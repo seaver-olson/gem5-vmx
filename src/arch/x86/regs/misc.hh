@@ -299,6 +299,29 @@ enum : RegIndex
     SmmCtl,
     VmHsavePa,
 
+    FeatureControl,
+
+    VmxBasic,
+    VmxPinbasedCtls,
+    VmxProcbasedCtls,
+    VmxExitCtls,
+    VmxEntryCtls,
+    VmxMisc,
+    VmxCr0Fixed0,
+    VmxCr0Fixed1,
+    VmxCr4Fixed0,
+    VmxCr4Fixed1,
+    VmxVmcsEnum,
+    VmxProcbasedCtls2,
+    VmxEptVpidCap,
+    VmxTruePinbasedCtls,
+    VmxTrueProcbasedCtls,
+    VmxTrueExitCtls,
+    VmxTrueEntryCtls,
+    VmxVmfunc,
+    VmxProcbasedCtls3,
+    VmxExitCtls2,
+
     /*
      * Segment registers
      */

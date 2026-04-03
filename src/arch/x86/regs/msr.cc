@@ -39,6 +39,7 @@ typedef MsrMap::value_type MsrVal;
 const MsrMap::value_type msrMapData[] = {
     MsrVal(0x10, misc_reg::Tsc),
     MsrVal(0x1B, misc_reg::ApicBase),
+    MsrVal(0x3A, misc_reg::FeatureControl), //IA32_FEATURE_CONTROL
     MsrVal(0xFE, misc_reg::Mtrrcap),
     MsrVal(0x174, misc_reg::SysenterCs),
     MsrVal(0x175, misc_reg::SysenterEsp),
@@ -112,6 +113,26 @@ const MsrMap::value_type msrMapData[] = {
     MsrVal(0x417, misc_reg::Mc5Misc),
     MsrVal(0x41B, misc_reg::Mc6Misc),
     MsrVal(0x41F, misc_reg::Mc7Misc),
+    MsrVal(0x480, misc_reg::VmxBasic), // IA32_VMX_BASIC 
+    MsrVal(0x481, misc_reg::VmxPinbasedCtls), // IA32_VMX_PINBASED_CTLS
+    MsrVal(0x482, misc_reg::VmxProcbasedCtls), // IA32_VMX_PROCBASED_CTLS
+    MsrVal(0x483, misc_reg::VmxExitCtls), // IA32_VMX_EXIT_CTLS
+    MsrVal(0x484, misc_reg::VmxEntryCtls), // IA32_VMX_ENTRY_CTLS
+    MsrVal(0x485, misc_reg::VmxMisc), // IA32_VMX_MISC
+    MsrVal(0x486, misc_reg::VmxCr0Fixed0), // IA32_VMX_CR0_FIXED0
+    MsrVal(0x487, misc_reg::VmxCr0Fixed1), // IA32_VMX_CR0_FIXED1
+    MsrVal(0x488, misc_reg::VmxCr4Fixed0), // IA32_VMX_CR4_FIXED0
+    MsrVal(0x489, misc_reg::VmxCr4Fixed1), // IA32_VMX_CR4_FIXED1
+    MsrVal(0x48A, misc_reg::VmxVmcsEnum), // IA32_VMX_VMCS_ENUM
+    MsrVal(0x48B, misc_reg::VmxProcbasedCtls2), // IA32_VMX_PROCBASED_CTLS2
+    MsrVal(0x48C, misc_reg::VmxEptVpidCap), // IA32_VMX_EPT_VPID_CAP
+    MsrVal(0x48D, misc_reg::VmxTruePinbasedCtls), // IA32_VMX_TRUE_PINBASED_CTLS
+    MsrVal(0x48E, misc_reg::VmxTrueProcbasedCtls), // IA32_VMX_TRUE_PROCBASED_CTLS
+    MsrVal(0x48F, misc_reg::VmxTrueExitCtls), // IA32_VMX_TRUE_EXIT_CTLS
+    MsrVal(0x490, misc_reg::VmxTrueEntryCtls), // IA32_VMX_TRUE_ENTRY_CTLS
+    MsrVal(0x491, misc_reg::VmxVmfunc), // IA32_VMX_VMFUNC
+    MsrVal(0x492, misc_reg::VmxProcbasedCtls3), // IA32_VMX_PROCBASED_CTLS3
+    MsrVal(0x493, misc_reg::VmxExitCtls2), // IA32_VMX_EXIT_CTLS2
     MsrVal(0xC0000080, misc_reg::Efer),
     MsrVal(0xC0000081, misc_reg::Star),
     MsrVal(0xC0000082, misc_reg::Lstar),
