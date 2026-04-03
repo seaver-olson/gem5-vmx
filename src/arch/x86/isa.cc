@@ -47,6 +47,7 @@ namespace gem5
 
 namespace X86ISA
 {
+uint32_t VmxVmcsRevisionId = 1;
 
 void
 ISA::updateHandyM5Reg(Efer efer, CR0 cr0,
@@ -124,6 +125,15 @@ ISA::clear()
     regVal[misc_reg::McgCap] = 0x104;
 
     regVal[misc_reg::Pat] = 0x0007040600070406ULL;
+
+    regVal[misc_reg::FeatureControl] = (1ULL << 0) | (1ULL << 2);
+    
+    regVal[misc_reg::VmxBasic] = 
+      (uint64_t)VmxVmcsRevisionId | // bits 30:0
+      (0x1000ULL << 32) | // bits 44:32 = 4096 bytes
+      (6ULL << 50) | // bits 53:50 = WB
+      (1ULL << 55); // true controls supported
+    //regVal[misc_reg::VmxEptVpidCap]
 
     // Bit 11 is mttr enable (1), bit 10 is fixed range enable (1)
     // bits 0-7 is default type (6, which means WB)
