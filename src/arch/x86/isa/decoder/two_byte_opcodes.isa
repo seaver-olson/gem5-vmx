@@ -839,13 +839,53 @@
                     //Also CMPXCHG16B
                     0x1: CMPXCHG8B(Mdp);
                     0x6: decode LEGACY_OP {
-                        0x1: WarnUnimpl::vmclear_Mq();
+                        0x1: decode MODRM_MOD {
+                            0x0: decode MODE_SUBMODE {
+                                0x4: decode MODRM_RM {
+                                    0x5: Cpl0VmxMemInst::VMCLEAR_P_0(true);
+                                    default: Cpl0VmxMemInst::VMCLEAR_M_0(false);
+                                }
+                                default: Cpl0VmxMemInst::VMCLEAR_M_1(false);
+                            }
+                            0x3: UD2();
+                            default: Cpl0VmxMemInst::VMCLEAR_M_2(false);
+                        }
                         default: decode LEGACY_REP {
-                            0x1: WarnUnimpl::vmxon_Mq();
-                            0x0: WarnUnimpl::vmptrld_Mq();
+                            0x1: decode MODRM_MOD {
+                                0x0: decode MODE_SUBMODE {
+                                    0x4: decode MODRM_RM {
+                                        0x5: Cpl0VmxMemInst::VMXON_P_0(true);
+                                        default: Cpl0VmxMemInst::VMXON_M_0(false);
+                                    }
+                                    default: Cpl0VmxMemInst::VMXON_M_1(false);
+                                }
+                                0x3: UD2();
+                                default: Cpl0VmxMemInst::VMXON_M_2(false);
+                            }
+                            0x0: decode MODRM_MOD {
+                                0x0: decode MODE_SUBMODE {
+                                    0x4: decode MODRM_RM {
+                                        0x5: Cpl0VmxMemInst::VMPTRLD_P_0(true);
+                                        default: Cpl0VmxMemInst::VMPTRLD_M_0(false);
+                                    }
+                                    default: Cpl0VmxMemInst::VMPTRLD_M_1(false);
+                                }
+                                0x3: UD2();
+                                default: Cpl0VmxMemInst::VMPTRLD_M_2(false);
+                            }
                         }
                     }
-                    0x7: WarnUnimpl::vmptrst_Mq();
+                    0x7: decode MODRM_MOD {
+                        0x0: decode MODE_SUBMODE {
+                            0x4: decode MODRM_RM {
+                                0x5: Cpl0VmxMemInst::VMPTRST_P_0(true);
+                                default: Cpl0VmxMemInst::VMPTRST_M_0(false);
+                            }
+                            default: Cpl0VmxMemInst::VMPTRST_M_1(false);
+                        }
+                        0x3: UD2();
+                        default: Cpl0VmxMemInst::VMPTRST_M_2(false);
+                    }
                     default: UD2();
                 }
                 default: decode LEGACY_DECODEVAL {

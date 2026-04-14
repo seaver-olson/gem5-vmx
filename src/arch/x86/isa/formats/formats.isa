@@ -46,6 +46,9 @@
 //Include a format to generate a monitor/mwait instructions.
 ##include "monitor_mwait.isa"
 
+//Include a format to generate VMX memory-form instructions.
+##include "vmx.isa"
+
 //Include the "unknown" format
 ##include "unknown.isa"
 

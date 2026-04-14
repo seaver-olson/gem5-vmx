@@ -1,0 +1,156 @@
+// Copyright (c) 2026
+// All rights reserved.
+
+output header {{
+    class VmxMemInst : public X86ISA::X86StaticInst
+    {
+      protected:
+        const uint8_t scale;
+        const RegIndex index;
+        const RegIndex base;
+        const uint64_t disp;
+        const uint8_t segment;
+        const uint8_t addressSize;
+        const bool ripRelative;
+
+        Addr operandEA(ExecContext *xc) const;
+
+      public:
+        VmxMemInst(const char *_mnemonic, ExtMachInst machInst,
+                OpClass __opClass, bool rip_relative);
+
+        std::string generateDisassembly(Addr pc,
+                const loader::SymbolTable *symtab) const override;
+    };
+}};
+
+output decoder {{
+    VmxMemInst::VmxMemInst(const char *_mnemonic, ExtMachInst machInst,
+            OpClass __opClass, bool rip_relative)
+        : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass),
+          scale(([&]() {
+              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
+              env.doModRM(machInst);
+              return env.scale;
+          })()),
+          index(([&]() {
+              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
+              env.doModRM(machInst);
+              return env.index.index();
+          })()),
+          base(([&]() {
+              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
+              env.doModRM(machInst);
+              return env.base.index();
+          })()),
+          disp(machInst.displacement),
+          segment(([&]() {
+              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
+              env.doModRM(machInst);
+              return env.seg;
+          })()),
+          addressSize(machInst.addrSize),
+          ripRelative(rip_relative)
+    {
+        flags[IsNonSpeculative] = true;
+        flags[IsSerializing] = true;
+        flags[IsSerializeAfter] = true;
+    }
+
+    std::string
+    VmxMemInst::generateDisassembly(
+            Addr pc, const loader::SymbolTable *symtab) const
+    {
+        std::stringstream response;
+        printMnemonic(response, mnemonic);
+        ccprintf(response, " ");
+        printMem(response, segment, scale, index, base, disp,
+                addressSize, ripRelative);
+        return response.str();
+    }
+}};
+
+output exec {{
+    Addr
+    VmxMemInst::operandEA(ExecContext *xc) const
+    {
+        auto *tc = xc->tcBase();
+        const uint64_t segBase = tc->readMiscRegNoEffect(
+                X86ISA::misc_reg::segEffBase(segment));
+        const uint64_t indexVal = index == int_reg::T0 ? 0 :
+            tc->getReg(X86ISA::intRegClass[index]);
+        const uint64_t baseVal = ripRelative ?
+            tc->pcState().as<X86ISA::PCState>().npc() :
+            (base == int_reg::T0 ? 0 : tc->getReg(X86ISA::intRegClass[base]));
+
+        const uint64_t linear =
+            bits(scale * indexVal + baseVal + disp, addressSize * 8 - 1, 0);
+        return segBase + linear;
+    }
+}};
+
+def template VmxMemDeclare {{
+    class %(class_name)s : public VmxMemInst
+    {
+      public:
+        %(class_name)s(X86ISA::ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+    };
+}};
+
+def template VmxMemConstruct {{
+    %(class_name)s::%(class_name)s(X86ISA::ExtMachInst machInst)
+        : VmxMemInst("%(base_mnemonic)s", machInst, No_OpClass, %(rip_relative)s)
+    {
+    }
+}};
+
+def template VmxMemExecute {{
+    Fault %(class_name)s::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        ISA *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+        const Addr EA = operandEA(xc);
+
+        if (strcmp(mnemonic, "vmxon") == 0) {
+            isa->vmxState().vmxon(xc, EA);
+        } else if (strcmp(mnemonic, "vmclear") == 0) {
+            isa->vmxState().vmclear(xc, EA);
+        } else if (strcmp(mnemonic, "vmptrld") == 0) {
+            isa->vmxState().vmptrld(xc, EA);
+        } else if (strcmp(mnemonic, "vmptrst") == 0) {
+            isa->vmxState().vmptrst(xc, EA);
+        } else {
+            panic("Unhandled VMX memory instruction '%s'", mnemonic);
+        }
+        return NoFault;
+    }
+}};
+
+def format VmxMemInst(rip_relative) {{
+    iop = InstObjParams(name, Name, 'VmxMemInst', '', [])
+    iop.rip_relative = 'true' if rip_relative else 'false'
+    iop.base_mnemonic = Name.split('_')[0].lower()
+    header_output = VmxMemDeclare.subst(iop)
+    decoder_output = VmxMemConstruct.subst(iop)
+    decode_block = BasicDecode.subst(iop)
+    exec_output = VmxMemExecute.subst(iop)
+}};
+
+def format Cpl0VmxMemInst(rip_relative) {{
+    iop = InstObjParams(name, Name, 'VmxMemInst', '', [])
+    iop.rip_relative = 'true' if rip_relative else 'false'
+    iop.base_mnemonic = Name.split('_')[0].lower()
+    header_output = VmxMemDeclare.subst(iop)
+    decoder_output = VmxMemConstruct.subst(iop)
+    decode_block = BasicDecode.subst(iop)
+    decode_block = '''
+        if (emi.mode.cpl != 0) {
+            return new DecodeFaultInst("%(Name)s", emi,
+                    std::make_shared<GeneralProtection>(0));
+        } else {
+            %(decode_block)s
+        }
+    ''' % {'decode_block': decode_block, 'Name': Name}
+    exec_output = VmxMemExecute.subst(iop)
+}};

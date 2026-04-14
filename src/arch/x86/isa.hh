@@ -34,6 +34,7 @@
 
 #include "arch/generic/isa.hh"
 #include "arch/x86/cpuid.hh"
+#include "arch/x86/insts/vmx.hh"
 #include "arch/x86/pcstate.hh"
 #include "arch/x86/regs/ccr.hh"
 #include "arch/x86/regs/float.hh"
@@ -59,6 +60,7 @@ class ISA : public BaseISA
             SegAttr csAttr, SegAttr ssAttr, RFLAGS rflags);
 
     std::string vendorString;
+    VmxState vmx;
 
   public:
     void clear() override;
@@ -94,6 +96,8 @@ class ISA : public BaseISA
     void setThreadContext(ThreadContext *_tc) override;
 
     std::string getVendorString() const;
+    VmxState &vmxState() { return vmx; }
+    const VmxState &vmxState() const { return vmx; }
 
     std::unique_ptr<X86CPUID> cpuid;
 };

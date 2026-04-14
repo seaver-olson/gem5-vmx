@@ -12,13 +12,8 @@ class alignas(4096) Vmcs
 {
   public: 
     static constexpr size_t VmcsRegionSize = 4096; // 4K-Byte aligned memory
-<<<<<<< HEAD
-	
-    enum class LaunchState {
-=======
                                                    
     enum class LaunchState : uint8_t {
->>>>>>> d88a418ea137721e702c3f5b454bb911a057eff2
       Clear,
       Launched
     };
@@ -26,13 +21,6 @@ class alignas(4096) Vmcs
     class VmcsHeader
     {
       public:
-<<<<<<< HEAD
-        uint32_t revisionId;
-        uint32_t abortIndicator;
-    }
-  private:
-    VmcsHeader header;
-=======
         uint32_t revisionId; // Bit 30:0 Revision Identifier - Processors that maintain VMCS data in different formats use different revision identifiers
                              // Bit 31 indicates whether the VMCS is a shadow VMCS (Section 27.10)
                              // revisionId is NEVER written by the processor
@@ -45,10 +33,6 @@ class alignas(4096) Vmcs
     static_assert(alignof(VmcsHeader) <= 4, "Unexpected alignment");
     static_assert(offsetof(VmcsHeader, abortIndicator) == 4, "abortIndicator must be at byte 4");
 
-};
-}
-}
->>>>>>> d88a418ea137721e702c3f5b454bb911a057eff2
 
 };
 } // X86ISA
