@@ -518,6 +518,11 @@ ISA::serialize(CheckpointOut &cp) const
     BaseISA::serialize(cp);
 
     SERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
+
+    {
+        Serializable::ScopedCheckpointSection sec(cp, "vmx");
+        vmx.serialize(cp);
+    }
 }
 
 void
@@ -529,6 +534,11 @@ ISA::unserialize(CheckpointIn &cp)
                      regVal[misc_reg::CsAttr],
                      regVal[misc_reg::SsAttr],
                      regVal[misc_reg::Rflags]);
+
+    {
+        Serializable::ScopedCheckpointSection sec(cp, "vmx");
+        vmx.unserialize(cp);
+    }
 }
 
 void

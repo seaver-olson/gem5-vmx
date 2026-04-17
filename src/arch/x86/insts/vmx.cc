@@ -1,5 +1,7 @@
 #include "arch/x86/insts/vmx.hh"
 
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "arch/x86/isa.hh"
@@ -16,7 +18,14 @@ namespace X86ISA
 {
 namespace
 {
-// Reads 64-bit mem operand
+
+uint32_t
+vmcsRevisionId(ThreadContext *tc)
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    return bits(isa->readMiscRegNoEffect(misc_reg::VmxBasic), 30, 0);
+}
+
 bool
 readQwordOperand(ExecContext *xc, Addr operandEA, uint64_t &value)
 {
@@ -27,7 +36,6 @@ readQwordOperand(ExecContext *xc, Addr operandEA, uint64_t &value)
     return fault == NoFault;
 }
 
-// Reads the VMCS region header from memory into the provided header struct
 bool
 readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
 {
@@ -35,7 +43,6 @@ readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
     return true;
 }
 
-// Checks if VMX is available and enabled in the current environment
 bool
 vmxAvailable(ThreadContext *tc)
 {
@@ -49,7 +56,6 @@ vmxAvailable(ThreadContext *tc)
     return cr4.vmxe && featureLocked && vmxonEnabled;
 }
 
-// Validates that the given region pointer is properly aligned, has a valid revision ID, and is not a shadow VMCS
 bool
 validateRegion(ThreadContext *tc, Addr regionPtr)
 {
@@ -60,105 +66,190 @@ validateRegion(ThreadContext *tc, Addr regionPtr)
     Vmcs::VmcsHeader header;
     readVmcsHeader(tc, regionPtr, header);
 
-    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
-    const auto vmxBasic = isa->readMiscRegNoEffect(misc_reg::VmxBasic);
-    const uint32_t expectedRevision = bits(vmxBasic, 30, 0);
-
-    return bits(header.revisionId, 30, 0) == expectedRevision &&
+    return bits(header.revisionId, 30, 0) == vmcsRevisionId(tc) &&
            !bits(header.revisionId, 31);
 }
 
-} // namespace (makes this private to this file)
+} // namespace
 
-    bool
-    VmxState::vmxon(ExecContext *xc, Addr operandEA)
-    {
-        auto *tc = xc->tcBase();
-        uint64_t regionPtr = 0;
+Vmcs *
+VmxState::findVmcs(Addr regionPtr)
+{
+    auto it = vmcsRegions.find(regionPtr);
+    return it == vmcsRegions.end() ? nullptr : &it->second;
+}
 
-        if (vmxActive || !vmxAvailable(tc) || !readQwordOperand(xc, operandEA,
-                    regionPtr) || !validateRegion(tc, regionPtr)) {
-            return false;
-        }
+const Vmcs *
+VmxState::findVmcs(Addr regionPtr) const
+{
+    auto it = vmcsRegions.find(regionPtr);
+    return it == vmcsRegions.end() ? nullptr : &it->second;
+}
 
-        vmxActive = true;
-        vmxonRegion = regionPtr;
-        currentVmcsPtr = 0;
-        return true;
+Vmcs *
+VmxState::currentVmcs()
+{
+    return currentVmcsPtr ? findVmcs(currentVmcsPtr) : nullptr;
+}
+
+const Vmcs *
+VmxState::currentVmcs() const
+{
+    return currentVmcsPtr ? findVmcs(currentVmcsPtr) : nullptr;
+}
+
+bool
+VmxState::vmxon(ExecContext *xc, Addr operandEA)
+{
+    auto *tc = xc->tcBase();
+    uint64_t regionPtr = 0;
+
+    if (vmxActive || !vmxAvailable(tc) || !readQwordOperand(xc, operandEA,
+                regionPtr) || !validateRegion(tc, regionPtr)) {
+        return false;
     }
 
-    bool
-    VmxState::vmxoff()
-    {
-        if (!vmxActive) {
-            return false;
-        }
+    vmxActive = true;
+    vmxonRegion = regionPtr;
+    currentVmcsPtr = 0;
+    return true;
+}
 
+bool
+VmxState::vmxoff()
+{
+    if (!vmxActive) {
+        return false;
+    }
+
+    vmxActive = false;
+    vmxonRegion = 0;
+    currentVmcsPtr = 0;
+    return true;
+}
+
+bool
+VmxState::vmclear(ExecContext *xc, Addr operandEA)
+{
+    auto *tc = xc->tcBase();
+    uint64_t regionPtr = 0;
+
+    if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
+        regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
+        return false;
+    }
+
+    if (currentVmcsPtr == regionPtr) {
+        currentVmcsPtr = 0;
+    }
+
+    auto [it, inserted] = vmcsRegions.try_emplace(
+            regionPtr, regionPtr, vmcsRevisionId(tc));
+    if (!inserted) {
+        it->second.clear();
+    }
+
+    return true;
+}
+
+bool
+VmxState::vmptrld(ExecContext *xc, Addr operandEA)
+{
+    auto *tc = xc->tcBase();
+    uint64_t regionPtr = 0;
+
+    if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
+        regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
+        return false;
+    }
+
+    vmcsRegions.try_emplace(regionPtr, regionPtr, vmcsRevisionId(tc));
+    currentVmcsPtr = regionPtr;
+    return true;
+}
+
+bool
+VmxState::vmptrst(ExecContext *xc, Addr operandEA)
+{
+    const std::vector<bool> byteEnable;
+    uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64);
+
+    if (!vmxActive) {
+        return false;
+    }
+
+    auto fault = xc->writeMem(
+            reinterpret_cast<uint8_t *>(&regionPtr), sizeof(regionPtr),
+            operandEA, Request::Flags(0), nullptr, byteEnable);
+    return fault == NoFault;
+}
+
+bool
+VmxState::vmread(uint64_t encoding, uint64_t &value) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !vmcs) {
+        return false;
+    }
+
+    return vmcs->read(encoding, value);
+}
+
+bool
+VmxState::vmwrite(uint64_t encoding, uint64_t value)
+{
+    Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !vmcs) {
+        return false;
+    }
+
+    vmcs->write(encoding, value);
+    return true;
+}
+
+void
+VmxState::serialize(CheckpointOut &cp) const
+{
+    size_t numVmcsRegions = vmcsRegions.size();
+
+    SERIALIZE_SCALAR(vmxActive);
+    SERIALIZE_SCALAR(vmxonRegion);
+    SERIALIZE_SCALAR(currentVmcsPtr);
+    SERIALIZE_SCALAR(numVmcsRegions);
+
+    size_t index = 0;
+    for (const auto &[regionPtr, vmcs] : vmcsRegions) {
+        Serializable::ScopedCheckpointSection sec(
+                cp, "vmcsRegion" + std::to_string(index++));
+        vmcs.serialize(cp);
+    }
+}
+
+void
+VmxState::unserialize(CheckpointIn &cp)
+{
+    if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;
         vmxonRegion = 0;
         currentVmcsPtr = 0;
-        return true;
+        vmcsRegions.clear();
+        return;
     }
 
-    bool
-    VmxState::vmclear(ExecContext *xc, Addr operandEA)
-    {
-        auto *tc = xc->tcBase();
-        uint64_t regionPtr = 0;
+    size_t numVmcsRegions = 0;
+    UNSERIALIZE_SCALAR(vmxonRegion);
+    UNSERIALIZE_SCALAR(currentVmcsPtr);
+    UNSERIALIZE_SCALAR(numVmcsRegions);
 
-        if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
-            regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
-            return false;
-        }
-
-        if (currentVmcsPtr == regionPtr) {
-            currentVmcsPtr = 0;
-        }
-
-        return true;
-    }
-
-    bool
-    VmxState::vmptrld(ExecContext *xc, Addr operandEA)
-    {
-        auto *tc = xc->tcBase();
-        uint64_t regionPtr = 0;
-
-        if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
-            regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
-            return false;
-        }
-
-        currentVmcsPtr = regionPtr;
-        return true;
-    }
-
-    bool
-    VmxState::vmptrst(ExecContext *xc, Addr operandEA)
-    {
-        const std::vector<bool> byteEnable;
-        uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64);
-
-        if (!vmxActive) {
-            return false;
-        }
-
-        auto fault = xc->writeMem(
-                reinterpret_cast<uint8_t *>(&regionPtr), sizeof(regionPtr),
-                operandEA, Request::Flags(0), nullptr, byteEnable);
-        return fault == NoFault;
-    }
-
-    bool
-    VmxState::vmread(uint64_t encoding, uint64_t &value) const
-    {
-        return false;
-    }
-
-    bool
-    VmxState::vmwrite(uint64_t encoding, uint64_t value)
-    {
-        return false;
+    vmcsRegions.clear();
+    for (size_t index = 0; index < numVmcsRegions; ++index) {
+        Serializable::ScopedCheckpointSection sec(
+                cp, "vmcsRegion" + std::to_string(index));
+        Vmcs vmcs;
+        vmcs.unserialize(cp);
+        vmcsRegions.emplace(vmcs.pointer(), std::move(vmcs));
     }
 }
-}
+
+} // namespace X86ISA
+} // namespace gem5
