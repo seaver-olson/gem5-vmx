@@ -69,11 +69,13 @@ class X86ISA(BaseISA):
     # zeros indicates to the KVM cpu / OS that there are no more index values
     # to iterate over.
     #
+    # If CPUID.01H:ECX.VMX[5] = 1, then VMX operation is supported
+    #
     # A good resource for these values can be found here:
     #     https://sandpile.org/x86/cpuid.htm
     # 0000_0001h
     FamilyModelStepping = VectorParam.UInt32(
-        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00000209],
+        [0x00020F51, 0x00000805, 0xEFDBFBFF, 0x00000229],
         "type/family/model/stepping and feature flags",
     )
     # 0000_0004h

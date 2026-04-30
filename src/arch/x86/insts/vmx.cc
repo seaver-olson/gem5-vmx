@@ -1,7 +1,7 @@
 #include "arch/x86/insts/vmx.hh"
 
-#include <string>
-#include <utility>
+#include <string> // for std::to_string
+#include <utility> // for std::pair and std::move
 #include <vector>
 
 #include "arch/x86/isa.hh"
@@ -18,6 +18,8 @@ namespace X86ISA
 {
 namespace
 {
+constexpr uint32_t VmxErrUnsupportedComponent = 12;
+constexpr uint32_t VmxErrWriteReadOnlyComponent = 13;
 
 uint32_t
 vmcsRevisionId(ThreadContext *tc)
@@ -26,14 +28,15 @@ vmcsRevisionId(ThreadContext *tc)
     return bits(isa->readMiscRegNoEffect(misc_reg::VmxBasic), 30, 0);
 }
 
-bool
-readQwordOperand(ExecContext *xc, Addr operandEA, uint64_t &value)
+Fault
+readOperand(ExecContext *xc, Addr operandEA, uint64_t &value, size_t size)
 {
     const std::vector<bool> byteEnable;
+    value = 0;
     auto fault = xc->readMem(
-            operandEA, reinterpret_cast<uint8_t *>(&value), sizeof(value),
+            operandEA, reinterpret_cast<uint8_t *>(&value), size,
             Request::Flags(0), byteEnable);
-    return fault == NoFault;
+    return fault;
 }
 
 bool
@@ -70,6 +73,14 @@ validateRegion(ThreadContext *tc, Addr regionPtr)
            !bits(header.revisionId, 31);
 }
 
+VmxResult
+vmFailValid(Vmcs *vmcs, uint32_t error)
+{
+    panic_if(!vmcs, "VMfailValid requires a current VMCS");
+    vmcs->setInstructionError(error);
+    return VmxResult::failValid(error);
+}
+
 } // namespace
 
 Vmcs *
@@ -98,45 +109,54 @@ VmxState::currentVmcs() const
     return currentVmcsPtr ? findVmcs(currentVmcsPtr) : nullptr;
 }
 
-bool
+VmxResult
 VmxState::vmxon(ExecContext *xc, Addr operandEA)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
+    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
-    if (vmxActive || !vmxAvailable(tc) || !readQwordOperand(xc, operandEA,
-                regionPtr) || !validateRegion(tc, regionPtr)) {
-        return false;
+    if (fault != NoFault) {
+        return VmxResult::propagateFault(fault);
+    }
+
+    if (vmxActive || !vmxAvailable(tc) || !validateRegion(tc, regionPtr)) {
+        return VmxResult::failInvalid();
     }
 
     vmxActive = true;
     vmxonRegion = regionPtr;
     currentVmcsPtr = 0;
-    return true;
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmxoff()
 {
     if (!vmxActive) {
-        return false;
+        return VmxResult::failInvalid();
     }
 
     vmxActive = false;
     vmxonRegion = 0;
     currentVmcsPtr = 0;
-    return true;
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmclear(ExecContext *xc, Addr operandEA)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
+    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
-    if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
-        regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
-        return false;
+    if (fault != NoFault) {
+        return VmxResult::propagateFault(fault);
+    }
+
+    if (!vmxActive || regionPtr == vmxonRegion ||
+        !validateRegion(tc, regionPtr)) {
+        return VmxResult::failInvalid();
     }
 
     if (currentVmcsPtr == regionPtr) {
@@ -149,62 +169,92 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA)
         it->second.clear();
     }
 
-    return true;
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmptrld(ExecContext *xc, Addr operandEA)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
+    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
-    if (!vmxActive || !readQwordOperand(xc, operandEA, regionPtr) ||
-        regionPtr == vmxonRegion || !validateRegion(tc, regionPtr)) {
-        return false;
+    if (fault != NoFault) {
+        return VmxResult::propagateFault(fault);
+    }
+
+    if (!vmxActive || regionPtr == vmxonRegion ||
+        !validateRegion(tc, regionPtr)) {
+        return VmxResult::failInvalid();
     }
 
     vmcsRegions.try_emplace(regionPtr, regionPtr, vmcsRevisionId(tc));
     currentVmcsPtr = regionPtr;
-    return true;
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 {
     const std::vector<bool> byteEnable;
     uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64);
 
     if (!vmxActive) {
-        return false;
+        return VmxResult::failInvalid();
     }
 
     auto fault = xc->writeMem(
             reinterpret_cast<uint8_t *>(&regionPtr), sizeof(regionPtr),
             operandEA, Request::Flags(0), nullptr, byteEnable);
-    return fault == NoFault;
+    if (fault != NoFault) {
+        return VmxResult::propagateFault(fault);
+    }
+
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmread(uint64_t encoding, uint64_t &value) const
 {
     const Vmcs *vmcs = currentVmcs();
     if (!vmxActive || !vmcs) {
-        return false;
+        return VmxResult::failInvalid();
     }
 
-    return vmcs->read(encoding, value);
+    if (!Vmcs::fieldSupported(encoding)) {
+        return vmFailValid(const_cast<Vmcs *>(vmcs),
+                VmxErrUnsupportedComponent);
+    }
+
+    if (!vmcs->read(encoding, value)) {
+        return vmFailValid(const_cast<Vmcs *>(vmcs),
+                VmxErrUnsupportedComponent);
+    }
+
+    return VmxResult::success();
 }
 
-bool
+VmxResult
 VmxState::vmwrite(uint64_t encoding, uint64_t value)
 {
     Vmcs *vmcs = currentVmcs();
     if (!vmxActive || !vmcs) {
-        return false;
+        return VmxResult::failInvalid();
     }
 
-    vmcs->write(encoding, value);
-    return true;
+    if (!Vmcs::fieldSupported(encoding)) {
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+    }
+
+    if (!Vmcs::fieldWritable(encoding)) {
+        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent);
+    }
+
+    if (!vmcs->write(encoding, value)) {
+        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent);
+    }
+
+    return VmxResult::success();
 }
 
 void
