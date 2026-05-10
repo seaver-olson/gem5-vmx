@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "base/logging.hh"
+#include "base/bitfield.hh"
 #include "base/types.hh"
 #include "sim/serialize.hh"
 
@@ -175,9 +176,7 @@ class Vmcs
             {0x6C16, "HOST_RIP", FieldWidth::Natural, true},
         };
 
-        if (encoding > 0xFFFF) {
-            return nullptr;
-        }
+        if (encoding > 0xFFFF) return nullptr;
 
         for (const auto &field : supportedFields) {
             if (field.encoding == encoding) {

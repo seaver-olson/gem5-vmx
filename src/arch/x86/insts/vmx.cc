@@ -31,7 +31,7 @@ vmcsRevisionId(ThreadContext *tc)
 Fault
 readOperand(ExecContext *xc, Addr operandEA, uint64_t &value, size_t size)
 {
-    const std::vector<bool> byteEnable;
+    const std::vector<bool> byteEnable(size, true);
     value = 0;
     auto fault = xc->readMem(
             operandEA, reinterpret_cast<uint8_t *>(&value), size,
@@ -42,7 +42,8 @@ readOperand(ExecContext *xc, Addr operandEA, uint64_t &value, size_t size)
 bool
 readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
 {
-    tc->getSystemPtr()->physProxy.readBlob(regionPtr, &header, sizeof(header));
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    proxy.readBlob(regionPtr, &header, sizeof(header));
     return true;
 }
 
@@ -196,8 +197,8 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA)
 VmxResult
 VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 {
-    const std::vector<bool> byteEnable;
     uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64);
+    const std::vector<bool> byteEnable(sizeof(regionPtr), true);
 
     if (!vmxActive) {
         return VmxResult::failInvalid();

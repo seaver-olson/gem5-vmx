@@ -1412,12 +1412,27 @@ let {{
                     break;
                   case 4:
                     {
-                        CR4 cr4 = newVal;
                         // Fault if any unknown bits are set. Also,
                         // PAE can't be disabled in long mode.
-                        if (bits(newVal, 63, 17) ||
-                            bits(newVal, 15, 11) ||
-                                (machInst.mode.mode == LongMode && !cr4.pae))
+                        constexpr RegVal legalCr4Mask =
+                            (1ULL << 0)  | // VME
+                            (1ULL << 1)  | // PVI
+                            (1ULL << 2)  | // TSD
+                            (1ULL << 3)  | // DE
+                            (1ULL << 4)  | // PSE
+                            (1ULL << 5)  | // PAE
+                            (1ULL << 6)  | // MCE
+                            (1ULL << 7)  | // PGE
+                            (1ULL << 8)  | // PCE
+                            (1ULL << 9)  | // OSFXSR
+                            (1ULL << 10) | // OSXMMEXCPT
+                            (1ULL << 13) | // VMXE
+                            (1ULL << 16) | // FSGSBASE
+                            (1ULL << 17) | // PCIDE
+                            (1ULL << 18);  // OSXSAVE
+                        if ((newVal & ~legalCr4Mask) ||
+                                (machInst.mode.mode == LongMode &&
+                                 !bits(newVal, 5)))
                             fault = std::make_shared<GeneralProtection>(0);
                     }
                     break;

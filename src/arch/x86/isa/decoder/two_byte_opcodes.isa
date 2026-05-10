@@ -616,8 +616,12 @@
             0x0F: decode LEGACY_DECODEVAL {
                 // no prefix
                 0x0: decode OPCODE_OP_BOTTOM3 {
-                    0x0: Cpl0VmxRegMemInst::VMREAD();
-                    0x1: Cpl0VmxRegMemInst::VMWRITE();
+                    0x0: decode MODRM_MOD {
+                        default: Cpl0VmxRegMemInst::VMREAD();
+                    }
+                    0x1: decode MODRM_MOD {
+                        default: Cpl0VmxRegMemInst::VMWRITE();
+                    }
                     0x6: MOVD(Edp,Pdp);
                     0x7: MOVQ(Qq,Pq);
                     default: UD2();

@@ -1,6 +1,3 @@
-// Copyright (c) 2026
-// All rights reserved.
-
 output header {{
     class VmxMemInst : public X86ISA::X86StaticInst
     {
@@ -78,7 +75,7 @@ output decoder {{
           segment(([&]() {
               EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
               env.doModRM(machInst);
-              return env.seg;
+              return uint8_t(env.seg);
           })()),
           addressSize(machInst.addrSize),
           ripRelative(rip_relative)
@@ -106,7 +103,8 @@ output decoder {{
           reg(machInst.modRM.reg | (machInst.rex.r << 3)),
           rmReg(machInst.modRM.rm | (machInst.rex.b << 3)),
           rmIsReg(machInst.modRM.mod == 3),
-          opSize(machInst.opSize),
+          opSize(machInst.mode.mode == LongMode &&
+                  machInst.mode.submode == SixtyFourBitMode ? 8 : 4),
           scale(([&]() {
               if (machInst.modRM.mod == 3) {
                   return uint8_t(0);
@@ -138,7 +136,7 @@ output decoder {{
               }
               EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
               env.doModRM(machInst);
-              return env.seg;
+              return uint8_t(env.seg);
           })()),
           addressSize(machInst.addrSize),
           ripRelative(machInst.modRM.mod == 0 && machInst.modRM.rm == 5 &&
@@ -176,7 +174,7 @@ output exec {{
     void
     setVmxResult(ThreadContext *tc, const X86ISA::VmxResult &result)
     {
-        auto rflags = tc->readMiscRegNoEffect(X86ISA::misc_reg::Rflags);
+        auto rflags = X86ISA::getRFlags(tc);
         rflags &= ~(X86ISA::CFBit | X86ISA::ZFBit);
 
         if (result.status == X86ISA::VmxStatus::VmFailInvalid) {
@@ -185,7 +183,7 @@ output exec {{
             rflags |= X86ISA::ZFBit;
         }
 
-        tc->setMiscReg(X86ISA::misc_reg::Rflags, rflags);
+        X86ISA::setRFlags(tc, rflags);
     }
 
     } // namespace
@@ -255,7 +253,7 @@ output exec {{
             return NoFault;
         }
 
-        const std::vector<bool> byteEnable;
+        const std::vector<bool> byteEnable(opSize, true);
         value = 0;
         return xc->readMem(
                 operandEA(xc), reinterpret_cast<uint8_t *>(&value), opSize,
@@ -270,7 +268,7 @@ output exec {{
             return NoFault;
         }
 
-        const std::vector<bool> byteEnable;
+        const std::vector<bool> byteEnable(opSize, true);
         return xc->writeMem(
                 reinterpret_cast<uint8_t *>(&value), opSize, operandEA(xc),
                 Request::Flags(0), nullptr, byteEnable);
@@ -395,7 +393,7 @@ def template VmxRegMemExecute {{
 
 def format VmxMemInst(rip_relative) {{
     iop = InstObjParams(name, Name, 'VmxMemInst', '', [])
-    iop.rip_relative = 'true' if rip_relative else 'false'
+    iop.rip_relative = str(rip_relative).lower()
     iop.base_mnemonic = Name.split('_')[0].lower()
     header_output = VmxMemDeclare.subst(iop)
     decoder_output = VmxMemConstruct.subst(iop)
@@ -405,7 +403,7 @@ def format VmxMemInst(rip_relative) {{
 
 def format Cpl0VmxMemInst(rip_relative) {{
     iop = InstObjParams(name, Name, 'VmxMemInst', '', [])
-    iop.rip_relative = 'true' if rip_relative else 'false'
+    iop.rip_relative = str(rip_relative).lower()
     iop.base_mnemonic = Name.split('_')[0].lower()
     header_output = VmxMemDeclare.subst(iop)
     decoder_output = VmxMemConstruct.subst(iop)
