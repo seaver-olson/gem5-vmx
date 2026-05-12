@@ -20,6 +20,16 @@ output header {{
                 const loader::SymbolTable *symtab) const override;
     };
 
+    class VmxNoOperandInst : public X86ISA::X86StaticInst
+    {
+      public:
+        VmxNoOperandInst(const char *_mnemonic, ExtMachInst machInst,
+                OpClass __opClass);
+
+        std::string generateDisassembly(Addr pc,
+                const loader::SymbolTable *symtab) const override;
+    };
+
     class VmxRegMemInst : public X86ISA::X86StaticInst
     {
       protected:
@@ -97,6 +107,24 @@ output decoder {{
         return response.str();
     }
 
+    VmxNoOperandInst::VmxNoOperandInst(const char *_mnemonic,
+            ExtMachInst machInst, OpClass __opClass)
+        : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass)
+    {
+        flags[IsNonSpeculative] = true;
+        flags[IsSerializing] = true;
+        flags[IsSerializeAfter] = true;
+    }
+
+    std::string
+    VmxNoOperandInst::generateDisassembly(
+            Addr pc, const loader::SymbolTable *symtab) const
+    {
+        std::stringstream response;
+        printMnemonic(response, mnemonic);
+        return response.str();
+    }
+
     VmxRegMemInst::VmxRegMemInst(const char *_mnemonic, ExtMachInst machInst,
             OpClass __opClass)
         : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass),
@@ -155,13 +183,13 @@ output decoder {{
         printMnemonic(response, mnemonic);
         ccprintf(response, " ");
         if (strcmp(mnemonic, "vmread") == 0) {
-            printRmOperand(response);
-            ccprintf(response, ", ");
             printReg(response, intRegClass[reg], opSize);
+            ccprintf(response, ", ");
+            printRmOperand(response);
         } else {
-            printReg(response, intRegClass[reg], opSize);
-            ccprintf(response, ", ");
             printRmOperand(response);
+            ccprintf(response, ", ");
+            printReg(response, intRegClass[reg], opSize);
         }
         return response.str();
     }
@@ -331,6 +359,44 @@ def template VmxMemExecute {{
     }
 }};
 
+def template VmxNoOperandDeclare {{
+    class %(class_name)s : public VmxNoOperandInst
+    {
+      public:
+        %(class_name)s(X86ISA::ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+    };
+}};
+
+def template VmxNoOperandConstruct {{
+    %(class_name)s::%(class_name)s(X86ISA::ExtMachInst machInst)
+        : VmxNoOperandInst("%(base_mnemonic)s", machInst, No_OpClass)
+    {
+    }
+}};
+
+def template VmxNoOperandExecute {{
+    Fault %(class_name)s::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        ISA *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+        X86ISA::VmxResult result;
+
+        if (strcmp(mnemonic, "vmxoff") == 0) {
+            result = isa->vmxState().vmxoff();
+        } else {
+            panic("Unhandled VMX no-operand instruction '%s'", mnemonic);
+        }
+
+        if (result.fault != NoFault) {
+            return result.fault;
+        }
+
+        setVmxResult(xc->tcBase(), result);
+        return NoFault;
+    }
+}};
+
 def template VmxRegMemDeclare {{
     class %(class_name)s : public VmxRegMemInst
     {
@@ -358,10 +424,7 @@ def template VmxRegMemExecute {{
         Fault fault = NoFault;
 
         if (strcmp(mnemonic, "vmread") == 0) {
-            fault = readRmOperand(xc, field);
-            if (fault != NoFault) {
-                return fault;
-            }
+            field = readIntOperand(xc->tcBase(), reg);
 
             result = isa->vmxState().vmread(field, value);
             if (result.fault != NoFault) {
@@ -369,11 +432,14 @@ def template VmxRegMemExecute {{
             }
 
             if (result.succeeded()) {
-                writeIntOperand(xc->tcBase(), reg, value);
+                fault = writeRmOperand(xc, value);
+                if (fault != NoFault) {
+                    return fault;
+                }
             }
         } else if (strcmp(mnemonic, "vmwrite") == 0) {
-            value = readIntOperand(xc->tcBase(), reg);
-            fault = readRmOperand(xc, field);
+            field = readIntOperand(xc->tcBase(), reg);
+            fault = readRmOperand(xc, value);
             if (fault != NoFault) {
                 return fault;
             }
@@ -417,6 +483,32 @@ def format Cpl0VmxMemInst(rip_relative) {{
         }
     ''' % {'decode_block': decode_block, 'Name': Name}
     exec_output = VmxMemExecute.subst(iop)
+}};
+
+def format VmxNoOperandInst() {{
+    iop = InstObjParams(name, Name, 'VmxNoOperandInst', '', [])
+    iop.base_mnemonic = Name.lower()
+    header_output = VmxNoOperandDeclare.subst(iop)
+    decoder_output = VmxNoOperandConstruct.subst(iop)
+    decode_block = BasicDecode.subst(iop)
+    exec_output = VmxNoOperandExecute.subst(iop)
+}};
+
+def format Cpl0VmxNoOperandInst() {{
+    iop = InstObjParams(name, Name, 'VmxNoOperandInst', '', [])
+    iop.base_mnemonic = Name.lower()
+    header_output = VmxNoOperandDeclare.subst(iop)
+    decoder_output = VmxNoOperandConstruct.subst(iop)
+    decode_block = BasicDecode.subst(iop)
+    decode_block = '''
+        if (emi.mode.cpl != 0) {
+            return new DecodeFaultInst("%(Name)s", emi,
+                    std::make_shared<GeneralProtection>(0));
+        } else {
+            %(decode_block)s
+        }
+    ''' % {'decode_block': decode_block, 'Name': Name}
+    exec_output = VmxNoOperandExecute.subst(iop)
 }};
 
 def format VmxRegMemInst() {{

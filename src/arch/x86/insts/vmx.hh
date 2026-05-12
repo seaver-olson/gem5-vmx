@@ -89,8 +89,8 @@ class VmxState
     VmxResult vmptrld(ExecContext *xc, Addr operandEA);
     VmxResult vmptrst(ExecContext *xc, Addr operandEA);
 
-    VmxResult vmread(uint64_t encoding, uint64_t &value) const;
-    VmxResult vmwrite(uint64_t encoding, uint64_t value);
+    VmxResult vmread(Vmcs::RawEncoding encoding, uint64_t &value) const;
+    VmxResult vmwrite(Vmcs::RawEncoding encoding, uint64_t value);
 
     void serialize(CheckpointOut &cp) const;
     void unserialize(CheckpointIn &cp);

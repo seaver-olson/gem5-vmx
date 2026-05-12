@@ -215,11 +215,17 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
-VmxState::vmread(uint64_t encoding, uint64_t &value) const
+VmxState::vmread(Vmcs::RawEncoding rawEncoding, uint64_t &value) const
 {
     const Vmcs *vmcs = currentVmcs();
     if (!vmxActive || !vmcs) {
         return VmxResult::failInvalid();
+    }
+
+    Vmcs::Encoding encoding = 0;
+    if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
+        return vmFailValid(const_cast<Vmcs *>(vmcs),
+                VmxErrUnsupportedComponent);
     }
 
     if (!Vmcs::fieldSupported(encoding)) {
@@ -236,11 +242,16 @@ VmxState::vmread(uint64_t encoding, uint64_t &value) const
 }
 
 VmxResult
-VmxState::vmwrite(uint64_t encoding, uint64_t value)
+VmxState::vmwrite(Vmcs::RawEncoding rawEncoding, uint64_t value)
 {
     Vmcs *vmcs = currentVmcs();
     if (!vmxActive || !vmcs) {
         return VmxResult::failInvalid();
+    }
+
+    Vmcs::Encoding encoding = 0;
+    if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
     }
 
     if (!Vmcs::fieldSupported(encoding)) {

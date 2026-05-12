@@ -68,7 +68,7 @@
                         0x1: vmcall();
                         0x2: vmlaunch();
                         0x3: vmresume();
-                        0x4: vmxoff();
+                        0x4: Cpl0VmxNoOperandInst::VMXOFF();
                         default: Inst::UD2();
                     }
                     default: sgdt_Ms();

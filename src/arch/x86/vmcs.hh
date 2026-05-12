@@ -18,10 +18,12 @@ namespace X86ISA
 class Vmcs
 {
   public:
-    using Encoding = uint64_t;
+    using RawEncoding = uint64_t;
+    using Encoding = uint32_t;
     using FieldMap = std::map<Encoding, uint64_t>;
 
     static constexpr size_t VmcsRegionSize = 4096;
+    static constexpr RawEncoding VmcsEncodingMask = 0x7fff;
     static constexpr Encoding VmInstructionError = 0x4400;
 
     enum class LaunchState : uint8_t
@@ -38,11 +40,35 @@ class Vmcs
         Natural
     };
 
+    enum class VmcsFieldType : uint8_t
+    {
+        Control,
+        VmExitInfo,
+        GuestState,
+        HostState
+    };
+
+    enum class VmcsFieldGroup : uint8_t
+    {
+        GuestState,
+        HostState,
+        VmExecutionControl,
+        VmExitControl,
+        VmEntryControl,
+        VmExitInformation,
+    };
+
     struct FieldInfo
     {
         Encoding encoding;
         const char *name;
+
         FieldWidth width;
+        // Encoded SDM field type.
+        VmcsFieldType type;
+        // Logical SDM grouping. This is more specific than the encoded type
+        // for control fields.
+        VmcsFieldGroup group;
         bool writable;
     };
 
@@ -63,120 +89,244 @@ class Vmcs
     static const FieldInfo *
     lookupField(Encoding encoding)
     {
+        using Group = VmcsFieldGroup;
+        using Type = VmcsFieldType;
+        using Width = FieldWidth;
+
         static constexpr FieldInfo supportedFields[] = {
-            {0x0000, "VPID", FieldWidth::U16, true},
-            {0x0800, "GUEST_ES_SELECTOR", FieldWidth::U16, true},
-            {0x0802, "GUEST_CS_SELECTOR", FieldWidth::U16, true},
-            {0x0804, "GUEST_SS_SELECTOR", FieldWidth::U16, true},
-            {0x0806, "GUEST_DS_SELECTOR", FieldWidth::U16, true},
-            {0x0808, "GUEST_FS_SELECTOR", FieldWidth::U16, true},
-            {0x080A, "GUEST_GS_SELECTOR", FieldWidth::U16, true},
-            {0x080C, "GUEST_LDTR_SELECTOR", FieldWidth::U16, true},
-            {0x080E, "GUEST_TR_SELECTOR", FieldWidth::U16, true},
-            {0x0C00, "HOST_ES_SELECTOR", FieldWidth::U16, true},
-            {0x0C02, "HOST_CS_SELECTOR", FieldWidth::U16, true},
-            {0x0C04, "HOST_SS_SELECTOR", FieldWidth::U16, true},
-            {0x0C06, "HOST_DS_SELECTOR", FieldWidth::U16, true},
-            {0x0C08, "HOST_FS_SELECTOR", FieldWidth::U16, true},
-            {0x0C0A, "HOST_GS_SELECTOR", FieldWidth::U16, true},
-            {0x0C0C, "HOST_TR_SELECTOR", FieldWidth::U16, true},
-            {0x2000, "IO_BITMAP_A", FieldWidth::U64, true},
-            {0x2002, "IO_BITMAP_B", FieldWidth::U64, true},
-            {0x2004, "MSR_BITMAP", FieldWidth::U64, true},
-            {0x2006, "VM_EXIT_MSR_STORE_ADDR", FieldWidth::U64, true},
-            {0x2008, "VM_EXIT_MSR_LOAD_ADDR", FieldWidth::U64, true},
-            {0x200A, "VM_ENTRY_MSR_LOAD_ADDR", FieldWidth::U64, true},
-            {0x2010, "TSC_OFFSET", FieldWidth::U64, true},
-            {0x2800, "VMCS_LINK_POINTER", FieldWidth::U64, true},
-            {0x2802, "GUEST_IA32_DEBUGCTL", FieldWidth::U64, true},
-            {0x2804, "GUEST_IA32_PAT", FieldWidth::U64, true},
-            {0x2806, "GUEST_IA32_EFER", FieldWidth::U64, true},
-            {0x2808, "GUEST_IA32_PERF_GLOBAL_CTRL", FieldWidth::U64, true},
-            {0x2C00, "HOST_IA32_PAT", FieldWidth::U64, true},
-            {0x2C02, "HOST_IA32_EFER", FieldWidth::U64, true},
-            {0x2C04, "HOST_IA32_PERF_GLOBAL_CTRL", FieldWidth::U64, true},
-            {0x4000, "PIN_BASED_VM_EXEC_CONTROL", FieldWidth::U32, true},
-            {0x4002, "CPU_BASED_VM_EXEC_CONTROL", FieldWidth::U32, true},
-            {0x4004, "EXCEPTION_BITMAP", FieldWidth::U32, true},
-            {0x4006, "PAGE_FAULT_ERROR_CODE_MASK", FieldWidth::U32, true},
-            {0x4008, "PAGE_FAULT_ERROR_CODE_MATCH", FieldWidth::U32, true},
-            {0x400A, "CR3_TARGET_COUNT", FieldWidth::U32, true},
-            {0x400C, "VM_EXIT_CONTROLS", FieldWidth::U32, true},
-            {0x400E, "VM_EXIT_MSR_STORE_COUNT", FieldWidth::U32, true},
-            {0x4010, "VM_EXIT_MSR_LOAD_COUNT", FieldWidth::U32, true},
-            {0x4012, "VM_ENTRY_CONTROLS", FieldWidth::U32, true},
-            {0x4014, "VM_ENTRY_MSR_LOAD_COUNT", FieldWidth::U32, true},
-            {0x4016, "VM_ENTRY_INTR_INFO_FIELD", FieldWidth::U32, true},
-            {0x4018, "VM_ENTRY_EXCEPTION_ERROR_CODE", FieldWidth::U32, true},
-            {0x401A, "VM_ENTRY_INSTRUCTION_LEN", FieldWidth::U32, true},
-            {0x401C, "TPR_THRESHOLD", FieldWidth::U32, true},
-            {0x401E, "SECONDARY_VM_EXEC_CONTROL", FieldWidth::U32, true},
-            {0x4400, "VM_INSTRUCTION_ERROR", FieldWidth::U32, false},
-            {0x4402, "VM_EXIT_REASON", FieldWidth::U32, false},
-            {0x4404, "VM_EXIT_INTERRUPTION_INFO", FieldWidth::U32, false},
-            {0x4406, "VM_EXIT_INTERRUPTION_ERROR_CODE", FieldWidth::U32, false},
-            {0x4408, "IDT_VECTORING_INFO_FIELD", FieldWidth::U32, false},
-            {0x440A, "IDT_VECTORING_ERROR_CODE", FieldWidth::U32, false},
-            {0x440C, "VM_EXIT_INSTRUCTION_LEN", FieldWidth::U32, false},
-            {0x440E, "VMX_INSTRUCTION_INFO", FieldWidth::U32, false},
-            {0x4800, "GUEST_ES_LIMIT", FieldWidth::U32, true},
-            {0x4802, "GUEST_CS_LIMIT", FieldWidth::U32, true},
-            {0x4804, "GUEST_SS_LIMIT", FieldWidth::U32, true},
-            {0x4806, "GUEST_DS_LIMIT", FieldWidth::U32, true},
-            {0x4808, "GUEST_FS_LIMIT", FieldWidth::U32, true},
-            {0x480A, "GUEST_GS_LIMIT", FieldWidth::U32, true},
-            {0x480C, "GUEST_LDTR_LIMIT", FieldWidth::U32, true},
-            {0x480E, "GUEST_TR_LIMIT", FieldWidth::U32, true},
-            {0x4810, "GUEST_GDTR_LIMIT", FieldWidth::U32, true},
-            {0x4812, "GUEST_IDTR_LIMIT", FieldWidth::U32, true},
-            {0x4814, "GUEST_ES_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x4816, "GUEST_CS_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x4818, "GUEST_SS_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x481A, "GUEST_DS_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x481C, "GUEST_FS_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x481E, "GUEST_GS_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x4820, "GUEST_LDTR_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x4822, "GUEST_TR_ACCESS_RIGHTS", FieldWidth::U32, true},
-            {0x4824, "GUEST_INTERRUPTIBILITY_STATE", FieldWidth::U32, true},
-            {0x4826, "GUEST_ACTIVITY_STATE", FieldWidth::U32, true},
-            {0x4828, "GUEST_SMBASE", FieldWidth::U32, true},
-            {0x482A, "GUEST_SYSENTER_CS", FieldWidth::U32, true},
-            {0x482E, "VMX_PREEMPTION_TIMER_VALUE", FieldWidth::U32, true},
-            {0x6800, "GUEST_CR0", FieldWidth::Natural, true},
-            {0x6802, "GUEST_CR3", FieldWidth::Natural, true},
-            {0x6804, "GUEST_CR4", FieldWidth::Natural, true},
-            {0x6806, "GUEST_ES_BASE", FieldWidth::Natural, true},
-            {0x6808, "GUEST_CS_BASE", FieldWidth::Natural, true},
-            {0x680A, "GUEST_SS_BASE", FieldWidth::Natural, true},
-            {0x680C, "GUEST_DS_BASE", FieldWidth::Natural, true},
-            {0x680E, "GUEST_FS_BASE", FieldWidth::Natural, true},
-            {0x6810, "GUEST_GS_BASE", FieldWidth::Natural, true},
-            {0x6812, "GUEST_LDTR_BASE", FieldWidth::Natural, true},
-            {0x6814, "GUEST_TR_BASE", FieldWidth::Natural, true},
-            {0x6816, "GUEST_GDTR_BASE", FieldWidth::Natural, true},
-            {0x6818, "GUEST_IDTR_BASE", FieldWidth::Natural, true},
-            {0x681A, "GUEST_DR7", FieldWidth::Natural, true},
-            {0x681C, "GUEST_RSP", FieldWidth::Natural, true},
-            {0x681E, "GUEST_RIP", FieldWidth::Natural, true},
-            {0x6820, "GUEST_RFLAGS", FieldWidth::Natural, true},
-            {0x6822, "GUEST_PENDING_DBG_EXCEPTIONS", FieldWidth::Natural, true},
-            {0x6824, "GUEST_SYSENTER_ESP", FieldWidth::Natural, true},
-            {0x6826, "GUEST_SYSENTER_EIP", FieldWidth::Natural, true},
-            {0x6C00, "HOST_CR0", FieldWidth::Natural, true},
-            {0x6C02, "HOST_CR3", FieldWidth::Natural, true},
-            {0x6C04, "HOST_CR4", FieldWidth::Natural, true},
-            {0x6C06, "HOST_FS_BASE", FieldWidth::Natural, true},
-            {0x6C08, "HOST_GS_BASE", FieldWidth::Natural, true},
-            {0x6C0A, "HOST_TR_BASE", FieldWidth::Natural, true},
-            {0x6C0C, "HOST_GDTR_BASE", FieldWidth::Natural, true},
-            {0x6C0E, "HOST_IDTR_BASE", FieldWidth::Natural, true},
-            {0x6C10, "HOST_IA32_SYSENTER_ESP", FieldWidth::Natural, true},
-            {0x6C12, "HOST_IA32_SYSENTER_EIP", FieldWidth::Natural, true},
-            {0x6C14, "HOST_RSP", FieldWidth::Natural, true},
-            {0x6C16, "HOST_RIP", FieldWidth::Natural, true},
+            {0x0000, "VPID", Width::U16, Type::Control,
+             Group::VmExecutionControl, true},
+
+            {0x0800, "GUEST_ES_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x0802, "GUEST_CS_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x0804, "GUEST_SS_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x0806, "GUEST_DS_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x0808, "GUEST_FS_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x080A, "GUEST_GS_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x080C, "GUEST_LDTR_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+            {0x080E, "GUEST_TR_SELECTOR", Width::U16, Type::GuestState,
+             Group::GuestState, true},
+
+            {0x0C00, "HOST_ES_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C02, "HOST_CS_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C04, "HOST_SS_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C06, "HOST_DS_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C08, "HOST_FS_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C0A, "HOST_GS_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+            {0x0C0C, "HOST_TR_SELECTOR", Width::U16, Type::HostState,
+             Group::HostState, true},
+
+            {0x2000, "IO_BITMAP_A", Width::U64, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x2002, "IO_BITMAP_B", Width::U64, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x2004, "MSR_BITMAP", Width::U64, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x2006, "VM_EXIT_MSR_STORE_ADDR", Width::U64, Type::Control,
+             Group::VmExitControl, true},
+            {0x2008, "VM_EXIT_MSR_LOAD_ADDR", Width::U64, Type::Control,
+             Group::VmExitControl, true},
+            {0x200A, "VM_ENTRY_MSR_LOAD_ADDR", Width::U64, Type::Control,
+             Group::VmEntryControl, true},
+            {0x2010, "TSC_OFFSET", Width::U64, Type::Control,
+             Group::VmExecutionControl, true},
+
+            {0x2800, "VMCS_LINK_POINTER", Width::U64, Type::GuestState,
+             Group::GuestState, true},
+            {0x2802, "GUEST_IA32_DEBUGCTL", Width::U64, Type::GuestState,
+             Group::GuestState, true},
+            {0x2804, "GUEST_IA32_PAT", Width::U64, Type::GuestState,
+             Group::GuestState, true},
+            {0x2806, "GUEST_IA32_EFER", Width::U64, Type::GuestState,
+             Group::GuestState, true},
+            {0x2808, "GUEST_IA32_PERF_GLOBAL_CTRL", Width::U64,
+             Type::GuestState, Group::GuestState, true},
+
+            {0x2C00, "HOST_IA32_PAT", Width::U64, Type::HostState,
+             Group::HostState, true},
+            {0x2C02, "HOST_IA32_EFER", Width::U64, Type::HostState,
+             Group::HostState, true},
+            {0x2C04, "HOST_IA32_PERF_GLOBAL_CTRL", Width::U64,
+             Type::HostState, Group::HostState, true},
+
+            {0x4000, "PIN_BASED_VM_EXEC_CONTROL", Width::U32,
+             Type::Control, Group::VmExecutionControl, true},
+            {0x4002, "CPU_BASED_VM_EXEC_CONTROL", Width::U32,
+             Type::Control, Group::VmExecutionControl, true},
+            {0x4004, "EXCEPTION_BITMAP", Width::U32, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x4006, "PAGE_FAULT_ERROR_CODE_MASK", Width::U32,
+             Type::Control, Group::VmExecutionControl, true},
+            {0x4008, "PAGE_FAULT_ERROR_CODE_MATCH", Width::U32,
+             Type::Control, Group::VmExecutionControl, true},
+            {0x400A, "CR3_TARGET_COUNT", Width::U32, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x400C, "VM_EXIT_CONTROLS", Width::U32, Type::Control,
+             Group::VmExitControl, true},
+            {0x400E, "VM_EXIT_MSR_STORE_COUNT", Width::U32,
+             Type::Control, Group::VmExitControl, true},
+            {0x4010, "VM_EXIT_MSR_LOAD_COUNT", Width::U32,
+             Type::Control, Group::VmExitControl, true},
+            {0x4012, "VM_ENTRY_CONTROLS", Width::U32, Type::Control,
+             Group::VmEntryControl, true},
+            {0x4014, "VM_ENTRY_MSR_LOAD_COUNT", Width::U32,
+             Type::Control, Group::VmEntryControl, true},
+            {0x4016, "VM_ENTRY_INTR_INFO_FIELD", Width::U32,
+             Type::Control, Group::VmEntryControl, true},
+            {0x4018, "VM_ENTRY_EXCEPTION_ERROR_CODE", Width::U32,
+             Type::Control, Group::VmEntryControl, true},
+            {0x401A, "VM_ENTRY_INSTRUCTION_LEN", Width::U32,
+             Type::Control, Group::VmEntryControl, true},
+            {0x401C, "TPR_THRESHOLD", Width::U32, Type::Control,
+             Group::VmExecutionControl, true},
+            {0x401E, "SECONDARY_VM_EXEC_CONTROL", Width::U32,
+             Type::Control, Group::VmExecutionControl, true},
+
+            {0x4400, "VM_INSTRUCTION_ERROR", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x4402, "VM_EXIT_REASON", Width::U32, Type::VmExitInfo,
+             Group::VmExitInformation, false},
+            {0x4404, "VM_EXIT_INTERRUPTION_INFO", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x4406, "VM_EXIT_INTERRUPTION_ERROR_CODE", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x4408, "IDT_VECTORING_INFO_FIELD", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x440A, "IDT_VECTORING_ERROR_CODE", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x440C, "VM_EXIT_INSTRUCTION_LEN", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+            {0x440E, "VMX_INSTRUCTION_INFO", Width::U32,
+             Type::VmExitInfo, Group::VmExitInformation, false},
+
+            {0x4800, "GUEST_ES_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4802, "GUEST_CS_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4804, "GUEST_SS_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4806, "GUEST_DS_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4808, "GUEST_FS_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x480A, "GUEST_GS_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x480C, "GUEST_LDTR_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x480E, "GUEST_TR_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4810, "GUEST_GDTR_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4812, "GUEST_IDTR_LIMIT", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x4814, "GUEST_ES_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4816, "GUEST_CS_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4818, "GUEST_SS_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x481A, "GUEST_DS_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x481C, "GUEST_FS_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x481E, "GUEST_GS_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4820, "GUEST_LDTR_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4822, "GUEST_TR_ACCESS_RIGHTS", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4824, "GUEST_INTERRUPTIBILITY_STATE", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4826, "GUEST_ACTIVITY_STATE", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+            {0x4828, "GUEST_SMBASE", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x482A, "GUEST_SYSENTER_CS", Width::U32, Type::GuestState,
+             Group::GuestState, true},
+            {0x482E, "VMX_PREEMPTION_TIMER_VALUE", Width::U32,
+             Type::GuestState, Group::GuestState, true},
+
+            {0x6800, "GUEST_CR0", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6802, "GUEST_CR3", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6804, "GUEST_CR4", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6806, "GUEST_ES_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6808, "GUEST_CS_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x680A, "GUEST_SS_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x680C, "GUEST_DS_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x680E, "GUEST_FS_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6810, "GUEST_GS_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6812, "GUEST_LDTR_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6814, "GUEST_TR_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6816, "GUEST_GDTR_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6818, "GUEST_IDTR_BASE", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x681A, "GUEST_DR7", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x681C, "GUEST_RSP", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x681E, "GUEST_RIP", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6820, "GUEST_RFLAGS", Width::Natural, Type::GuestState,
+             Group::GuestState, true},
+            {0x6822, "GUEST_PENDING_DBG_EXCEPTIONS", Width::Natural,
+             Type::GuestState, Group::GuestState, true},
+            {0x6824, "GUEST_SYSENTER_ESP", Width::Natural,
+             Type::GuestState, Group::GuestState, true},
+            {0x6826, "GUEST_SYSENTER_EIP", Width::Natural,
+             Type::GuestState, Group::GuestState, true},
+
+            {0x6C00, "HOST_CR0", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C02, "HOST_CR3", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C04, "HOST_CR4", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C06, "HOST_FS_BASE", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C08, "HOST_GS_BASE", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C0A, "HOST_TR_BASE", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C0C, "HOST_GDTR_BASE", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C0E, "HOST_IDTR_BASE", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C10, "HOST_IA32_SYSENTER_ESP", Width::Natural,
+             Type::HostState, Group::HostState, true},
+            {0x6C12, "HOST_IA32_SYSENTER_EIP", Width::Natural,
+             Type::HostState, Group::HostState, true},
+            {0x6C14, "HOST_RSP", Width::Natural, Type::HostState,
+             Group::HostState, true},
+            {0x6C16, "HOST_RIP", Width::Natural, Type::HostState,
+             Group::HostState, true},
         };
 
-        if (encoding > 0xFFFF) return nullptr;
+        if (encoding > VmcsEncodingMask) return nullptr;
 
         for (const auto &field : supportedFields) {
             if (field.encoding == encoding) {
@@ -286,6 +436,17 @@ class Vmcs
         }
 
         return mask(64);
+    }
+
+    static bool
+    decodeEncoding(RawEncoding raw_encoding, Encoding &encoding)
+    {
+        if (raw_encoding & ~VmcsEncodingMask) {
+            return false;
+        }
+
+        encoding = static_cast<Encoding>(raw_encoding);
+        return true;
     }
 
     static uint64_t
