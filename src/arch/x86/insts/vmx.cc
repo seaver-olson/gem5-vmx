@@ -176,7 +176,7 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA)
 VmxResult
 VmxState::vmptrld(ExecContext *xc, Addr operandEA)
 {
-    auto *tc = xc->tcBase();
+    auto *tc = xc->tcBase(); // vmptrld does not require VMX to be active, but the operand still needs to be validated
     uint64_t regionPtr = 0;
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
@@ -197,8 +197,8 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA)
 VmxResult
 VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 {
-    uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64);
-    const std::vector<bool> byteEnable(sizeof(regionPtr), true);
+    uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64); // if no current VMCS, return all 1s per SDM
+    const std::vector<bool> byteEnable(sizeof(regionPtr), true); // Enable all bytes for the write
 
     if (!vmxActive) {
         return VmxResult::failInvalid();
@@ -218,67 +218,70 @@ VmxResult
 VmxState::vmread(Vmcs::RawEncoding rawEncoding, uint64_t &value) const
 {
     const Vmcs *vmcs = currentVmcs();
+    // If there is no current VMCS or VMX is not active, instruction fails with VMfailInvalid (make sure to select a vmcs with vmptrld before vmwrite or vmread)
     if (!vmxActive || !vmcs) {
-        return VmxResult::failInvalid();
+        return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
     }
 
     Vmcs::Encoding encoding = 0;
+    // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent);
+                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
     }
-
+    // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
         return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent);
+                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
     }
-
+    // checks if the field is readable. If not, the instruction fails with VMfailValid
     if (!vmcs->read(encoding, value)) {
         return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent);
+                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
     }
 
-    return VmxResult::success();
+    return VmxResult::success(); // Field read, CF=0, ZF=0
 }
 
 VmxResult
 VmxState::vmwrite(Vmcs::RawEncoding rawEncoding, uint64_t value)
 {
     Vmcs *vmcs = currentVmcs();
-    if (!vmxActive || !vmcs) {
-        return VmxResult::failInvalid();
-    }
 
+    // If there is no current VMCS or VMX is not active, instruction fails with VMfailInvalid (make sure to select a vmcs with vmptrld before vmwrite or vmread)
+    if (!vmxActive || !vmcs) {
+        return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
+    }
+    // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     Vmcs::Encoding encoding = 0;
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
     }
-
+    // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
     }
-
+    // Once field is determined, checks if the field is read-only. If true then the instruction fails with VMfailValid
     if (!Vmcs::fieldWritable(encoding)) {
-        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent);
+        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent); // CF=1, ZF=0, VM-instruction error field = 13 (VMXErrWriteReadOnlyComponent)
     }
 
     if (!vmcs->write(encoding, value)) {
-        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent);
+        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent); // CF=1, ZF=0, VM-instruction error field = 13 (VMXErrWriteReadOnlyComponent)
     }
 
-    return VmxResult::success();
+    return VmxResult::success(); // Field written, CF=0, ZF=0
 }
 
 void
 VmxState::serialize(CheckpointOut &cp) const
 {
     size_t numVmcsRegions = vmcsRegions.size();
-
     SERIALIZE_SCALAR(vmxActive);
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
     SERIALIZE_SCALAR(numVmcsRegions);
-
+    // Serialize each VMCS region with a unique section name.
     size_t index = 0;
     for (const auto &[regionPtr, vmcs] : vmcsRegions) {
         Serializable::ScopedCheckpointSection sec(
@@ -290,6 +293,7 @@ VmxState::serialize(CheckpointOut &cp) const
 void
 VmxState::unserialize(CheckpointIn &cp)
 {
+    // if vmx is not active, skip serializing the rest of the state since it should be ignored on vmxoff and vmxon resets the state
     if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;
         vmxonRegion = 0;
