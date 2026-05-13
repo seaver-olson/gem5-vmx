@@ -114,6 +114,13 @@ output decoder {{
         flags[IsNonSpeculative] = true;
         flags[IsSerializing] = true;
         flags[IsSerializeAfter] = true;
+        if (strcmp(mnemonic, "vmcall") == 0 ||
+                strcmp(mnemonic, "vmlaunch") == 0 ||
+                strcmp(mnemonic, "vmresume") == 0) {
+            flags[IsControl] = true;
+            flags[IsIndirectControl] = true;
+            flags[IsUncondControl] = true;
+        }
     }
 
     std::string
@@ -212,6 +219,24 @@ output exec {{
         }
 
         X86ISA::setRFlags(tc, rflags);
+    }
+
+    void
+    redirectNextPc(ThreadContext *tc, Addr nextPc)
+    {
+        X86ISA::PCState pc = tc->pcState().as<X86ISA::PCState>();
+        pc.setNPC(nextPc);
+        tc->pcState(pc);
+    }
+
+    void
+    completeVmxResult(ThreadContext *tc, const X86ISA::VmxResult &result)
+    {
+        if (result.redirectsNextPc) {
+            redirectNextPc(tc, result.nextPc);
+        } else {
+            setVmxResult(tc, result);
+        }
     }
 
     } // namespace
@@ -384,6 +409,12 @@ def template VmxNoOperandExecute {{
 
         if (strcmp(mnemonic, "vmxoff") == 0) {
             result = isa->vmxState().vmxoff();
+        } else if (strcmp(mnemonic, "vmlaunch") == 0) {
+            result = isa->vmxState().vmlaunch(xc);
+        } else if (strcmp(mnemonic, "vmresume") == 0) {
+            result = isa->vmxState().vmresume(xc);
+        } else if (strcmp(mnemonic, "vmcall") == 0) {
+            result = isa->vmxState().vmcall(xc, size());
         } else {
             panic("Unhandled VMX no-operand instruction '%s'", mnemonic);
         }
@@ -392,7 +423,7 @@ def template VmxNoOperandExecute {{
             return result.fault;
         }
 
-        setVmxResult(xc->tcBase(), result);
+        completeVmxResult(xc->tcBase(), result);
         return NoFault;
     }
 }};

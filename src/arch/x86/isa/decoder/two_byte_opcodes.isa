@@ -65,9 +65,9 @@
             0x01: decode MODRM_REG {
                 0x0: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
-                        0x1: vmcall();
-                        0x2: vmlaunch();
-                        0x3: vmresume();
+                        0x1: Cpl0VmxNoOperandInst::VMCALL();
+                        0x2: Cpl0VmxNoOperandInst::VMLAUNCH();
+                        0x3: Cpl0VmxNoOperandInst::VMRESUME();
                         0x4: Cpl0VmxNoOperandInst::VMXOFF();
                         default: Inst::UD2();
                     }

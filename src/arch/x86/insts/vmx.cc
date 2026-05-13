@@ -4,6 +4,7 @@
 #include <utility> // for std::pair and std::move
 #include <vector>
 
+#include "arch/x86/decoder.hh"
 #include "arch/x86/isa.hh"
 #include "arch/x86/regs/misc.hh"
 #include "base/bitfield.hh"
@@ -20,6 +21,14 @@ namespace
 {
 constexpr uint32_t VmxErrUnsupportedComponent = 12;
 constexpr uint32_t VmxErrWriteReadOnlyComponent = 13;
+constexpr uint32_t VmxErrVmcallInRoot = 1;
+constexpr uint32_t VmxErrVmlaunchNonClearVmcs = 4;
+constexpr uint32_t VmxErrVmresumeNonLaunchedVmcs = 5;
+constexpr uint32_t VmxExitReasonVmcall = 18;
+constexpr Vmcs::Encoding VmcsVmExitReason = 0x4402;
+constexpr Vmcs::Encoding VmcsVmExitInstructionLen = 0x440C;
+constexpr Vmcs::Encoding VmcsGuestRip = 0x681E;
+constexpr Vmcs::Encoding VmcsHostRip = 0x6C16;
 
 uint32_t
 vmcsRevisionId(ThreadContext *tc)
@@ -82,7 +91,88 @@ vmFailValid(Vmcs *vmcs, uint32_t error)
     return VmxResult::failValid(error);
 }
 
+Addr
+currentRip(ThreadContext *tc)
+{
+    const auto &pc = tc->pcState().as<PCState>();
+    const Addr csBase = tc->readMiscRegNoEffect(misc_reg::CsBase);
+    return pc.instAddr() - csBase;
+}
+
 } // namespace
+
+void
+VmxState::RootSnapshot::capture(ThreadContext *tc)
+{
+    for (size_t idx = 0; idx < NumSegmentRegs; ++idx) {
+        selector[idx] = tc->readMiscRegNoEffect(misc_reg::segSel(idx));
+        base[idx] = tc->readMiscRegNoEffect(misc_reg::segBase(idx));
+        effBase[idx] = tc->readMiscRegNoEffect(misc_reg::segEffBase(idx));
+        limit[idx] = tc->readMiscRegNoEffect(misc_reg::segLimit(idx));
+        attr[idx] = tc->readMiscRegNoEffect(misc_reg::segAttr(idx));
+    }
+    m5Reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    valid = true;
+}
+
+void
+VmxState::RootSnapshot::restore(ThreadContext *tc) const
+{
+    if (!valid) {
+        return;
+    }
+
+    for (size_t idx = 0; idx < NumSegmentRegs; ++idx) {
+        tc->setMiscRegNoEffect(misc_reg::segSel(idx), selector[idx]);
+        tc->setMiscRegNoEffect(misc_reg::segBase(idx), base[idx]);
+        tc->setMiscRegNoEffect(misc_reg::segEffBase(idx), effBase[idx]);
+        tc->setMiscRegNoEffect(misc_reg::segLimit(idx), limit[idx]);
+        tc->setMiscRegNoEffect(misc_reg::segAttr(idx), attr[idx]);
+    }
+
+    tc->setMiscRegNoEffect(misc_reg::M5Reg, m5Reg);
+    tc->getDecoderPtr()->as<Decoder>().setM5Reg(m5Reg);
+}
+
+void
+VmxState::RootSnapshot::clear()
+{
+    valid = false;
+    selector = {};
+    base = {};
+    effBase = {};
+    limit = {};
+    attr = {};
+    m5Reg = 0;
+}
+
+void
+VmxState::RootSnapshot::serialize(CheckpointOut &cp) const
+{
+    SERIALIZE_SCALAR(valid);
+    arrayParamOut(cp, "selector", selector.data(), NumSegmentRegs);
+    arrayParamOut(cp, "base", base.data(), NumSegmentRegs);
+    arrayParamOut(cp, "effBase", effBase.data(), NumSegmentRegs);
+    arrayParamOut(cp, "limit", limit.data(), NumSegmentRegs);
+    arrayParamOut(cp, "attr", attr.data(), NumSegmentRegs);
+    SERIALIZE_SCALAR(m5Reg);
+}
+
+void
+VmxState::RootSnapshot::unserialize(CheckpointIn &cp)
+{
+    if (!UNSERIALIZE_OPT_SCALAR(valid)) {
+        clear();
+        return;
+    }
+
+    arrayParamIn(cp, "selector", selector.data(), NumSegmentRegs);
+    arrayParamIn(cp, "base", base.data(), NumSegmentRegs);
+    arrayParamIn(cp, "effBase", effBase.data(), NumSegmentRegs);
+    arrayParamIn(cp, "limit", limit.data(), NumSegmentRegs);
+    arrayParamIn(cp, "attr", attr.data(), NumSegmentRegs);
+    UNSERIALIZE_SCALAR(m5Reg);
+}
 
 Vmcs *
 VmxState::findVmcs(Addr regionPtr)
@@ -126,8 +216,10 @@ VmxState::vmxon(ExecContext *xc, Addr operandEA)
     }
 
     vmxActive = true;
+    inVmxNonRoot = false;
     vmxonRegion = regionPtr;
     currentVmcsPtr = 0;
+    rootSnapshot.clear();
     return VmxResult::success();
 }
 
@@ -139,8 +231,10 @@ VmxState::vmxoff()
     }
 
     vmxActive = false;
+    inVmxNonRoot = false;
     vmxonRegion = 0;
     currentVmcsPtr = 0;
+    rootSnapshot.clear();
     return VmxResult::success();
 }
 
@@ -215,6 +309,80 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
+VmxState::vmlaunch(ExecContext *xc)
+{
+    auto *tc = xc->tcBase();
+    Vmcs *vmcs = currentVmcs();
+
+    if (!vmxActive || inVmxNonRoot || !vmcs) {
+        return VmxResult::failInvalid();
+    }
+    if (vmcs->launched()) {
+        return vmFailValid(vmcs, VmxErrVmlaunchNonClearVmcs);
+    }
+
+    uint64_t guestRip = 0;
+    if (!vmcs->read(VmcsGuestRip, guestRip)) {
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+    }
+
+    rootSnapshot.capture(tc);
+    inVmxNonRoot = true;
+    vmcs->setLaunched(true);
+    return VmxResult::successRedirect(guestRip);
+}
+
+VmxResult
+VmxState::vmresume(ExecContext *xc)
+{
+    auto *tc = xc->tcBase();
+    Vmcs *vmcs = currentVmcs();
+
+    if (!vmxActive || inVmxNonRoot || !vmcs) {
+        return VmxResult::failInvalid();
+    }
+    if (!vmcs->launched()) {
+        return vmFailValid(vmcs, VmxErrVmresumeNonLaunchedVmcs);
+    }
+
+    uint64_t guestRip = 0;
+    if (!vmcs->read(VmcsGuestRip, guestRip)) {
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+    }
+
+    rootSnapshot.capture(tc);
+    inVmxNonRoot = true;
+    return VmxResult::successRedirect(guestRip);
+}
+
+VmxResult
+VmxState::vmcall(ExecContext *xc, uint8_t instructionSize)
+{
+    auto *tc = xc->tcBase();
+    Vmcs *vmcs = currentVmcs();
+
+    if (!vmxActive || !vmcs) {
+        return VmxResult::failInvalid();
+    }
+    if (!inVmxNonRoot) {
+        return vmFailValid(vmcs, VmxErrVmcallInRoot);
+    }
+
+    uint64_t hostRip = 0;
+    if (!vmcs->read(VmcsHostRip, hostRip)) {
+        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+    }
+
+    vmcs->writeUnchecked(VmcsGuestRip, currentRip(tc));
+    vmcs->writeUnchecked(VmcsVmExitReason, VmxExitReasonVmcall);
+    vmcs->writeUnchecked(VmcsVmExitInstructionLen, instructionSize);
+
+    rootSnapshot.restore(tc);
+    inVmxNonRoot = false;
+    return VmxResult::successRedirect(hostRip);
+}
+
+VmxResult
 VmxState::vmread(Vmcs::RawEncoding rawEncoding, uint64_t &value) const
 {
     const Vmcs *vmcs = currentVmcs();
@@ -278,9 +446,14 @@ VmxState::serialize(CheckpointOut &cp) const
 {
     size_t numVmcsRegions = vmcsRegions.size();
     SERIALIZE_SCALAR(vmxActive);
+    SERIALIZE_SCALAR(inVmxNonRoot);
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
     SERIALIZE_SCALAR(numVmcsRegions);
+    {
+        Serializable::ScopedCheckpointSection sec(cp, "rootSnapshot");
+        rootSnapshot.serialize(cp);
+    }
     // Serialize each VMCS region with a unique section name.
     size_t index = 0;
     for (const auto &[regionPtr, vmcs] : vmcsRegions) {
@@ -296,16 +469,28 @@ VmxState::unserialize(CheckpointIn &cp)
     // if vmx is not active, skip serializing the rest of the state since it should be ignored on vmxoff and vmxon resets the state
     if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;
+        inVmxNonRoot = false;
         vmxonRegion = 0;
         currentVmcsPtr = 0;
         vmcsRegions.clear();
+        rootSnapshot.clear();
         return;
     }
 
     size_t numVmcsRegions = 0;
+    if (!UNSERIALIZE_OPT_SCALAR(inVmxNonRoot)) {
+        inVmxNonRoot = false;
+    }
     UNSERIALIZE_SCALAR(vmxonRegion);
     UNSERIALIZE_SCALAR(currentVmcsPtr);
     UNSERIALIZE_SCALAR(numVmcsRegions);
+
+    if (cp.sectionExists(Serializable::currentSection() + ".rootSnapshot")) {
+        Serializable::ScopedCheckpointSection sec(cp, "rootSnapshot");
+        rootSnapshot.unserialize(cp);
+    } else {
+        rootSnapshot.clear();
+    }
 
     vmcsRegions.clear();
     for (size_t index = 0; index < numVmcsRegions; ++index) {
