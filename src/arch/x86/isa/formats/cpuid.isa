@@ -72,6 +72,12 @@ def template CPUIDExecute {{
         // be set to true. Otherwise, the instruction does nothing.
         %(op_decl)s;
         %(op_rd)s;
+        ISA *vmxIsa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+        if (vmxIsa && vmxIsa->vmxState().nonRootActive()) {
+            vmxIsa->vmxState().vmexitInstruction(
+                    xc, VmxExitReason::Cpuid, size());
+            return NoFault;
+        }
         %(code)s;
         %(op_wb)s;
         return NoFault;

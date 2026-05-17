@@ -8,6 +8,7 @@
 #include "arch/x86/regs/segment.hh"
 #include "arch/x86/vmcs.hh"
 #include "base/types.hh"
+#include "cpu/null_static_inst.hh"
 #include "sim/faults.hh"
 #include "sim/serialize.hh"
 
@@ -18,6 +19,161 @@ class ThreadContext;
 
 namespace X86ISA
 {
+
+// Intel SDM Vol. 3 Appendix C basic VM-exit reasons.
+enum class VmxExitReason : uint32_t
+{
+    ExceptionOrNmi = 0,
+    ExternalInterrupt = 1,
+    TripleFault = 2,
+    InitSignal = 3,
+    StartupIpi = 4,
+    IoSmi = 5,
+    OtherSmi = 6,
+    InterruptWindow = 7,
+    NmiWindow = 8,
+    TaskSwitch = 9,
+    Cpuid = 10,
+    Getsec = 11,
+    Hlt = 12,
+    Invd = 13,
+    Invlpg = 14,
+    Rdpmc = 15,
+    Rdtsc = 16,
+    Rsm = 17,
+    Vmcall = 18,
+    Vmclear = 19,
+    Vmlaunch = 20,
+    Vmptrld = 21,
+    Vmptrst = 22,
+    Vmread = 23,
+    Vmresume = 24,
+    Vmwrite = 25,
+    Vmxoff = 26,
+    Vmxon = 27,
+    ControlRegisterAccess = 28,
+    MovDr = 29,
+    IoInstruction = 30,
+    Rdmsr = 31,
+    Wrmsr = 32,
+    VmEntryInvalidGuestState = 33,
+    VmEntryMsrLoad = 34,
+    Mwait = 36,
+    MonitorTrapFlag = 37,
+    Monitor = 39,
+    Pause = 40,
+    VmEntryMachineCheck = 41,
+    TprBelowThreshold = 43,
+    ApicAccess = 44,
+    VirtualizedEoi = 45,
+    AccessGdtrOrIdtr = 46,
+    AccessLdtrOrTr = 47,
+    EptViolation = 48,
+    EptMisconfiguration = 49,
+    Invept = 50,
+    Rdtscp = 51,
+    VmxPreemptionTimerExpired = 52,
+    Invvpid = 53,
+    Wbinvd = 54,
+    Xsetbv = 55,
+    ApicWrite = 56,
+    Rdrand = 57,
+    Invpcid = 58,
+    Vmfunc = 59,
+    Encls = 60,
+    Rdseed = 61,
+    PageModificationLogFull = 62,
+    Xsaves = 63,
+    Xrstors = 64,
+};
+
+// Intel SDM Vol. 3 Appendix C VM-instruction error numbers.
+enum class VmxInstructionError : uint32_t
+{
+    VmcallInRoot = 1,
+    VmclearInvalidPhysicalAddress = 2,
+    VmclearWithVmxonPointer = 3,
+    VmlaunchNonClearVmcs = 4,
+    VmresumeNonLaunchedVmcs = 5,
+    VmresumeAfterVmxoff = 6,
+    VmEntryInvalidControlFields = 7,
+    VmEntryInvalidHostState = 8,
+    VmptrldInvalidPhysicalAddress = 9,
+    VmptrldWithVmxonPointer = 10,
+    VmptrldIncorrectVmcsRevision = 11,
+    UnsupportedVmcsComponent = 12,
+    VmwriteReadOnlyVmcsComponent = 13,
+    VmxonInRoot = 15,
+    VmEntryInvalidExecutiveVmcsPointer = 16,
+    VmEntryNonLaunchedExecutiveVmcs = 17,
+    VmEntryExecutiveVmcsPointerNotVmxonPointer = 18,
+    VmcallNonClearVmcs = 19,
+    VmcallInvalidVmExitControls = 20,
+    VmcallIncorrectMsegRevision = 22,
+    VmxoffUnderDualMonitorTreatment = 23,
+    VmcallInvalidSmmMonitorFeatures = 24,
+    VmEntryInvalidExecutiveVmcsVmExecutionControls = 25,
+    VmEntryEventsBlockedByMovSs = 26,
+    InveptInvvpidInvalidOperand = 28,
+};
+
+enum class VmxInterruptionType : uint8_t
+{
+    ExternalInterrupt = 0,
+    Nmi = 2,
+    HardwareException = 3,
+    SoftwareInterrupt = 4,
+    PrivilegedSoftwareException = 5,
+    SoftwareException = 6,
+};
+
+enum class VmxCrAccessType : uint8_t
+{
+    MovToCr = 0,
+    MovFromCr = 1,
+    Clts = 2,
+    Lmsw = 3,
+};
+
+struct VmxExitInfo
+{
+    VmxExitReason reason = VmxExitReason::ExceptionOrNmi;
+    bool vmEntryFailure = false;
+
+    bool hasQualification = false;
+    uint64_t qualification = 0;
+
+    bool hasInstructionLength = false;
+    uint32_t instructionLength = 0;
+
+    bool hasInstructionInfo = false;
+    uint32_t instructionInfo = 0;
+
+    bool hasInterruptionInfo = false;
+    uint32_t interruptionInfo = 0;
+
+    bool hasInterruptionErrorCode = false;
+    uint32_t interruptionErrorCode = 0;
+
+    bool hasGuestLinearAddress = false;
+    uint64_t guestLinearAddress = 0;
+
+    bool hasGuestPhysicalAddress = false;
+    uint64_t guestPhysicalAddress = 0;
+};
+
+class VmxExitFault : public FaultBase
+{
+  private:
+    VmxExitInfo exitInfo;
+
+  public:
+    explicit VmxExitFault(const VmxExitInfo &info) : exitInfo(info) {}
+
+    const char *name() const override { return "vmx_exit"; }
+    void invoke(ThreadContext *tc, const StaticInstPtr &inst =
+            nullStaticInstPtr) override;
+};
 
 enum class VmxStatus : uint8_t
 {
@@ -117,17 +273,51 @@ class VmxState
     Addr vmxonPtr() const { return vmxonRegion; }
     Addr currentVmcsPointer() const { return currentVmcsPtr; }
 
-    VmxResult vmxon(ExecContext *xc, Addr operandEA);
-    VmxResult vmxoff();
-    VmxResult vmclear(ExecContext *xc, Addr operandEA);
-    VmxResult vmptrld(ExecContext *xc, Addr operandEA);
-    VmxResult vmptrst(ExecContext *xc, Addr operandEA);
-    VmxResult vmlaunch(ExecContext *xc);
-    VmxResult vmresume(ExecContext *xc);
+    VmxResult vmxon(ExecContext *xc, Addr operandEA,
+            uint8_t instructionSize);
+    VmxResult vmxoff(ExecContext *xc, uint8_t instructionSize);
+    VmxResult vmclear(ExecContext *xc, Addr operandEA,
+            uint8_t instructionSize);
+    VmxResult vmptrld(ExecContext *xc, Addr operandEA,
+            uint8_t instructionSize);
+    VmxResult vmptrst(ExecContext *xc, Addr operandEA,
+            uint8_t instructionSize);
+    VmxResult vmlaunch(ExecContext *xc, uint8_t instructionSize);
+    VmxResult vmresume(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmcall(ExecContext *xc, uint8_t instructionSize);
 
-    VmxResult vmread(Vmcs::RawEncoding encoding, uint64_t &value) const;
-    VmxResult vmwrite(Vmcs::RawEncoding encoding, uint64_t value);
+    VmxResult vmread(ExecContext *xc, Vmcs::RawEncoding encoding,
+            uint64_t &value, uint8_t instructionSize);
+    VmxResult vmwrite(ExecContext *xc, Vmcs::RawEncoding encoding,
+            uint64_t value, uint8_t instructionSize);
+
+    bool shouldExitOnException(uint8_t vector, uint64_t errorCode) const;
+    bool shouldExitOnExternalInterrupt() const;
+    bool shouldExitOnNmi() const;
+    bool hltCausesExit() const;
+    bool invlpgCausesExit() const;
+    bool movDrCausesExit() const;
+    bool rdmsrCausesExit(ThreadContext *tc, uint32_t msr) const;
+    bool wrmsrCausesExit(ThreadContext *tc, uint32_t msr) const;
+    bool ioInstructionCausesExit(ThreadContext *tc, uint16_t port,
+            size_t size) const;
+    bool controlRegisterAccessCausesExit(uint8_t cr, VmxCrAccessType type,
+            uint64_t value = 0) const;
+
+    VmxResult vmexitInstruction(ExecContext *xc, VmxExitReason reason,
+            uint8_t instructionSize, uint64_t qualification = 0,
+            uint32_t instructionInfo = 0);
+    VmxResult controlRegisterExit(ExecContext *xc, uint8_t cr,
+            VmxCrAccessType type, uint8_t gpr, uint64_t value,
+            uint8_t instructionSize);
+    VmxResult debugRegisterExit(ExecContext *xc, uint8_t dr, bool fromDr,
+            uint8_t gpr, uint8_t instructionSize);
+    bool vmexitEvent(ThreadContext *tc, const VmxExitInfo &exitInfo);
+    bool vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
+            Addr *hostRip = nullptr);
+
+    Fault ioExitFault(bool read, uint16_t port, size_t size) const;
+    Fault msrExitFault(bool read, uint32_t msr) const;
 
     void serialize(CheckpointOut &cp) const;
     void unserialize(CheckpointIn &cp);

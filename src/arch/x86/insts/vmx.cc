@@ -1,5 +1,6 @@
 #include "arch/x86/insts/vmx.hh"
 
+#include <memory>
 #include <string> // for std::to_string
 #include <utility> // for std::pair and std::move
 #include <vector>
@@ -19,16 +20,56 @@ namespace X86ISA
 {
 namespace
 {
-constexpr uint32_t VmxErrUnsupportedComponent = 12;
-constexpr uint32_t VmxErrWriteReadOnlyComponent = 13;
-constexpr uint32_t VmxErrVmcallInRoot = 1;
-constexpr uint32_t VmxErrVmlaunchNonClearVmcs = 4;
-constexpr uint32_t VmxErrVmresumeNonLaunchedVmcs = 5;
-constexpr uint32_t VmxExitReasonVmcall = 18;
+constexpr uint32_t
+toInt(VmxExitReason reason)
+{
+    return static_cast<uint32_t>(reason);
+}
+
+constexpr uint32_t
+toInt(VmxInstructionError error)
+{
+    return static_cast<uint32_t>(error);
+}
+
 constexpr Vmcs::Encoding VmcsVmExitReason = 0x4402;
+constexpr Vmcs::Encoding VmcsVmExitInterruptionInfo = 0x4404;
+constexpr Vmcs::Encoding VmcsVmExitInterruptionErrorCode = 0x4406;
 constexpr Vmcs::Encoding VmcsVmExitInstructionLen = 0x440C;
+constexpr Vmcs::Encoding VmcsVmxInstructionInfo = 0x440E;
+constexpr Vmcs::Encoding VmcsPinBasedVmExecControl = 0x4000;
+constexpr Vmcs::Encoding VmcsCpuBasedVmExecControl = 0x4002;
+constexpr Vmcs::Encoding VmcsExceptionBitmap = 0x4004;
+constexpr Vmcs::Encoding VmcsPageFaultErrorCodeMask = 0x4006;
+constexpr Vmcs::Encoding VmcsPageFaultErrorCodeMatch = 0x4008;
+constexpr Vmcs::Encoding VmcsIoBitmapA = 0x2000;
+constexpr Vmcs::Encoding VmcsIoBitmapB = 0x2002;
+constexpr Vmcs::Encoding VmcsMsrBitmap = 0x2004;
+constexpr Vmcs::Encoding VmcsGuestPhysicalAddress = 0x2400;
+constexpr Vmcs::Encoding VmcsCr0GuestHostMask = 0x6000;
+constexpr Vmcs::Encoding VmcsCr4GuestHostMask = 0x6002;
+constexpr Vmcs::Encoding VmcsCr0ReadShadow = 0x6004;
+constexpr Vmcs::Encoding VmcsCr4ReadShadow = 0x6006;
+constexpr Vmcs::Encoding VmcsExitQualification = 0x6400;
+constexpr Vmcs::Encoding VmcsGuestLinearAddress = 0x640A;
 constexpr Vmcs::Encoding VmcsGuestRip = 0x681E;
 constexpr Vmcs::Encoding VmcsHostRip = 0x6C16;
+
+constexpr uint32_t PinBasedExternalInterruptExiting = 1u << 0;
+constexpr uint32_t PinBasedNmiExiting = 1u << 3;
+
+constexpr uint32_t CpuBasedHltExiting = 1u << 7;
+constexpr uint32_t CpuBasedInvlpgExiting = 1u << 9;
+constexpr uint32_t CpuBasedCr3LoadExiting = 1u << 15;
+constexpr uint32_t CpuBasedCr3StoreExiting = 1u << 16;
+constexpr uint32_t CpuBasedCr8LoadExiting = 1u << 19;
+constexpr uint32_t CpuBasedCr8StoreExiting = 1u << 20;
+constexpr uint32_t CpuBasedMovDrExiting = 1u << 23;
+constexpr uint32_t CpuBasedUnconditionalIoExiting = 1u << 24;
+constexpr uint32_t CpuBasedUseIoBitmaps = 1u << 25;
+constexpr uint32_t CpuBasedUseMsrBitmaps = 1u << 28;
+
+constexpr uint32_t VmExitReasonVmEntryFailure = 1u << 31;
 
 uint32_t
 vmcsRevisionId(ThreadContext *tc)
@@ -99,11 +140,451 @@ currentRip(ThreadContext *tc)
     return pc.instAddr() - csBase;
 }
 
+void
+redirectNextPc(ThreadContext *tc, Addr nextPc)
+{
+    PCState pc = tc->pcState().as<PCState>();
+    pc.setNPC(nextPc);
+    tc->pcState(pc);
+}
+
+void
+redirectNow(ThreadContext *tc, Addr nextPc)
+{
+    PCState pc(nextPc);
+    tc->pcState(pc);
+}
+
+uint64_t
+ioQualification(bool read, uint16_t port, size_t size)
+{
+    uint64_t qualification = 0;
+
+    switch (size) {
+      case 1:
+        qualification |= 0;
+        break;
+      case 2:
+        qualification |= 1;
+        break;
+      case 4:
+        qualification |= 3;
+        break;
+      default:
+        panic("Unsupported VMX I/O exit size %zu", size);
+    }
+
+    if (!read) {
+        qualification |= 1ull << 3;
+    }
+    qualification |= static_cast<uint64_t>(port) << 16;
+    return qualification;
+}
+
+uint64_t
+crQualification(uint8_t cr, VmxCrAccessType type, uint8_t gpr,
+        uint64_t value)
+{
+    uint64_t qualification = cr & 0xf;
+    qualification |= (static_cast<uint64_t>(type) & 0x3) << 4;
+    qualification |= (static_cast<uint64_t>(gpr) & 0xf) << 8;
+    if (type == VmxCrAccessType::Lmsw) {
+        qualification |= (value & 0xffff) << 16;
+    }
+    return qualification;
+}
+
+uint64_t
+drQualification(uint8_t dr, bool fromDr, uint8_t gpr)
+{
+    uint64_t qualification = dr & 0xf;
+    if (fromDr) {
+        qualification |= 1ull << 4;
+    }
+    qualification |= (static_cast<uint64_t>(gpr) & 0xf) << 8;
+    return qualification;
+}
+
+bool
+isLowOrHighMsr(uint32_t msr, uint32_t &index, bool &high)
+{
+    if (msr <= 0x1fff) {
+        index = msr;
+        high = false;
+        return true;
+    }
+
+    if (msr >= 0xc0000000 && msr <= 0xc0001fff) {
+        index = msr & 0x1fff;
+        high = true;
+        return true;
+    }
+
+    return false;
+}
+
 } // namespace
+
+void
+VmxExitFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    if (!isa || !isa->vmxState().vmexitEvent(tc, exitInfo)) {
+        panic("Unable to complete VMX exit fault");
+    }
+}
+
+bool
+VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
+        Addr *hostRip)
+{
+    Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t hostRipValue = 0;
+    if (!vmcs->read(VmcsHostRip, hostRipValue)) {
+        return false;
+    }
+
+    uint32_t reason = toInt(exitInfo.reason);
+    if (exitInfo.vmEntryFailure) {
+        reason |= VmExitReasonVmEntryFailure;
+    }
+
+    vmcs->writeUnchecked(VmcsGuestRip, currentRip(tc));
+    vmcs->writeUnchecked(VmcsVmExitReason, reason);
+    vmcs->writeUnchecked(VmcsExitQualification,
+            exitInfo.hasQualification ? exitInfo.qualification : 0);
+    vmcs->writeUnchecked(VmcsVmExitInstructionLen,
+            exitInfo.hasInstructionLength ? exitInfo.instructionLength : 0);
+    vmcs->writeUnchecked(VmcsVmxInstructionInfo,
+            exitInfo.hasInstructionInfo ? exitInfo.instructionInfo : 0);
+    vmcs->writeUnchecked(VmcsVmExitInterruptionInfo,
+            exitInfo.hasInterruptionInfo ? exitInfo.interruptionInfo : 0);
+    vmcs->writeUnchecked(VmcsVmExitInterruptionErrorCode,
+            exitInfo.hasInterruptionErrorCode ?
+            exitInfo.interruptionErrorCode : 0);
+    vmcs->writeUnchecked(VmcsGuestLinearAddress,
+            exitInfo.hasGuestLinearAddress ?
+            exitInfo.guestLinearAddress : 0);
+    vmcs->writeUnchecked(VmcsGuestPhysicalAddress,
+            exitInfo.hasGuestPhysicalAddress ?
+            exitInfo.guestPhysicalAddress : 0);
+
+    rootSnapshot.restore(tc);
+    inVmxNonRoot = false;
+
+    if (hostRip) {
+        *hostRip = hostRipValue;
+    }
+    return true;
+}
+
+bool
+VmxState::vmexitEvent(ThreadContext *tc, const VmxExitInfo &exitInfo)
+{
+    Addr hostRip = 0;
+    if (!vmexit(tc, exitInfo, &hostRip)) {
+        return false;
+    }
+
+    redirectNow(tc, hostRip);
+    return true;
+}
+
+VmxResult
+VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
+        uint8_t instructionSize, uint64_t qualification,
+        uint32_t instructionInfo)
+{
+    VmxExitInfo exitInfo;
+    exitInfo.reason = reason;
+    exitInfo.hasInstructionLength = true;
+    exitInfo.instructionLength = instructionSize;
+    exitInfo.hasQualification = qualification != 0;
+    exitInfo.qualification = qualification;
+    exitInfo.hasInstructionInfo = instructionInfo != 0;
+    exitInfo.instructionInfo = instructionInfo;
+
+    Addr hostRip = 0;
+    if (!vmexit(xc->tcBase(), exitInfo, &hostRip)) {
+        return VmxResult::failInvalid();
+    }
+
+    redirectNextPc(xc->tcBase(), hostRip);
+    return VmxResult::successRedirect(hostRip);
+}
+
+VmxResult
+VmxState::controlRegisterExit(ExecContext *xc, uint8_t cr,
+        VmxCrAccessType type, uint8_t gpr, uint64_t value,
+        uint8_t instructionSize)
+{
+    return vmexitInstruction(xc, VmxExitReason::ControlRegisterAccess,
+            instructionSize, crQualification(cr, type, gpr, value));
+}
+
+VmxResult
+VmxState::debugRegisterExit(ExecContext *xc, uint8_t dr, bool fromDr,
+        uint8_t gpr, uint8_t instructionSize)
+{
+    return vmexitInstruction(xc, VmxExitReason::MovDr, instructionSize,
+            drQualification(dr, fromDr, gpr));
+}
+
+bool
+VmxState::shouldExitOnException(uint8_t vector, uint64_t errorCode) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t exceptionBitmap = 0;
+    vmcs->read(VmcsExceptionBitmap, exceptionBitmap);
+    const bool bitmapBit = bits(exceptionBitmap, vector);
+
+    if (vector == 14) {
+        uint64_t mask = 0;
+        uint64_t match = 0;
+        vmcs->read(VmcsPageFaultErrorCodeMask, mask);
+        vmcs->read(VmcsPageFaultErrorCodeMatch, match);
+        const bool matched = (errorCode & mask) == match;
+        return bitmapBit ? matched : !matched;
+    }
+
+    return bitmapBit;
+}
+
+bool
+VmxState::shouldExitOnExternalInterrupt() const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsPinBasedVmExecControl, controls);
+    return controls & PinBasedExternalInterruptExiting;
+}
+
+bool
+VmxState::shouldExitOnNmi() const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsPinBasedVmExecControl, controls);
+    return controls & PinBasedNmiExiting;
+}
+
+bool
+VmxState::hltCausesExit() const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    return controls & CpuBasedHltExiting;
+}
+
+bool
+VmxState::invlpgCausesExit() const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    return controls & CpuBasedInvlpgExiting;
+}
+
+bool
+VmxState::movDrCausesExit() const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    return controls & CpuBasedMovDrExiting;
+}
+
+bool
+VmxState::ioInstructionCausesExit(ThreadContext *tc, uint16_t port,
+        size_t size) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    if (controls & CpuBasedUnconditionalIoExiting) {
+        return true;
+    }
+    if (!(controls & CpuBasedUseIoBitmaps)) {
+        return false;
+    }
+
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    for (size_t offset = 0; offset < size; ++offset) {
+        const uint32_t checkedPort = port + offset;
+        const Vmcs::Encoding bitmapField =
+            checkedPort < 0x8000 ? VmcsIoBitmapA : VmcsIoBitmapB;
+        uint64_t bitmapBase = 0;
+        vmcs->read(bitmapField, bitmapBase);
+
+        const uint32_t bit = checkedPort & 0x7fff;
+        uint8_t byte = 0;
+        proxy.readBlob(bitmapBase + bit / 8, &byte, sizeof(byte));
+        if (byte & (1u << (bit % 8))) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool
+VmxState::rdmsrCausesExit(ThreadContext *tc, uint32_t msr) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    if (!(controls & CpuBasedUseMsrBitmaps)) {
+        return true;
+    }
+
+    uint32_t index = 0;
+    bool high = false;
+    if (!isLowOrHighMsr(msr, index, high)) {
+        return true;
+    }
+
+    uint64_t bitmapBase = 0;
+    vmcs->read(VmcsMsrBitmap, bitmapBase);
+    const Addr offset = (high ? 1024 : 0) + index / 8;
+    uint8_t byte = 0;
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    proxy.readBlob(bitmapBase + offset, &byte, sizeof(byte));
+    return byte & (1u << (index % 8));
+}
+
+bool
+VmxState::wrmsrCausesExit(ThreadContext *tc, uint32_t msr) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+    if (!(controls & CpuBasedUseMsrBitmaps)) {
+        return true;
+    }
+
+    uint32_t index = 0;
+    bool high = false;
+    if (!isLowOrHighMsr(msr, index, high)) {
+        return true;
+    }
+
+    uint64_t bitmapBase = 0;
+    vmcs->read(VmcsMsrBitmap, bitmapBase);
+    const Addr offset = 2048 + (high ? 1024 : 0) + index / 8;
+    uint8_t byte = 0;
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    proxy.readBlob(bitmapBase + offset, &byte, sizeof(byte));
+    return byte & (1u << (index % 8));
+}
+
+bool
+VmxState::controlRegisterAccessCausesExit(uint8_t cr, VmxCrAccessType type,
+        uint64_t value) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs) {
+        return false;
+    }
+
+    uint64_t controls = 0;
+    vmcs->read(VmcsCpuBasedVmExecControl, controls);
+
+    if (type == VmxCrAccessType::MovFromCr) {
+        if (cr == 3) {
+            return controls & CpuBasedCr3StoreExiting;
+        }
+        if (cr == 8) {
+            return controls & CpuBasedCr8StoreExiting;
+        }
+        return false;
+    }
+
+    if (cr == 3) {
+        return controls & CpuBasedCr3LoadExiting;
+    }
+    if (cr == 8) {
+        return controls & CpuBasedCr8LoadExiting;
+    }
+    if (cr == 0 || cr == 4) {
+        uint64_t guestHostMask = 0;
+        uint64_t readShadow = 0;
+        vmcs->read(cr == 0 ? VmcsCr0GuestHostMask : VmcsCr4GuestHostMask,
+                guestHostMask);
+        vmcs->read(cr == 0 ? VmcsCr0ReadShadow : VmcsCr4ReadShadow,
+                readShadow);
+        return ((value ^ readShadow) & guestHostMask) != 0;
+    }
+
+    return false;
+}
+
+Fault
+VmxState::ioExitFault(bool read, uint16_t port, size_t size) const
+{
+    VmxExitInfo exitInfo;
+    exitInfo.reason = VmxExitReason::IoInstruction;
+    exitInfo.hasQualification = true;
+    exitInfo.qualification = ioQualification(read, port, size);
+    exitInfo.hasInstructionLength = true;
+    exitInfo.instructionLength = 0;
+    return std::make_shared<VmxExitFault>(exitInfo);
+}
+
+Fault
+VmxState::msrExitFault(bool read, uint32_t msr) const
+{
+    VmxExitInfo exitInfo;
+    exitInfo.reason = read ? VmxExitReason::Rdmsr : VmxExitReason::Wrmsr;
+    exitInfo.hasInstructionLength = true;
+    exitInfo.instructionLength = 0;
+    return std::make_shared<VmxExitFault>(exitInfo);
+}
 
 void
 VmxState::RootSnapshot::capture(ThreadContext *tc)
 {
+    panic_if(!tc, "RootSnapshot::capture requires a valid ThreadContext");
     for (size_t idx = 0; idx < NumSegmentRegs; ++idx) {
         selector[idx] = tc->readMiscRegNoEffect(misc_reg::segSel(idx));
         base[idx] = tc->readMiscRegNoEffect(misc_reg::segBase(idx));
@@ -118,6 +599,7 @@ VmxState::RootSnapshot::capture(ThreadContext *tc)
 void
 VmxState::RootSnapshot::restore(ThreadContext *tc) const
 {
+    panic_if(!tc, "RootSnapshot::restore requires a valid ThreadContext");
     if (!valid) {
         return;
     }
@@ -201,10 +683,16 @@ VmxState::currentVmcs() const
 }
 
 VmxResult
-VmxState::vmxon(ExecContext *xc, Addr operandEA)
+VmxState::vmxon(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmxon,
+                instructionSize);
+    }
+
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
     if (fault != NoFault) {
@@ -224,8 +712,13 @@ VmxState::vmxon(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
-VmxState::vmxoff()
+VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
 {
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmxoff,
+                instructionSize);
+    }
+
     if (!vmxActive) {
         return VmxResult::failInvalid();
     }
@@ -239,10 +732,16 @@ VmxState::vmxoff()
 }
 
 VmxResult
-VmxState::vmclear(ExecContext *xc, Addr operandEA)
+VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmclear,
+                instructionSize);
+    }
+
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
     if (fault != NoFault) {
@@ -268,10 +767,16 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
-VmxState::vmptrld(ExecContext *xc, Addr operandEA)
+VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase(); // vmptrld does not require VMX to be active, but the operand still needs to be validated
+    auto *tc = xc->tcBase();// VMPTRLD requires VMX operation and selects the current VMCS.
     uint64_t regionPtr = 0;
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmptrld,
+                instructionSize);
+    }
+
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
 
     if (fault != NoFault) {
@@ -289,10 +794,15 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
-VmxState::vmptrst(ExecContext *xc, Addr operandEA)
+VmxState::vmptrst(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
     uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64); // if no current VMCS, return all 1s per SDM
     const std::vector<bool> byteEnable(sizeof(regionPtr), true); // Enable all bytes for the write
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmptrst,
+                instructionSize);
+    }
 
     if (!vmxActive) {
         return VmxResult::failInvalid();
@@ -309,21 +819,28 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA)
 }
 
 VmxResult
-VmxState::vmlaunch(ExecContext *xc)
+VmxState::vmlaunch(ExecContext *xc, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     Vmcs *vmcs = currentVmcs();
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmlaunch,
+                instructionSize);
+    }
 
     if (!vmxActive || inVmxNonRoot || !vmcs) {
         return VmxResult::failInvalid();
     }
     if (vmcs->launched()) {
-        return vmFailValid(vmcs, VmxErrVmlaunchNonClearVmcs);
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmlaunchNonClearVmcs));
     }
 
     uint64_t guestRip = 0;
     if (!vmcs->read(VmcsGuestRip, guestRip)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
 
     rootSnapshot.capture(tc);
@@ -333,21 +850,28 @@ VmxState::vmlaunch(ExecContext *xc)
 }
 
 VmxResult
-VmxState::vmresume(ExecContext *xc)
+VmxState::vmresume(ExecContext *xc, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     Vmcs *vmcs = currentVmcs();
+
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmresume,
+                instructionSize);
+    }
 
     if (!vmxActive || inVmxNonRoot || !vmcs) {
         return VmxResult::failInvalid();
     }
     if (!vmcs->launched()) {
-        return vmFailValid(vmcs, VmxErrVmresumeNonLaunchedVmcs);
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmresumeNonLaunchedVmcs));
     }
 
     uint64_t guestRip = 0;
     if (!vmcs->read(VmcsGuestRip, guestRip)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
 
     rootSnapshot.capture(tc);
@@ -358,61 +882,56 @@ VmxState::vmresume(ExecContext *xc)
 VmxResult
 VmxState::vmcall(ExecContext *xc, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase();
     Vmcs *vmcs = currentVmcs();
 
     if (!vmxActive || !vmcs) {
         return VmxResult::failInvalid();
     }
     if (!inVmxNonRoot) {
-        return vmFailValid(vmcs, VmxErrVmcallInRoot);
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmcallInRoot));
     }
 
-    uint64_t hostRip = 0;
-    if (!vmcs->read(VmcsHostRip, hostRip)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent);
-    }
-
-    vmcs->writeUnchecked(VmcsGuestRip, currentRip(tc));
-    vmcs->writeUnchecked(VmcsVmExitReason, VmxExitReasonVmcall);
-    vmcs->writeUnchecked(VmcsVmExitInstructionLen, instructionSize);
-
-    rootSnapshot.restore(tc);
-    inVmxNonRoot = false;
-    return VmxResult::successRedirect(hostRip);
+    return vmexitInstruction(xc, VmxExitReason::Vmcall, instructionSize);
 }
 
 VmxResult
-VmxState::vmread(Vmcs::RawEncoding rawEncoding, uint64_t &value) const
+VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
+        uint64_t &value, uint8_t instructionSize)
 {
-    const Vmcs *vmcs = currentVmcs();
+    Vmcs *vmcs = currentVmcs();
     // If there is no current VMCS or VMX is not active, instruction fails with VMfailInvalid (make sure to select a vmcs with vmptrld before vmwrite or vmread)
     if (!vmxActive || !vmcs) {
         return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
+    }
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmread,
+                instructionSize);
     }
 
     Vmcs::Encoding encoding = 0;
     // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
-        return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
     }
     // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
-        return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
     }
     // checks if the field is readable. If not, the instruction fails with VMfailValid
     if (!vmcs->read(encoding, value)) {
-        return vmFailValid(const_cast<Vmcs *>(vmcs),
-                VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
     }
 
     return VmxResult::success(); // Field read, CF=0, ZF=0
 }
 
 VmxResult
-VmxState::vmwrite(Vmcs::RawEncoding rawEncoding, uint64_t value)
+VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
+        uint64_t value, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
 
@@ -420,22 +939,30 @@ VmxState::vmwrite(Vmcs::RawEncoding rawEncoding, uint64_t value)
     if (!vmxActive || !vmcs) {
         return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
     }
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmwrite,
+                instructionSize);
+    }
     // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     Vmcs::Encoding encoding = 0;
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
     }
     // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
-        return vmFailValid(vmcs, VmxErrUnsupportedComponent); // CF=1, ZF=0, VM-instruction error field = 12 (VMXErrUnsupportedComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
     }
     // Once field is determined, checks if the field is read-only. If true then the instruction fails with VMfailValid
     if (!Vmcs::fieldWritable(encoding)) {
-        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent); // CF=1, ZF=0, VM-instruction error field = 13 (VMXErrWriteReadOnlyComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 13
     }
 
     if (!vmcs->write(encoding, value)) {
-        return vmFailValid(vmcs, VmxErrWriteReadOnlyComponent); // CF=1, ZF=0, VM-instruction error field = 13 (VMXErrWriteReadOnlyComponent)
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 13
     }
 
     return VmxResult::success(); // Field written, CF=0, ZF=0

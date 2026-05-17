@@ -741,7 +741,16 @@ let {{
 
 
     iop = InstObjParams("tia", "Tia", 'X86ISA::MemNoDataOp',
-                        { "code": "xc->demapPage(EA, 0);",
+                        { "code": '''
+        if (auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                isa && isa->vmxState().invlpgCausesExit()) {
+            isa->vmxState().vmexitInstruction(
+                    xc, VmxExitReason::Invlpg, size(), EA);
+            return NoFault;
+        }
+
+        xc->demapPage(EA, 0);
+''',
                           "ea_code": calculateEA,
                           "memDataSize": "dataSize" })
     header_output += MicroLeaDeclare.subst(iop)

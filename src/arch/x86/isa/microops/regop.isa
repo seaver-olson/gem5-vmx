@@ -1341,6 +1341,12 @@ let {{
                 fault = std::make_shared<InvalidOpcode>();
             } else if (dr7.gd) {
                 fault = std::make_shared<DebugException>();
+            } else if (auto *isa =
+                    dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                    isa && isa->vmxState().movDrCausesExit()) {
+                isa->vmxState().debugRegisterExit(
+                        xc, src1, true, dest, size());
+                return NoFault;
             } else {
                 %s
             }
@@ -1362,6 +1368,12 @@ let {{
                 fault = std::make_shared<GeneralProtection>(0);
             } else if (dr7.gd) {
                 fault = std::make_shared<DebugException>();
+            } else if (auto *isa =
+                    dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                    isa && isa->vmxState().movDrCausesExit()) {
+                isa->vmxState().debugRegisterExit(
+                        xc, dest, false, src1, size());
+                return NoFault;
             } else {
                 DebugDest = PSrcReg1;
             }
@@ -1374,6 +1386,14 @@ let {{
         rdcrCode = '''
             if (src1 == 1 || (src1 > 4 && src1 < 8) || (src1 > 8)) {
                 fault = std::make_shared<InvalidOpcode>();
+            } else if (auto *isa =
+                    dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                    isa && isa->vmxState().controlRegisterAccessCausesExit(
+                        src1, VmxCrAccessType::MovFromCr)) {
+                isa->vmxState().controlRegisterExit(
+                        xc, src1, VmxCrAccessType::MovFromCr,
+                        dest, 0, size());
+                return NoFault;
             } else {
                 %s
             }
@@ -1392,6 +1412,15 @@ let {{
             } else {
                 RegVal newVal = PSrcReg1;
 
+                if (auto *isa =
+                        dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                        isa && isa->vmxState().controlRegisterAccessCausesExit(
+                            dest, VmxCrAccessType::MovToCr, newVal)) {
+                    isa->vmxState().controlRegisterExit(
+                            xc, dest, VmxCrAccessType::MovToCr,
+                            src1, newVal, size());
+                    return NoFault;
+                } else {
                 // Check for any modifications that would cause a fault.
                 switch(dest) {
                   case 0:
@@ -1447,6 +1476,7 @@ let {{
                             "Unrecognized control register %d.\\n", dest);
                 }
                 ControlDest = newVal;
+                }
             }
             '''
 

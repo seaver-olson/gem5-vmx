@@ -28,6 +28,7 @@
 #ifndef __ARCH_X86_INSTS_MICROSPECOP_HH__
 #define __ARCH_X86_INSTS_MICROSPECOP_HH__
 
+#include "arch/x86/isa.hh"
 #include "arch/x86/insts/microop.hh"
 #include "cpu/exec_context.hh"
 
@@ -51,6 +52,13 @@ class MicroHalt : public InstOperands<X86MicroopBase>
     Fault
     execute(ExecContext *xc, trace::InstRecord *) const override
     {
+        auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+        if (isa && isa->vmxState().hltCausesExit()) {
+            isa->vmxState().vmexitInstruction(
+                    xc, VmxExitReason::Hlt, size());
+            return NoFault;
+        }
+
         xc->tcBase()->suspend();
         return NoFault;
     }

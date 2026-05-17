@@ -41,6 +41,7 @@
 #include <memory>
 
 #include "arch/x86/faults.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/insts/microldstop.hh"
 #include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/pseudo_inst_abi.hh"
@@ -220,6 +221,16 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
     } else if (prefix == IntAddrPrefixMSR) {
         vaddr = (vaddr >> 3) & ~IntAddrPrefixMask;
 
+        auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+        if (isa) {
+            auto &vmx = isa->vmxState();
+            const uint32_t msr = static_cast<uint32_t>(vaddr);
+            if ((read && vmx.rdmsrCausesExit(tc, msr)) ||
+                    (!read && vmx.wrmsrCausesExit(tc, msr))) {
+                return vmx.msrExitFault(read, msr);
+            }
+        }
+
         RegIndex regNum;
         if (!msrAddrToIndex(regNum, vaddr))
             return std::make_shared<GeneralProtection>(0);
@@ -241,6 +252,15 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
         // Make sure the address fits in the expected 16 bit IO address
         // space.
         assert(!(IOPort & ~0xFFFF));
+        auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+        if (isa) {
+            auto &vmx = isa->vmxState();
+            if (vmx.ioInstructionCausesExit(tc,
+                        static_cast<uint16_t>(IOPort), req->getSize())) {
+                return vmx.ioExitFault(read,
+                        static_cast<uint16_t>(IOPort), req->getSize());
+            }
+        }
         if (IOPort == 0xCF8 && req->getSize() == 4) {
             req->setPaddr(req->getVaddr());
             req->setLocalAccessor(

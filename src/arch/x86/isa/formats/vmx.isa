@@ -364,13 +364,13 @@ def template VmxMemExecute {{
         X86ISA::VmxResult result;
 
         if (strcmp(mnemonic, "vmxon") == 0) {
-            result = isa->vmxState().vmxon(xc, EA);
+            result = isa->vmxState().vmxon(xc, EA, size());
         } else if (strcmp(mnemonic, "vmclear") == 0) {
-            result = isa->vmxState().vmclear(xc, EA);
+            result = isa->vmxState().vmclear(xc, EA, size());
         } else if (strcmp(mnemonic, "vmptrld") == 0) {
-            result = isa->vmxState().vmptrld(xc, EA);
+            result = isa->vmxState().vmptrld(xc, EA, size());
         } else if (strcmp(mnemonic, "vmptrst") == 0) {
-            result = isa->vmxState().vmptrst(xc, EA);
+            result = isa->vmxState().vmptrst(xc, EA, size());
         } else {
             panic("Unhandled VMX memory instruction '%s'", mnemonic);
         }
@@ -379,7 +379,7 @@ def template VmxMemExecute {{
             return result.fault;
         }
 
-        setVmxResult(xc->tcBase(), result);
+        completeVmxResult(xc->tcBase(), result);
         return NoFault;
     }
 }};
@@ -408,11 +408,11 @@ def template VmxNoOperandExecute {{
         X86ISA::VmxResult result;
 
         if (strcmp(mnemonic, "vmxoff") == 0) {
-            result = isa->vmxState().vmxoff();
+            result = isa->vmxState().vmxoff(xc, size());
         } else if (strcmp(mnemonic, "vmlaunch") == 0) {
-            result = isa->vmxState().vmlaunch(xc);
+            result = isa->vmxState().vmlaunch(xc, size());
         } else if (strcmp(mnemonic, "vmresume") == 0) {
-            result = isa->vmxState().vmresume(xc);
+            result = isa->vmxState().vmresume(xc, size());
         } else if (strcmp(mnemonic, "vmcall") == 0) {
             result = isa->vmxState().vmcall(xc, size());
         } else {
@@ -457,7 +457,7 @@ def template VmxRegMemExecute {{
         if (strcmp(mnemonic, "vmread") == 0) {
             field = readIntOperand(xc->tcBase(), reg);
 
-            result = isa->vmxState().vmread(field, value);
+            result = isa->vmxState().vmread(xc, field, value, size());
             if (result.fault != NoFault) {
                 return result.fault;
             }
@@ -475,7 +475,7 @@ def template VmxRegMemExecute {{
                 return fault;
             }
 
-            result = isa->vmxState().vmwrite(field, value);
+            result = isa->vmxState().vmwrite(xc, field, value, size());
             if (result.fault != NoFault) {
                 return result.fault;
             }
@@ -483,7 +483,7 @@ def template VmxRegMemExecute {{
             panic("Unhandled VMX reg/mem instruction '%s'", mnemonic);
         }
 
-        setVmxResult(xc->tcBase(), result);
+        completeVmxResult(xc->tcBase(), result);
         return NoFault;
     }
 }};

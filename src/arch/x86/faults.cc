@@ -41,6 +41,7 @@
 #include "arch/x86/faults.hh"
 
 #include "arch/x86/generated/decoder.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/insts/static_inst.hh"
 #include "arch/x86/mmu.hh"
 #include "arch/x86/regs/int.hh"
@@ -58,9 +59,79 @@ namespace gem5
 namespace X86ISA
 {
 
+namespace
+{
+
+uint32_t
+vmxInterruptionInfo(uint8_t vector, VmxInterruptionType type,
+        bool errorCodeValid)
+{
+    uint32_t info = vector;
+    info |= static_cast<uint32_t>(type) << 8;
+    if (errorCodeValid) {
+        info |= 1u << 11;
+    }
+    info |= 1u << 31;
+    return info;
+}
+
+} // namespace
+
 void
 X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    if (isa && isa->vmxState().nonRootActive()) {
+        VmxExitInfo exitInfo;
+        bool shouldExit = false;
+
+        if (dynamic_cast<ExternalInterrupt *>(this)) {
+            shouldExit = isa->vmxState().shouldExitOnExternalInterrupt();
+            exitInfo.reason = VmxExitReason::ExternalInterrupt;
+            exitInfo.hasInterruptionInfo = true;
+            exitInfo.interruptionInfo = vmxInterruptionInfo(vector,
+                    VmxInterruptionType::ExternalInterrupt, false);
+        } else if (dynamic_cast<NonMaskableInterrupt *>(this)) {
+            shouldExit = isa->vmxState().shouldExitOnNmi();
+            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
+            exitInfo.hasInterruptionInfo = true;
+            exitInfo.interruptionInfo = vmxInterruptionInfo(2,
+                    VmxInterruptionType::Nmi, false);
+        } else if (dynamic_cast<SystemManagementInterrupt *>(this)) {
+            shouldExit = true;
+            exitInfo.reason = VmxExitReason::OtherSmi;
+        } else if (dynamic_cast<InitInterrupt *>(this)) {
+            shouldExit = true;
+            exitInfo.reason = VmxExitReason::InitSignal;
+        } else if (dynamic_cast<StartupInterrupt *>(this)) {
+            shouldExit = true;
+            exitInfo.reason = VmxExitReason::StartupIpi;
+            exitInfo.hasQualification = true;
+            exitInfo.qualification = vector;
+        } else {
+            const uint64_t checkedErrorCode =
+                errorCode == (uint64_t)-1 ? 0 : errorCode;
+            shouldExit = isa->vmxState().shouldExitOnException(
+                    vector, checkedErrorCode);
+            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
+            const bool hasErrorCode = errorCode != (uint64_t)-1;
+            const VmxInterruptionType type =
+                (dynamic_cast<Breakpoint *>(this) ||
+                 dynamic_cast<OverflowTrap *>(this)) ?
+                VmxInterruptionType::SoftwareException :
+                VmxInterruptionType::HardwareException;
+            exitInfo.hasInterruptionInfo = true;
+            exitInfo.interruptionInfo = vmxInterruptionInfo(
+                    vector, type, hasErrorCode);
+            exitInfo.hasInterruptionErrorCode = hasErrorCode;
+            exitInfo.interruptionErrorCode = checkedErrorCode;
+        }
+
+        if (shouldExit && isa->vmxState().vmexitEvent(tc, exitInfo)) {
+            return;
+        }
+    }
+
     if (!FullSystem) {
         FaultBase::invoke(tc, inst);
         return;
@@ -136,6 +207,27 @@ InvalidOpcode::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 void
 PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    if (isa && isa->vmxState().nonRootActive()) {
+        const uint64_t checkedErrorCode =
+            errorCode == (uint64_t)-1 ? 0 : errorCode;
+        if (isa->vmxState().shouldExitOnException(vector, checkedErrorCode)) {
+            VmxExitInfo exitInfo;
+            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
+            exitInfo.hasInterruptionInfo = true;
+            exitInfo.interruptionInfo = vmxInterruptionInfo(
+                    vector, VmxInterruptionType::HardwareException, true);
+            exitInfo.hasInterruptionErrorCode = true;
+            exitInfo.interruptionErrorCode = checkedErrorCode;
+            exitInfo.hasQualification = true;
+            exitInfo.qualification = addr;
+
+            if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
+                return;
+            }
+        }
+    }
+
     if (FullSystem) {
         // Invalidate any matching TLB entries before handling the page fault.
         tc->getMMUPtr()->demapPage(addr, 0);
