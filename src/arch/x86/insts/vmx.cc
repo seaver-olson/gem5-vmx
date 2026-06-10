@@ -32,28 +32,38 @@ toInt(VmxInstructionError error)
     return static_cast<uint32_t>(error);
 }
 
-constexpr Vmcs::Encoding VmcsVmExitReason = 0x4402;
-constexpr Vmcs::Encoding VmcsVmExitInterruptionInfo = 0x4404;
-constexpr Vmcs::Encoding VmcsVmExitInterruptionErrorCode = 0x4406;
-constexpr Vmcs::Encoding VmcsVmExitInstructionLen = 0x440C;
-constexpr Vmcs::Encoding VmcsVmxInstructionInfo = 0x440E;
-constexpr Vmcs::Encoding VmcsPinBasedVmExecControl = 0x4000;
-constexpr Vmcs::Encoding VmcsCpuBasedVmExecControl = 0x4002;
-constexpr Vmcs::Encoding VmcsExceptionBitmap = 0x4004;
-constexpr Vmcs::Encoding VmcsPageFaultErrorCodeMask = 0x4006;
-constexpr Vmcs::Encoding VmcsPageFaultErrorCodeMatch = 0x4008;
-constexpr Vmcs::Encoding VmcsIoBitmapA = 0x2000;
-constexpr Vmcs::Encoding VmcsIoBitmapB = 0x2002;
-constexpr Vmcs::Encoding VmcsMsrBitmap = 0x2004;
-constexpr Vmcs::Encoding VmcsGuestPhysicalAddress = 0x2400;
-constexpr Vmcs::Encoding VmcsCr0GuestHostMask = 0x6000;
-constexpr Vmcs::Encoding VmcsCr4GuestHostMask = 0x6002;
-constexpr Vmcs::Encoding VmcsCr0ReadShadow = 0x6004;
-constexpr Vmcs::Encoding VmcsCr4ReadShadow = 0x6006;
-constexpr Vmcs::Encoding VmcsExitQualification = 0x6400;
-constexpr Vmcs::Encoding VmcsGuestLinearAddress = 0x640A;
-constexpr Vmcs::Encoding VmcsGuestRip = 0x681E;
-constexpr Vmcs::Encoding VmcsHostRip = 0x6C16;
+using VmcsField = Vmcs::Field;
+
+constexpr VmcsField VmcsVmExitReason = VmcsField::VmExitReason;
+constexpr VmcsField VmcsVmExitInterruptionInfo =
+    VmcsField::VmExitInterruptionInfo;
+constexpr VmcsField VmcsVmExitInterruptionErrorCode =
+    VmcsField::VmExitInterruptionErrorCode;
+constexpr VmcsField VmcsVmExitInstructionLen =
+    VmcsField::VmExitInstructionLen;
+constexpr VmcsField VmcsVmxInstructionInfo = VmcsField::VmxInstructionInfo;
+constexpr VmcsField VmcsPinBasedVmExecControl =
+    VmcsField::PinBasedVmExecControl;
+constexpr VmcsField VmcsCpuBasedVmExecControl =
+    VmcsField::CpuBasedVmExecControl;
+constexpr VmcsField VmcsExceptionBitmap = VmcsField::ExceptionBitmap;
+constexpr VmcsField VmcsPageFaultErrorCodeMask =
+    VmcsField::PageFaultErrorCodeMask;
+constexpr VmcsField VmcsPageFaultErrorCodeMatch =
+    VmcsField::PageFaultErrorCodeMatch;
+constexpr VmcsField VmcsIoBitmapA = VmcsField::IoBitmapA;
+constexpr VmcsField VmcsIoBitmapB = VmcsField::IoBitmapB;
+constexpr VmcsField VmcsMsrBitmap = VmcsField::MsrBitmap;
+constexpr VmcsField VmcsGuestPhysicalAddress =
+    VmcsField::GuestPhysicalAddress;
+constexpr VmcsField VmcsCr0GuestHostMask = VmcsField::Cr0GuestHostMask;
+constexpr VmcsField VmcsCr4GuestHostMask = VmcsField::Cr4GuestHostMask;
+constexpr VmcsField VmcsCr0ReadShadow = VmcsField::Cr0ReadShadow;
+constexpr VmcsField VmcsCr4ReadShadow = VmcsField::Cr4ReadShadow;
+constexpr VmcsField VmcsExitQualification = VmcsField::ExitQualification;
+constexpr VmcsField VmcsGuestLinearAddress = VmcsField::GuestLinearAddress;
+constexpr VmcsField VmcsGuestRip = VmcsField::GuestRip;
+constexpr VmcsField VmcsHostRip = VmcsField::HostRip;
 
 constexpr uint32_t PinBasedExternalInterruptExiting = 1u << 0;
 constexpr uint32_t PinBasedNmiExiting = 1u << 3;
@@ -444,7 +454,7 @@ VmxState::ioInstructionCausesExit(ThreadContext *tc, uint16_t port,
     PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
     for (size_t offset = 0; offset < size; ++offset) {
         const uint32_t checkedPort = port + offset;
-        const Vmcs::Encoding bitmapField =
+        const VmcsField bitmapField =
             checkedPort < 0x8000 ? VmcsIoBitmapA : VmcsIoBitmapB;
         uint64_t bitmapBase = 0;
         vmcs->read(bitmapField, bitmapBase);
@@ -909,7 +919,7 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
                 instructionSize);
     }
 
-    Vmcs::Encoding encoding = 0;
+    Vmcs::FieldEncoding encoding;
     // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(vmcs,
@@ -944,7 +954,7 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
                 instructionSize);
     }
     // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
-    Vmcs::Encoding encoding = 0;
+    Vmcs::FieldEncoding encoding;
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
