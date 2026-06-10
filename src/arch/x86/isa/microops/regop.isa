@@ -1345,7 +1345,7 @@ let {{
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                     isa && isa->vmxState().movDrCausesExit()) {
                 isa->vmxState().debugRegisterExit(
-                        xc, src1, true, dest, size());
+                        xc, src1, true, dest, StaticInst::size());
                 return NoFault;
             } else {
                 %s
@@ -1372,7 +1372,7 @@ let {{
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                     isa && isa->vmxState().movDrCausesExit()) {
                 isa->vmxState().debugRegisterExit(
-                        xc, dest, false, src1, size());
+                        xc, dest, false, src1, StaticInst::size());
                 return NoFault;
             } else {
                 DebugDest = PSrcReg1;
@@ -1392,7 +1392,7 @@ let {{
                         src1, VmxCrAccessType::MovFromCr)) {
                 isa->vmxState().controlRegisterExit(
                         xc, src1, VmxCrAccessType::MovFromCr,
-                        dest, 0, size());
+                        dest, 0, StaticInst::size());
                 return NoFault;
             } else {
                 %s
@@ -1418,7 +1418,7 @@ let {{
                             dest, VmxCrAccessType::MovToCr, newVal)) {
                     isa->vmxState().controlRegisterExit(
                             xc, dest, VmxCrAccessType::MovToCr,
-                            src1, newVal, size());
+                            src1, newVal, StaticInst::size());
                     return NoFault;
                 } else {
                 // Check for any modifications that would cause a fault.

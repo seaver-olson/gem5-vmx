@@ -745,7 +745,7 @@ let {{
         if (auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                 isa && isa->vmxState().invlpgCausesExit()) {
             isa->vmxState().vmexitInstruction(
-                    xc, VmxExitReason::Invlpg, size(), EA);
+                    xc, VmxExitReason::Invlpg, StaticInst::size(), EA);
             return NoFault;
         }
 
