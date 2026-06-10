@@ -1,11 +1,13 @@
 #ifndef __ARCH_X86_VMCS_HH__
 #define __ARCH_X86_VMCS_HH__
 
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <vector>
 
-#include "base/logging.hh"
 #include "base/bitfield.hh"
+#include "base/logging.hh"
 #include "base/types.hh"
 #include "sim/serialize.hh"
 
@@ -14,7 +16,8 @@ namespace gem5
 namespace X86ISA
 {
 
-// This is gem5's shadow model of a VMCS region, not the hardware region itself.
+// This is gem5's shadow model of a VMCS region, not the hardware region
+// itself. Field encoding follows Intel SDM Vol. 3C, Section 26.11.2.
 class Vmcs
 {
   public:
@@ -24,12 +27,239 @@ class Vmcs
 
     static constexpr size_t VmcsRegionSize = 4096;
     static constexpr RawEncoding VmcsEncodingMask = 0x7fff;
-    static constexpr Encoding VmInstructionError = 0x4400;
+    static constexpr Encoding VmcsEncodingReservedBit = 1u << 12;
+
+    enum class Field : Encoding
+    {
+        VirtualProcessorId = 0x0000,
+        PostedInterruptNotificationVector = 0x0002,
+        EptpIndex = 0x0004,
+        HlatPrefixSize = 0x0006,
+        LastPidPointerIndex = 0x0008,
+
+        GuestEsSelector = 0x0800,
+        GuestCsSelector = 0x0802,
+        GuestSsSelector = 0x0804,
+        GuestDsSelector = 0x0806,
+        GuestFsSelector = 0x0808,
+        GuestGsSelector = 0x080A,
+        GuestLdtrSelector = 0x080C,
+        GuestTrSelector = 0x080E,
+        GuestInterruptStatus = 0x0810,
+        PmlIndex = 0x0812,
+        GuestUinv = 0x0814,
+
+        HostEsSelector = 0x0C00,
+        HostCsSelector = 0x0C02,
+        HostSsSelector = 0x0C04,
+        HostDsSelector = 0x0C06,
+        HostFsSelector = 0x0C08,
+        HostGsSelector = 0x0C0A,
+        HostTrSelector = 0x0C0C,
+
+        IoBitmapA = 0x2000,
+        IoBitmapB = 0x2002,
+        MsrBitmap = 0x2004,
+        VmExitMsrStoreAddress = 0x2006,
+        VmExitMsrLoadAddress = 0x2008,
+        VmEntryMsrLoadAddress = 0x200A,
+        ExecutiveVmcsPointer = 0x200C,
+        PmlAddress = 0x200E,
+        TscOffset = 0x2010,
+        VirtualApicAddress = 0x2012,
+        ApicAccessAddress = 0x2014,
+        PostedInterruptDescriptorAddress = 0x2016,
+        VmFunctionControls = 0x2018,
+        EptPointer = 0x201A,
+        EoiExitBitmap0 = 0x201C,
+        EoiExitBitmap1 = 0x201E,
+        EoiExitBitmap2 = 0x2020,
+        EoiExitBitmap3 = 0x2022,
+        EptpListAddress = 0x2024,
+        VmreadBitmapAddress = 0x2026,
+        VmwriteBitmapAddress = 0x2028,
+        VirtualizationExceptionInformationAddress = 0x202A,
+        XssExitingBitmap = 0x202C,
+        EnclsExitingBitmap = 0x202E,
+        SubPagePermissionTablePointer = 0x2030,
+        TscMultiplier = 0x2032,
+        TertiaryProcessorBasedVmExecutionControls = 0x2034,
+        LowPasidDirectoryAddress = 0x2038,
+        HighPasidDirectoryAddress = 0x203A,
+        SeamSharedEptPointer = 0x203C,
+        PconfigExitingBitmap = 0x203E,
+        HlatPointer = 0x2040,
+        PidPointerTableAddress = 0x2042,
+        SecondaryVmExitControls = 0x2044,
+        Ia32SpecCtrlMask = 0x204A,
+        Ia32SpecCtrlShadow = 0x204C,
+        InjectedEventData = 0x2052,
+
+        GuestPhysicalAddress = 0x2400,
+        MsrData = 0x2402,
+        OriginalEventData = 0x2404,
+
+        VmcsLinkPointer = 0x2800,
+        GuestIa32Debugctl = 0x2802,
+        GuestIa32Pat = 0x2804,
+        GuestIa32Efer = 0x2806,
+        GuestIa32PerfGlobalCtrl = 0x2808,
+        GuestPdpte0 = 0x280A,
+        GuestPdpte1 = 0x280C,
+        GuestPdpte2 = 0x280E,
+        GuestPdpte3 = 0x2810,
+        GuestIa32Bndcfgs = 0x2812,
+        GuestIa32RtitCtl = 0x2814,
+        GuestIa32LbrCtl = 0x2816,
+        GuestIa32Pkrs = 0x2818,
+        GuestIa32FredConfig = 0x281A,
+        GuestIa32FredRsp1 = 0x281C,
+        GuestIa32FredRsp2 = 0x281E,
+        GuestIa32FredRsp3 = 0x2820,
+        GuestIa32FredStklvls = 0x2822,
+        GuestIa32FredSsp1 = 0x2824,
+        GuestIa32FredSsp2 = 0x2826,
+        GuestIa32FredSsp3 = 0x2828,
+
+        HostIa32Pat = 0x2C00,
+        HostIa32Efer = 0x2C02,
+        HostIa32PerfGlobalCtrl = 0x2C04,
+        HostIa32Pkrs = 0x2C06,
+        HostIa32FredConfig = 0x2C08,
+        HostIa32FredRsp1 = 0x2C0A,
+        HostIa32FredRsp2 = 0x2C0C,
+        HostIa32FredRsp3 = 0x2C0E,
+        HostIa32FredStklvls = 0x2C10,
+        HostIa32FredSsp1 = 0x2C12,
+        HostIa32FredSsp2 = 0x2C14,
+        HostIa32FredSsp3 = 0x2C16,
+
+        PinBasedVmExecControl = 0x4000,
+        CpuBasedVmExecControl = 0x4002,
+        ExceptionBitmap = 0x4004,
+        PageFaultErrorCodeMask = 0x4006,
+        PageFaultErrorCodeMatch = 0x4008,
+        Cr3TargetCount = 0x400A,
+        VmExitControls = 0x400C,
+        VmExitMsrStoreCount = 0x400E,
+        VmExitMsrLoadCount = 0x4010,
+        VmEntryControls = 0x4012,
+        VmEntryMsrLoadCount = 0x4014,
+        VmEntryIntrInfoField = 0x4016,
+        VmEntryExceptionErrorCode = 0x4018,
+        VmEntryInstructionLen = 0x401A,
+        TprThreshold = 0x401C,
+        SecondaryVmExecControl = 0x401E,
+        PleGap = 0x4020,
+        PleWindow = 0x4022,
+        InstructionTimeoutControl = 0x4024,
+        SeamGuestKeyId = 0x4026,
+
+        VmInstructionError = 0x4400,
+        VmExitReason = 0x4402,
+        VmExitInterruptionInfo = 0x4404,
+        VmExitInterruptionErrorCode = 0x4406,
+        IdtVectoringInfoField = 0x4408,
+        IdtVectoringErrorCode = 0x440A,
+        VmExitInstructionLen = 0x440C,
+        VmxInstructionInfo = 0x440E,
+
+        GuestEsLimit = 0x4800,
+        GuestCsLimit = 0x4802,
+        GuestSsLimit = 0x4804,
+        GuestDsLimit = 0x4806,
+        GuestFsLimit = 0x4808,
+        GuestGsLimit = 0x480A,
+        GuestLdtrLimit = 0x480C,
+        GuestTrLimit = 0x480E,
+        GuestGdtrLimit = 0x4810,
+        GuestIdtrLimit = 0x4812,
+        GuestEsAccessRights = 0x4814,
+        GuestCsAccessRights = 0x4816,
+        GuestSsAccessRights = 0x4818,
+        GuestDsAccessRights = 0x481A,
+        GuestFsAccessRights = 0x481C,
+        GuestGsAccessRights = 0x481E,
+        GuestLdtrAccessRights = 0x4820,
+        GuestTrAccessRights = 0x4822,
+        GuestInterruptibilityState = 0x4824,
+        GuestActivityState = 0x4826,
+        GuestSmbase = 0x4828,
+        GuestSysenterCs = 0x482A,
+        VmxPreemptionTimerValue = 0x482E,
+
+        HostIa32SysenterCs = 0x4C00,
+
+        Cr0GuestHostMask = 0x6000,
+        Cr4GuestHostMask = 0x6002,
+        Cr0ReadShadow = 0x6004,
+        Cr4ReadShadow = 0x6006,
+        Cr3TargetValue0 = 0x6008,
+        Cr3TargetValue1 = 0x600A,
+        Cr3TargetValue2 = 0x600C,
+        Cr3TargetValue3 = 0x600E,
+
+        ExitQualification = 0x6400,
+        IoRcx = 0x6402,
+        IoRsi = 0x6404,
+        IoRdi = 0x6406,
+        IoRip = 0x6408,
+        GuestLinearAddress = 0x640A,
+
+        GuestCr0 = 0x6800,
+        GuestCr3 = 0x6802,
+        GuestCr4 = 0x6804,
+        GuestEsBase = 0x6806,
+        GuestCsBase = 0x6808,
+        GuestSsBase = 0x680A,
+        GuestDsBase = 0x680C,
+        GuestFsBase = 0x680E,
+        GuestGsBase = 0x6810,
+        GuestLdtrBase = 0x6812,
+        GuestTrBase = 0x6814,
+        GuestGdtrBase = 0x6816,
+        GuestIdtrBase = 0x6818,
+        GuestDr7 = 0x681A,
+        GuestRsp = 0x681C,
+        GuestRip = 0x681E,
+        GuestRflags = 0x6820,
+        GuestPendingDbgExceptions = 0x6822,
+        GuestSysenterEsp = 0x6824,
+        GuestSysenterEip = 0x6826,
+        GuestIa32SCet = 0x6828,
+        GuestSsp = 0x682A,
+        GuestIa32InterruptSspTableAddr = 0x682C,
+
+        HostCr0 = 0x6C00,
+        HostCr3 = 0x6C02,
+        HostCr4 = 0x6C04,
+        HostFsBase = 0x6C06,
+        HostGsBase = 0x6C08,
+        HostTrBase = 0x6C0A,
+        HostGdtrBase = 0x6C0C,
+        HostIdtrBase = 0x6C0E,
+        HostIa32SysenterEsp = 0x6C10,
+        HostIa32SysenterEip = 0x6C12,
+        HostRsp = 0x6C14,
+        HostRip = 0x6C16,
+        HostIa32SCet = 0x6C18,
+        HostSsp = 0x6C1A,
+        HostIa32InterruptSspTableAddr = 0x6C1C,
+    };
+
+    static constexpr Encoding VmInstructionError =
+        static_cast<Encoding>(Field::VmInstructionError);
 
     enum class LaunchState : uint8_t
     {
         Clear,
         Launched
+    };
+
+    enum class AccessType : uint8_t
+    {
+        Full,
+        High
     };
 
     enum class FieldWidth : uint8_t
@@ -58,18 +288,125 @@ class Vmcs
         VmExitInformation,
     };
 
+    static constexpr Encoding
+    encodingOf(Field field)
+    {
+        return static_cast<Encoding>(field);
+    }
+
+    static constexpr FieldWidth
+    widthFromEncoding(Encoding encoding)
+    {
+        switch ((encoding >> 13) & 0x3) {
+          case 0:
+            return FieldWidth::U16;
+          case 1:
+            return FieldWidth::U64;
+          case 2:
+            return FieldWidth::U32;
+          case 3:
+            return FieldWidth::Natural;
+        }
+
+        return FieldWidth::Natural;
+    }
+
+    static constexpr VmcsFieldType
+    typeFromEncoding(Encoding encoding)
+    {
+        switch ((encoding >> 10) & 0x3) {
+          case 0:
+            return VmcsFieldType::Control;
+          case 1:
+            return VmcsFieldType::VmExitInfo;
+          case 2:
+            return VmcsFieldType::GuestState;
+          case 3:
+            return VmcsFieldType::HostState;
+        }
+
+        return VmcsFieldType::Control;
+    }
+
     struct FieldInfo
     {
-        Encoding encoding;
+        Field field;
         const char *name;
-
-        FieldWidth width;
-        // Encoded SDM field type.
-        VmcsFieldType type;
-        // Logical SDM grouping. This is more specific than the encoded type
-        // for control fields.
         VmcsFieldGroup group;
         bool writable;
+
+        constexpr Encoding
+        encoding() const
+        {
+            return encodingOf(field);
+        }
+
+        constexpr FieldWidth
+        width() const
+        {
+            return widthFromEncoding(encoding());
+        }
+
+        constexpr VmcsFieldType
+        type() const
+        {
+            return typeFromEncoding(encoding());
+        }
+    };
+
+    class FieldEncoding
+    {
+      private:
+        Encoding rawEncoding = 0;
+        Field fieldId = Field::VirtualProcessorId;
+        AccessType accessType = AccessType::Full;
+
+      public:
+        constexpr FieldEncoding() = default;
+
+        constexpr FieldEncoding(Encoding raw_encoding, Field field,
+                AccessType access_type)
+            : rawEncoding(raw_encoding),
+              fieldId(field),
+              accessType(access_type)
+        {
+        }
+
+        static constexpr FieldEncoding
+        full(Field field)
+        {
+            return FieldEncoding(encodingOf(field), field, AccessType::Full);
+        }
+
+        constexpr Encoding
+        raw() const
+        {
+            return rawEncoding;
+        }
+
+        constexpr Field
+        field() const
+        {
+            return fieldId;
+        }
+
+        constexpr Encoding
+        fullEncoding() const
+        {
+            return encodingOf(fieldId);
+        }
+
+        constexpr AccessType
+        access() const
+        {
+            return accessType;
+        }
+
+        constexpr bool
+        highAccess() const
+        {
+            return accessType == AccessType::High;
+        }
     };
 
     class VmcsHeader
@@ -87,288 +424,240 @@ class Vmcs
 
   public:
     static const FieldInfo *
-    lookupField(Encoding encoding)
+    lookupField(Field field_id)
     {
+        using F = Field;
         using Group = VmcsFieldGroup;
-        using Type = VmcsFieldType;
-        using Width = FieldWidth;
+
+#define VMCS_FIELD(_field, _group, _writable) \
+            {F::_field, #_field, Group::_group, _writable}
 
         static constexpr FieldInfo supportedFields[] = {
-            {0x0000, "VPID", Width::U16, Type::Control,
-             Group::VmExecutionControl, true},
+            VMCS_FIELD(VirtualProcessorId, VmExecutionControl, true),
+            VMCS_FIELD(PostedInterruptNotificationVector,
+                    VmExecutionControl, true),
+            VMCS_FIELD(EptpIndex, VmExecutionControl, true),
+            VMCS_FIELD(HlatPrefixSize, VmExecutionControl, true),
+            VMCS_FIELD(LastPidPointerIndex, VmExecutionControl, true),
 
-            {0x0800, "GUEST_ES_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x0802, "GUEST_CS_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x0804, "GUEST_SS_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x0806, "GUEST_DS_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x0808, "GUEST_FS_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x080A, "GUEST_GS_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x080C, "GUEST_LDTR_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
-            {0x080E, "GUEST_TR_SELECTOR", Width::U16, Type::GuestState,
-             Group::GuestState, true},
+            VMCS_FIELD(GuestEsSelector, GuestState, true),
+            VMCS_FIELD(GuestCsSelector, GuestState, true),
+            VMCS_FIELD(GuestSsSelector, GuestState, true),
+            VMCS_FIELD(GuestDsSelector, GuestState, true),
+            VMCS_FIELD(GuestFsSelector, GuestState, true),
+            VMCS_FIELD(GuestGsSelector, GuestState, true),
+            VMCS_FIELD(GuestLdtrSelector, GuestState, true),
+            VMCS_FIELD(GuestTrSelector, GuestState, true),
+            VMCS_FIELD(GuestInterruptStatus, GuestState, true),
+            VMCS_FIELD(PmlIndex, GuestState, true),
+            VMCS_FIELD(GuestUinv, GuestState, true),
 
-            {0x0C00, "HOST_ES_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C02, "HOST_CS_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C04, "HOST_SS_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C06, "HOST_DS_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C08, "HOST_FS_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C0A, "HOST_GS_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
-            {0x0C0C, "HOST_TR_SELECTOR", Width::U16, Type::HostState,
-             Group::HostState, true},
+            VMCS_FIELD(HostEsSelector, HostState, true),
+            VMCS_FIELD(HostCsSelector, HostState, true),
+            VMCS_FIELD(HostSsSelector, HostState, true),
+            VMCS_FIELD(HostDsSelector, HostState, true),
+            VMCS_FIELD(HostFsSelector, HostState, true),
+            VMCS_FIELD(HostGsSelector, HostState, true),
+            VMCS_FIELD(HostTrSelector, HostState, true),
 
-            {0x2000, "IO_BITMAP_A", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x2002, "IO_BITMAP_B", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x2004, "MSR_BITMAP", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x2006, "VM_EXIT_MSR_STORE_ADDR", Width::U64, Type::Control,
-             Group::VmExitControl, true},
-            {0x2008, "VM_EXIT_MSR_LOAD_ADDR", Width::U64, Type::Control,
-             Group::VmExitControl, true},
-            {0x200A, "VM_ENTRY_MSR_LOAD_ADDR", Width::U64, Type::Control,
-             Group::VmEntryControl, true},
-            {0x2010, "TSC_OFFSET", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x2012, "VIRTUAL_APIC_ADDRESS", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x2014, "APIC_ACCESS_ADDRESS", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x201A, "EPT_POINTER", Width::U64, Type::Control,
-             Group::VmExecutionControl, true},
+            VMCS_FIELD(IoBitmapA, VmExecutionControl, true),
+            VMCS_FIELD(IoBitmapB, VmExecutionControl, true),
+            VMCS_FIELD(MsrBitmap, VmExecutionControl, true),
+            VMCS_FIELD(VmExitMsrStoreAddress, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrLoadAddress, VmExitControl, true),
+            VMCS_FIELD(VmEntryMsrLoadAddress, VmEntryControl, true),
+            VMCS_FIELD(ExecutiveVmcsPointer, VmExecutionControl, true),
+            VMCS_FIELD(PmlAddress, VmExecutionControl, true),
+            VMCS_FIELD(TscOffset, VmExecutionControl, true),
+            VMCS_FIELD(VirtualApicAddress, VmExecutionControl, true),
+            VMCS_FIELD(ApicAccessAddress, VmExecutionControl, true),
+            VMCS_FIELD(PostedInterruptDescriptorAddress,
+                    VmExecutionControl, true),
+            VMCS_FIELD(VmFunctionControls, VmExecutionControl, true),
+            VMCS_FIELD(EptPointer, VmExecutionControl, true),
+            VMCS_FIELD(EoiExitBitmap0, VmExecutionControl, true),
+            VMCS_FIELD(EoiExitBitmap1, VmExecutionControl, true),
+            VMCS_FIELD(EoiExitBitmap2, VmExecutionControl, true),
+            VMCS_FIELD(EoiExitBitmap3, VmExecutionControl, true),
+            VMCS_FIELD(EptpListAddress, VmExecutionControl, true),
+            VMCS_FIELD(VmreadBitmapAddress, VmExecutionControl, true),
+            VMCS_FIELD(VmwriteBitmapAddress, VmExecutionControl, true),
+            VMCS_FIELD(VirtualizationExceptionInformationAddress,
+                    VmExecutionControl, true),
+            VMCS_FIELD(XssExitingBitmap, VmExecutionControl, true),
+            VMCS_FIELD(EnclsExitingBitmap, VmExecutionControl, true),
+            VMCS_FIELD(SubPagePermissionTablePointer,
+                    VmExecutionControl, true),
+            VMCS_FIELD(TscMultiplier, VmExecutionControl, true),
+            VMCS_FIELD(TertiaryProcessorBasedVmExecutionControls,
+                    VmExecutionControl, true),
+            VMCS_FIELD(LowPasidDirectoryAddress, VmExecutionControl, true),
+            VMCS_FIELD(HighPasidDirectoryAddress, VmExecutionControl, true),
+            VMCS_FIELD(SeamSharedEptPointer, VmExecutionControl, true),
+            VMCS_FIELD(PconfigExitingBitmap, VmExecutionControl, true),
+            VMCS_FIELD(HlatPointer, VmExecutionControl, true),
+            VMCS_FIELD(PidPointerTableAddress, VmExecutionControl, true),
+            VMCS_FIELD(SecondaryVmExitControls, VmExitControl, true),
+            VMCS_FIELD(Ia32SpecCtrlMask, VmExecutionControl, true),
+            VMCS_FIELD(Ia32SpecCtrlShadow, VmExecutionControl, true),
+            VMCS_FIELD(InjectedEventData, VmEntryControl, true),
 
-            {0x2400, "GUEST_PHYSICAL_ADDRESS", Width::U64,
-             Type::VmExitInfo, Group::VmExitInformation, false},
+            VMCS_FIELD(GuestPhysicalAddress, VmExitInformation, false),
+            VMCS_FIELD(MsrData, VmExitInformation, false),
+            VMCS_FIELD(OriginalEventData, VmExitInformation, false),
 
-            {0x2800, "VMCS_LINK_POINTER", Width::U64, Type::GuestState,
-             Group::GuestState, true},
-            {0x2802, "GUEST_IA32_DEBUGCTL", Width::U64, Type::GuestState,
-             Group::GuestState, true},
-            {0x2804, "GUEST_IA32_PAT", Width::U64, Type::GuestState,
-             Group::GuestState, true},
-            {0x2806, "GUEST_IA32_EFER", Width::U64, Type::GuestState,
-             Group::GuestState, true},
-            {0x2808, "GUEST_IA32_PERF_GLOBAL_CTRL", Width::U64,
-             Type::GuestState, Group::GuestState, true},
+            VMCS_FIELD(VmcsLinkPointer, GuestState, true),
+            VMCS_FIELD(GuestIa32Debugctl, GuestState, true),
+            VMCS_FIELD(GuestIa32Pat, GuestState, true),
+            VMCS_FIELD(GuestIa32Efer, GuestState, true),
+            VMCS_FIELD(GuestIa32PerfGlobalCtrl, GuestState, true),
+            VMCS_FIELD(GuestPdpte0, GuestState, true),
+            VMCS_FIELD(GuestPdpte1, GuestState, true),
+            VMCS_FIELD(GuestPdpte2, GuestState, true),
+            VMCS_FIELD(GuestPdpte3, GuestState, true),
+            VMCS_FIELD(GuestIa32Bndcfgs, GuestState, true),
+            VMCS_FIELD(GuestIa32RtitCtl, GuestState, true),
+            VMCS_FIELD(GuestIa32LbrCtl, GuestState, true),
+            VMCS_FIELD(GuestIa32Pkrs, GuestState, true),
+            VMCS_FIELD(GuestIa32FredConfig, GuestState, true),
+            VMCS_FIELD(GuestIa32FredRsp1, GuestState, true),
+            VMCS_FIELD(GuestIa32FredRsp2, GuestState, true),
+            VMCS_FIELD(GuestIa32FredRsp3, GuestState, true),
+            VMCS_FIELD(GuestIa32FredStklvls, GuestState, true),
+            VMCS_FIELD(GuestIa32FredSsp1, GuestState, true),
+            VMCS_FIELD(GuestIa32FredSsp2, GuestState, true),
+            VMCS_FIELD(GuestIa32FredSsp3, GuestState, true),
 
-            {0x2C00, "HOST_IA32_PAT", Width::U64, Type::HostState,
-             Group::HostState, true},
-            {0x2C02, "HOST_IA32_EFER", Width::U64, Type::HostState,
-             Group::HostState, true},
-            {0x2C04, "HOST_IA32_PERF_GLOBAL_CTRL", Width::U64,
-             Type::HostState, Group::HostState, true},
+            VMCS_FIELD(HostIa32Pat, HostState, true),
+            VMCS_FIELD(HostIa32Efer, HostState, true),
+            VMCS_FIELD(HostIa32PerfGlobalCtrl, HostState, true),
+            VMCS_FIELD(HostIa32Pkrs, HostState, true),
+            VMCS_FIELD(HostIa32FredConfig, HostState, true),
+            VMCS_FIELD(HostIa32FredRsp1, HostState, true),
+            VMCS_FIELD(HostIa32FredRsp2, HostState, true),
+            VMCS_FIELD(HostIa32FredRsp3, HostState, true),
+            VMCS_FIELD(HostIa32FredStklvls, HostState, true),
+            VMCS_FIELD(HostIa32FredSsp1, HostState, true),
+            VMCS_FIELD(HostIa32FredSsp2, HostState, true),
+            VMCS_FIELD(HostIa32FredSsp3, HostState, true),
 
-            {0x4000, "PIN_BASED_VM_EXEC_CONTROL", Width::U32,
-             Type::Control, Group::VmExecutionControl, true},
-            {0x4002, "CPU_BASED_VM_EXEC_CONTROL", Width::U32,
-             Type::Control, Group::VmExecutionControl, true},
-            {0x4004, "EXCEPTION_BITMAP", Width::U32, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x4006, "PAGE_FAULT_ERROR_CODE_MASK", Width::U32,
-             Type::Control, Group::VmExecutionControl, true},
-            {0x4008, "PAGE_FAULT_ERROR_CODE_MATCH", Width::U32,
-             Type::Control, Group::VmExecutionControl, true},
-            {0x400A, "CR3_TARGET_COUNT", Width::U32, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x400C, "VM_EXIT_CONTROLS", Width::U32, Type::Control,
-             Group::VmExitControl, true},
-            {0x400E, "VM_EXIT_MSR_STORE_COUNT", Width::U32,
-             Type::Control, Group::VmExitControl, true},
-            {0x4010, "VM_EXIT_MSR_LOAD_COUNT", Width::U32,
-             Type::Control, Group::VmExitControl, true},
-            {0x4012, "VM_ENTRY_CONTROLS", Width::U32, Type::Control,
-             Group::VmEntryControl, true},
-            {0x4014, "VM_ENTRY_MSR_LOAD_COUNT", Width::U32,
-             Type::Control, Group::VmEntryControl, true},
-            {0x4016, "VM_ENTRY_INTR_INFO_FIELD", Width::U32,
-             Type::Control, Group::VmEntryControl, true},
-            {0x4018, "VM_ENTRY_EXCEPTION_ERROR_CODE", Width::U32,
-             Type::Control, Group::VmEntryControl, true},
-            {0x401A, "VM_ENTRY_INSTRUCTION_LEN", Width::U32,
-             Type::Control, Group::VmEntryControl, true},
-            {0x401C, "TPR_THRESHOLD", Width::U32, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x401E, "SECONDARY_VM_EXEC_CONTROL", Width::U32,
-             Type::Control, Group::VmExecutionControl, true},
+            VMCS_FIELD(PinBasedVmExecControl, VmExecutionControl, true),
+            VMCS_FIELD(CpuBasedVmExecControl, VmExecutionControl, true),
+            VMCS_FIELD(ExceptionBitmap, VmExecutionControl, true),
+            VMCS_FIELD(PageFaultErrorCodeMask, VmExecutionControl, true),
+            VMCS_FIELD(PageFaultErrorCodeMatch, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetCount, VmExecutionControl, true),
+            VMCS_FIELD(VmExitControls, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrStoreCount, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrLoadCount, VmExitControl, true),
+            VMCS_FIELD(VmEntryControls, VmEntryControl, true),
+            VMCS_FIELD(VmEntryMsrLoadCount, VmEntryControl, true),
+            VMCS_FIELD(VmEntryIntrInfoField, VmEntryControl, true),
+            VMCS_FIELD(VmEntryExceptionErrorCode, VmEntryControl, true),
+            VMCS_FIELD(VmEntryInstructionLen, VmEntryControl, true),
+            VMCS_FIELD(TprThreshold, VmExecutionControl, true),
+            VMCS_FIELD(SecondaryVmExecControl, VmExecutionControl, true),
+            VMCS_FIELD(PleGap, VmExecutionControl, true),
+            VMCS_FIELD(PleWindow, VmExecutionControl, true),
+            VMCS_FIELD(InstructionTimeoutControl, VmExecutionControl, true),
+            VMCS_FIELD(SeamGuestKeyId, VmExecutionControl, true),
 
-            {0x4400, "VM_INSTRUCTION_ERROR", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x4402, "VM_EXIT_REASON", Width::U32, Type::VmExitInfo,
-             Group::VmExitInformation, false},
-            {0x4404, "VM_EXIT_INTERRUPTION_INFO", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x4406, "VM_EXIT_INTERRUPTION_ERROR_CODE", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x4408, "IDT_VECTORING_INFO_FIELD", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x440A, "IDT_VECTORING_ERROR_CODE", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x440C, "VM_EXIT_INSTRUCTION_LEN", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x440E, "VMX_INSTRUCTION_INFO", Width::U32,
-             Type::VmExitInfo, Group::VmExitInformation, false},
+            VMCS_FIELD(VmInstructionError, VmExitInformation, false),
+            VMCS_FIELD(VmExitReason, VmExitInformation, false),
+            VMCS_FIELD(VmExitInterruptionInfo, VmExitInformation, false),
+            VMCS_FIELD(VmExitInterruptionErrorCode, VmExitInformation, false),
+            VMCS_FIELD(IdtVectoringInfoField, VmExitInformation, false),
+            VMCS_FIELD(IdtVectoringErrorCode, VmExitInformation, false),
+            VMCS_FIELD(VmExitInstructionLen, VmExitInformation, false),
+            VMCS_FIELD(VmxInstructionInfo, VmExitInformation, false),
 
-            {0x4800, "GUEST_ES_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4802, "GUEST_CS_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4804, "GUEST_SS_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4806, "GUEST_DS_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4808, "GUEST_FS_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x480A, "GUEST_GS_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x480C, "GUEST_LDTR_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x480E, "GUEST_TR_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4810, "GUEST_GDTR_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4812, "GUEST_IDTR_LIMIT", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x4814, "GUEST_ES_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4816, "GUEST_CS_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4818, "GUEST_SS_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x481A, "GUEST_DS_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x481C, "GUEST_FS_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x481E, "GUEST_GS_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4820, "GUEST_LDTR_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4822, "GUEST_TR_ACCESS_RIGHTS", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4824, "GUEST_INTERRUPTIBILITY_STATE", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4826, "GUEST_ACTIVITY_STATE", Width::U32,
-             Type::GuestState, Group::GuestState, true},
-            {0x4828, "GUEST_SMBASE", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x482A, "GUEST_SYSENTER_CS", Width::U32, Type::GuestState,
-             Group::GuestState, true},
-            {0x482E, "VMX_PREEMPTION_TIMER_VALUE", Width::U32,
-             Type::GuestState, Group::GuestState, true},
+            VMCS_FIELD(GuestEsLimit, GuestState, true),
+            VMCS_FIELD(GuestCsLimit, GuestState, true),
+            VMCS_FIELD(GuestSsLimit, GuestState, true),
+            VMCS_FIELD(GuestDsLimit, GuestState, true),
+            VMCS_FIELD(GuestFsLimit, GuestState, true),
+            VMCS_FIELD(GuestGsLimit, GuestState, true),
+            VMCS_FIELD(GuestLdtrLimit, GuestState, true),
+            VMCS_FIELD(GuestTrLimit, GuestState, true),
+            VMCS_FIELD(GuestGdtrLimit, GuestState, true),
+            VMCS_FIELD(GuestIdtrLimit, GuestState, true),
+            VMCS_FIELD(GuestEsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestCsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestSsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestDsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestFsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestGsAccessRights, GuestState, true),
+            VMCS_FIELD(GuestLdtrAccessRights, GuestState, true),
+            VMCS_FIELD(GuestTrAccessRights, GuestState, true),
+            VMCS_FIELD(GuestInterruptibilityState, GuestState, true),
+            VMCS_FIELD(GuestActivityState, GuestState, true),
+            VMCS_FIELD(GuestSmbase, GuestState, true),
+            VMCS_FIELD(GuestSysenterCs, GuestState, true),
+            VMCS_FIELD(VmxPreemptionTimerValue, GuestState, true),
 
-            {0x6800, "GUEST_CR0", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6802, "GUEST_CR3", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6804, "GUEST_CR4", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6806, "GUEST_ES_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6808, "GUEST_CS_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x680A, "GUEST_SS_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x680C, "GUEST_DS_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x680E, "GUEST_FS_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6810, "GUEST_GS_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6812, "GUEST_LDTR_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6814, "GUEST_TR_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6816, "GUEST_GDTR_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6818, "GUEST_IDTR_BASE", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x681A, "GUEST_DR7", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x681C, "GUEST_RSP", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x681E, "GUEST_RIP", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6820, "GUEST_RFLAGS", Width::Natural, Type::GuestState,
-             Group::GuestState, true},
-            {0x6822, "GUEST_PENDING_DBG_EXCEPTIONS", Width::Natural,
-             Type::GuestState, Group::GuestState, true},
-            {0x6824, "GUEST_SYSENTER_ESP", Width::Natural,
-             Type::GuestState, Group::GuestState, true},
-            {0x6826, "GUEST_SYSENTER_EIP", Width::Natural,
-             Type::GuestState, Group::GuestState, true},
+            VMCS_FIELD(HostIa32SysenterCs, HostState, true),
 
-            {0x6000, "CR0_GUEST_HOST_MASK", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x6002, "CR4_GUEST_HOST_MASK", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x6004, "CR0_READ_SHADOW", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x6006, "CR4_READ_SHADOW", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x6008, "CR3_TARGET_VALUE_0", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x600A, "CR3_TARGET_VALUE_1", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x600C, "CR3_TARGET_VALUE_2", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
-            {0x600E, "CR3_TARGET_VALUE_3", Width::Natural, Type::Control,
-             Group::VmExecutionControl, true},
+            VMCS_FIELD(Cr0GuestHostMask, VmExecutionControl, true),
+            VMCS_FIELD(Cr4GuestHostMask, VmExecutionControl, true),
+            VMCS_FIELD(Cr0ReadShadow, VmExecutionControl, true),
+            VMCS_FIELD(Cr4ReadShadow, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue0, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue1, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue2, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue3, VmExecutionControl, true),
 
-            {0x6400, "EXIT_QUALIFICATION", Width::Natural,
-             Type::VmExitInfo, Group::VmExitInformation, false},
-            {0x6402, "IO_RCX", Width::Natural, Type::VmExitInfo,
-             Group::VmExitInformation, false},
-            {0x6404, "IO_RSI", Width::Natural, Type::VmExitInfo,
-             Group::VmExitInformation, false},
-            {0x6406, "IO_RDI", Width::Natural, Type::VmExitInfo,
-             Group::VmExitInformation, false},
-            {0x6408, "IO_RIP", Width::Natural, Type::VmExitInfo,
-             Group::VmExitInformation, false},
-            {0x640A, "GUEST_LINEAR_ADDRESS", Width::Natural,
-             Type::VmExitInfo, Group::VmExitInformation, false},
+            VMCS_FIELD(ExitQualification, VmExitInformation, false),
+            VMCS_FIELD(IoRcx, VmExitInformation, false),
+            VMCS_FIELD(IoRsi, VmExitInformation, false),
+            VMCS_FIELD(IoRdi, VmExitInformation, false),
+            VMCS_FIELD(IoRip, VmExitInformation, false),
+            VMCS_FIELD(GuestLinearAddress, VmExitInformation, false),
 
-            {0x6C00, "HOST_CR0", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C02, "HOST_CR3", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C04, "HOST_CR4", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C06, "HOST_FS_BASE", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C08, "HOST_GS_BASE", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C0A, "HOST_TR_BASE", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C0C, "HOST_GDTR_BASE", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C0E, "HOST_IDTR_BASE", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C10, "HOST_IA32_SYSENTER_ESP", Width::Natural,
-             Type::HostState, Group::HostState, true},
-            {0x6C12, "HOST_IA32_SYSENTER_EIP", Width::Natural,
-             Type::HostState, Group::HostState, true},
-            {0x6C14, "HOST_RSP", Width::Natural, Type::HostState,
-             Group::HostState, true},
-            {0x6C16, "HOST_RIP", Width::Natural, Type::HostState,
-             Group::HostState, true},
+            VMCS_FIELD(GuestCr0, GuestState, true),
+            VMCS_FIELD(GuestCr3, GuestState, true),
+            VMCS_FIELD(GuestCr4, GuestState, true),
+            VMCS_FIELD(GuestEsBase, GuestState, true),
+            VMCS_FIELD(GuestCsBase, GuestState, true),
+            VMCS_FIELD(GuestSsBase, GuestState, true),
+            VMCS_FIELD(GuestDsBase, GuestState, true),
+            VMCS_FIELD(GuestFsBase, GuestState, true),
+            VMCS_FIELD(GuestGsBase, GuestState, true),
+            VMCS_FIELD(GuestLdtrBase, GuestState, true),
+            VMCS_FIELD(GuestTrBase, GuestState, true),
+            VMCS_FIELD(GuestGdtrBase, GuestState, true),
+            VMCS_FIELD(GuestIdtrBase, GuestState, true),
+            VMCS_FIELD(GuestDr7, GuestState, true),
+            VMCS_FIELD(GuestRsp, GuestState, true),
+            VMCS_FIELD(GuestRip, GuestState, true),
+            VMCS_FIELD(GuestRflags, GuestState, true),
+            VMCS_FIELD(GuestPendingDbgExceptions, GuestState, true),
+            VMCS_FIELD(GuestSysenterEsp, GuestState, true),
+            VMCS_FIELD(GuestSysenterEip, GuestState, true),
+            VMCS_FIELD(GuestIa32SCet, GuestState, true),
+            VMCS_FIELD(GuestSsp, GuestState, true),
+            VMCS_FIELD(GuestIa32InterruptSspTableAddr, GuestState, true),
+
+            VMCS_FIELD(HostCr0, HostState, true),
+            VMCS_FIELD(HostCr3, HostState, true),
+            VMCS_FIELD(HostCr4, HostState, true),
+            VMCS_FIELD(HostFsBase, HostState, true),
+            VMCS_FIELD(HostGsBase, HostState, true),
+            VMCS_FIELD(HostTrBase, HostState, true),
+            VMCS_FIELD(HostGdtrBase, HostState, true),
+            VMCS_FIELD(HostIdtrBase, HostState, true),
+            VMCS_FIELD(HostIa32SysenterEsp, HostState, true),
+            VMCS_FIELD(HostIa32SysenterEip, HostState, true),
+            VMCS_FIELD(HostRsp, HostState, true),
+            VMCS_FIELD(HostRip, HostState, true),
+            VMCS_FIELD(HostIa32SCet, HostState, true),
+            VMCS_FIELD(HostSsp, HostState, true),
+            VMCS_FIELD(HostIa32InterruptSspTableAddr, HostState, true),
         };
 
-        if (encoding > VmcsEncodingMask) return nullptr;
+#undef VMCS_FIELD
 
         for (const auto &field : supportedFields) {
-            if (field.encoding == encoding) {
+            if (field.field == field_id) {
                 return &field;
             }
         }
@@ -376,10 +665,57 @@ class Vmcs
         return nullptr;
     }
 
+    static const FieldInfo *
+    lookupField(const FieldEncoding &encoding)
+    {
+        const auto *field = lookupField(encoding.field());
+        if (!field) {
+            return nullptr;
+        }
+        if (encoding.highAccess() && field->width() != FieldWidth::U64) {
+            return nullptr;
+        }
+        return field;
+    }
+
+    static const FieldInfo *
+    lookupField(Encoding encoding)
+    {
+        FieldEncoding decoded;
+        return decodeEncoding(encoding, decoded) ? lookupField(decoded) :
+            nullptr;
+    }
+
+    static bool
+    fieldSupported(Field field)
+    {
+        return lookupField(field) != nullptr;
+    }
+
+    static bool
+    fieldSupported(const FieldEncoding &encoding)
+    {
+        return lookupField(encoding) != nullptr;
+    }
+
     static bool
     fieldSupported(Encoding encoding)
     {
         return lookupField(encoding) != nullptr;
+    }
+
+    static bool
+    fieldWritable(Field field)
+    {
+        const auto *info = lookupField(field);
+        return info && info->writable;
+    }
+
+    static bool
+    fieldWritable(const FieldEncoding &encoding)
+    {
+        const auto *field = lookupField(encoding);
+        return field && field->writable;
     }
 
     static bool
@@ -478,63 +814,150 @@ class Vmcs
     }
 
     static bool
-    decodeEncoding(RawEncoding raw_encoding, Encoding &encoding)
+    decodeEncoding(RawEncoding raw_encoding, FieldEncoding &encoding)
     {
-        if (raw_encoding & ~VmcsEncodingMask) {
+        if ((raw_encoding & ~VmcsEncodingMask) ||
+                (raw_encoding & VmcsEncodingReservedBit)) {
             return false;
         }
 
-        encoding = static_cast<Encoding>(raw_encoding);
+        const auto raw = static_cast<Encoding>(raw_encoding);
+        const bool high = bits(raw, 0);
+        const auto full_encoding = high ?
+            static_cast<Encoding>(raw & ~static_cast<Encoding>(1)) : raw;
+        encoding = FieldEncoding(raw, static_cast<Field>(full_encoding),
+                high ? AccessType::High : AccessType::Full);
         return true;
+    }
+
+    static bool
+    decodeEncoding(RawEncoding raw_encoding, Encoding &encoding)
+    {
+        FieldEncoding decoded;
+        if (!decodeEncoding(raw_encoding, decoded)) {
+            return false;
+        }
+
+        encoding = decoded.fullEncoding();
+        return true;
+    }
+
+    static uint64_t
+    sanitizeValue(Field field, uint64_t value)
+    {
+        const auto *info = lookupField(field);
+        return info ? (value & widthMask(info->width())) : value;
     }
 
     static uint64_t
     sanitizeValue(Encoding encoding, uint64_t value)
     {
         const auto *field = lookupField(encoding);
-        return field ? (value & widthMask(field->width)) : value;
+        return field ? sanitizeValue(field->field, value) : value;
+    }
+
+    bool
+    read(Field field, uint64_t &value) const
+    {
+        return read(FieldEncoding::full(field), value);
     }
 
     bool
     read(Encoding encoding, uint64_t &value) const
     {
-        if (!fieldSupported(encoding)) {
+        FieldEncoding decoded;
+        if (!decodeEncoding(encoding, decoded)) {
+            return false;
+        }
+        return read(decoded, value);
+    }
+
+    bool
+    read(const FieldEncoding &encoding, uint64_t &value) const
+    {
+        if (!lookupField(encoding)) {
             return false;
         }
 
-        auto it = fields.find(encoding);
-        if (it == fields.end()) {
-            value = 0;
-            return true;
+        auto it = fields.find(encoding.fullEncoding());
+        value = it == fields.end() ? 0 :
+            sanitizeValue(encoding.field(), it->second);
+        if (encoding.highAccess()) {
+            value = bits(value, 63, 32);
         }
-
-        value = sanitizeValue(encoding, it->second);
         return true;
+    }
+
+    bool
+    write(Field field, uint64_t value)
+    {
+        return write(FieldEncoding::full(field), value);
     }
 
     bool
     write(Encoding encoding, uint64_t value)
     {
-        if (!fieldWritable(encoding)) {
+        FieldEncoding decoded;
+        if (!decodeEncoding(encoding, decoded)) {
+            return false;
+        }
+        return write(decoded, value);
+    }
+
+    bool
+    write(const FieldEncoding &encoding, uint64_t value)
+    {
+        const auto *field = lookupField(encoding);
+        if (!field || !field->writable) {
             return false;
         }
 
-        fields[encoding] = sanitizeValue(encoding, value);
+        if (encoding.highAccess()) {
+            uint64_t current = 0;
+            read(encoding.field(), current);
+            replaceBits(current, 63, 32, bits(value, 31, 0));
+            fields[encoding.fullEncoding()] =
+                sanitizeValue(encoding.field(), current);
+            return true;
+        }
+
+        fields[encoding.fullEncoding()] =
+            sanitizeValue(encoding.field(), value);
         return true;
+    }
+
+    void
+    writeUnchecked(Field field, uint64_t value)
+    {
+        panic_if(!fieldSupported(field),
+                "Unsupported VMCS field %#x for unchecked write",
+                encodingOf(field));
+        fields[encodingOf(field)] = sanitizeValue(field, value);
     }
 
     void
     writeUnchecked(Encoding encoding, uint64_t value)
     {
-        panic_if(!fieldSupported(encoding),
+        FieldEncoding decoded;
+        panic_if(!decodeEncoding(encoding, decoded) || !lookupField(decoded),
                 "Unsupported VMCS field %#x for unchecked write", encoding);
-        fields[encoding] = sanitizeValue(encoding, value);
+
+        if (decoded.highAccess()) {
+            uint64_t current = 0;
+            read(decoded.field(), current);
+            replaceBits(current, 63, 32, bits(value, 31, 0));
+            fields[decoded.fullEncoding()] =
+                sanitizeValue(decoded.field(), current);
+            return;
+        }
+
+        writeUnchecked(decoded.field(), value);
     }
 
     void
     setInstructionError(uint32_t error)
     {
-        writeUnchecked(VmInstructionError, error);
+        writeUnchecked(Field::VmInstructionError, error);
     }
 
     void
@@ -575,12 +998,25 @@ class Vmcs
 
         panic_if(encodings.size() != values.size(),
                 "Malformed VMCS checkpoint: encoding/value count mismatch");
+        panic_if(launch_state > static_cast<uint8_t>(LaunchState::Launched),
+                "Malformed VMCS checkpoint: invalid launch state %u",
+                launch_state);
 
         launchState = static_cast<LaunchState>(launch_state);
         fields.clear();
         for (size_t i = 0; i < encodings.size(); ++i) {
-            fields.emplace(encodings[i], values[i]);
+            FieldEncoding decoded;
+            panic_if(!decodeEncoding(encodings[i], decoded) ||
+                    !lookupField(decoded),
+                    "Malformed VMCS checkpoint: unsupported field %#x",
+                    encodings[i]);
+            panic_if(decoded.highAccess(),
+                    "Malformed VMCS checkpoint: high-access field %#x",
+                    encodings[i]);
+            fields.emplace(decoded.fullEncoding(),
+                    sanitizeValue(decoded.field(), values[i]));
         }
+        fields.emplace(VmInstructionError, 0);
     }
 
     static_assert(sizeof(VmcsHeader) == 8,
