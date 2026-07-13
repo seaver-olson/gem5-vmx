@@ -1,7 +1,6 @@
 #ifndef __ARCH_X86_VMX_HH__
 #define __ARCH_X86_VMX_HH__
 
-#include <array>
 #include <cstdint>
 #include <map>
 
@@ -236,36 +235,36 @@ class VmxState
 {
   private:
     using VmcsMap = std::map<Addr, Vmcs>;
-    static constexpr size_t NumSegmentRegs = segment_idx::NumIdxs;
-
-    struct RootSnapshot
-    {
-        bool valid = false;
-        std::array<RegVal, NumSegmentRegs> selector = {};
-        std::array<RegVal, NumSegmentRegs> base = {};
-        std::array<RegVal, NumSegmentRegs> effBase = {};
-        std::array<RegVal, NumSegmentRegs> limit = {};
-        std::array<RegVal, NumSegmentRegs> attr = {};
-        RegVal m5Reg = 0;
-
-        void capture(ThreadContext *tc);
-        void restore(ThreadContext *tc) const;
-        void clear();
-        void serialize(CheckpointOut &cp) const;
-        void unserialize(CheckpointIn &cp);
-    };
+    static constexpr Addr InvalidVmcsPointer = ~Addr(0);
 
     bool vmxActive = false;
     bool inVmxNonRoot = false;
     Addr vmxonRegion = 0;
-    Addr currentVmcsPtr = 0;
+    Addr currentVmcsPtr = InvalidVmcsPointer;
     VmcsMap vmcsRegions;
-    RootSnapshot rootSnapshot;
+
+    struct VmEntryValidationResult
+    {
+        bool valid = true;
+        bool vmEntryFailure = false;
+        VmxInstructionError instructionError =
+            VmxInstructionError::VmEntryInvalidControlFields;
+        VmxExitReason exitReason = VmxExitReason::VmEntryInvalidGuestState;
+    };
 
     Vmcs *findVmcs(Addr regionPtr);
     const Vmcs *findVmcs(Addr regionPtr) const;
     Vmcs *currentVmcs();
     const Vmcs *currentVmcs() const;
+
+    VmEntryValidationResult validateVmEntry(ThreadContext *tc,
+            Vmcs &vmcs) const;
+    bool loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const;
+    bool loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const;
+    void saveGuestState(ThreadContext *tc, Vmcs &vmcs) const;
+    VmxResult failVmEntry(ThreadContext *tc, Vmcs &vmcs,
+            VmxExitReason reason);
+    VmxResult vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize);
 
   public:
     bool active() const { return vmxActive; }

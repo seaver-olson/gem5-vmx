@@ -105,6 +105,8 @@ SimObject(
 SimObject('X86CPU.py', sim_objects=[], tags=['x86 isa'])
 
 DebugFlag('LocalApic', "Local APIC debugging", tags=['x86 isa'])
+DebugFlag('VMX', "Intel VMX instruction and transition tracing",
+          tags=['x86 isa'])
 DebugFlag('X86', "Generic X86 ISA debugging", tags=['x86 isa'])
 DebugFlag('ACPI', "ACPI debugging", tags=['x86 isa'])
 

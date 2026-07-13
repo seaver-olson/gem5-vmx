@@ -1,16 +1,22 @@
 #include "arch/x86/insts/vmx.hh"
 
+#include <array>
 #include <memory>
 #include <string> // for std::to_string
 #include <utility> // for std::pair and std::move
 #include <vector>
 
 #include "arch/x86/decoder.hh"
+#include "arch/x86/faults.hh"
 #include "arch/x86/isa.hh"
+#include "arch/x86/page_size.hh"
+#include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/utility.hh"
 #include "base/bitfield.hh"
 #include "cpu/exec_context.hh"
 #include "cpu/thread_context.hh"
+#include "debug/VMX.hh"
 #include "mem/port_proxy.hh"
 #include "sim/system.hh"
 
@@ -63,7 +69,35 @@ constexpr VmcsField VmcsCr4ReadShadow = VmcsField::Cr4ReadShadow;
 constexpr VmcsField VmcsExitQualification = VmcsField::ExitQualification;
 constexpr VmcsField VmcsGuestLinearAddress = VmcsField::GuestLinearAddress;
 constexpr VmcsField VmcsGuestRip = VmcsField::GuestRip;
+constexpr VmcsField VmcsGuestRsp = VmcsField::GuestRsp;
+constexpr VmcsField VmcsGuestRflags = VmcsField::GuestRflags;
+constexpr VmcsField VmcsGuestCr0 = VmcsField::GuestCr0;
+constexpr VmcsField VmcsGuestCr3 = VmcsField::GuestCr3;
+constexpr VmcsField VmcsGuestCr4 = VmcsField::GuestCr4;
+constexpr VmcsField VmcsGuestDr7 = VmcsField::GuestDr7;
+constexpr VmcsField VmcsGuestIa32Efer = VmcsField::GuestIa32Efer;
+constexpr VmcsField VmcsGuestActivityState = VmcsField::GuestActivityState;
 constexpr VmcsField VmcsHostRip = VmcsField::HostRip;
+constexpr VmcsField VmcsHostRsp = VmcsField::HostRsp;
+constexpr VmcsField VmcsHostCr0 = VmcsField::HostCr0;
+constexpr VmcsField VmcsHostCr3 = VmcsField::HostCr3;
+constexpr VmcsField VmcsHostCr4 = VmcsField::HostCr4;
+constexpr VmcsField VmcsHostIa32Efer = VmcsField::HostIa32Efer;
+constexpr VmcsField VmcsVmEntryControls = VmcsField::VmEntryControls;
+constexpr VmcsField VmcsVmEntryIntrInfoField = VmcsField::VmEntryIntrInfoField;
+constexpr VmcsField VmcsVmEntryMsrLoadCount = VmcsField::VmEntryMsrLoadCount;
+constexpr VmcsField VmcsVmExitControls = VmcsField::VmExitControls;
+constexpr VmcsField VmcsVmExitMsrStoreCount = VmcsField::VmExitMsrStoreCount;
+constexpr VmcsField VmcsVmExitMsrLoadCount = VmcsField::VmExitMsrLoadCount;
+constexpr VmcsField VmcsSecondaryVmExecControl =
+    VmcsField::SecondaryVmExecControl;
+constexpr VmcsField VmcsCr3TargetCount = VmcsField::Cr3TargetCount;
+constexpr VmcsField VmcsGuestIa32SysenterCs = VmcsField::GuestSysenterCs;
+constexpr VmcsField VmcsGuestIa32SysenterEsp = VmcsField::GuestSysenterEsp;
+constexpr VmcsField VmcsGuestIa32SysenterEip = VmcsField::GuestSysenterEip;
+constexpr VmcsField VmcsHostIa32SysenterCs = VmcsField::HostIa32SysenterCs;
+constexpr VmcsField VmcsHostIa32SysenterEsp = VmcsField::HostIa32SysenterEsp;
+constexpr VmcsField VmcsHostIa32SysenterEip = VmcsField::HostIa32SysenterEip;
 
 constexpr uint32_t PinBasedExternalInterruptExiting = 1u << 0;
 constexpr uint32_t PinBasedNmiExiting = 1u << 3;
@@ -78,8 +112,67 @@ constexpr uint32_t CpuBasedMovDrExiting = 1u << 23;
 constexpr uint32_t CpuBasedUnconditionalIoExiting = 1u << 24;
 constexpr uint32_t CpuBasedUseIoBitmaps = 1u << 25;
 constexpr uint32_t CpuBasedUseMsrBitmaps = 1u << 28;
+constexpr uint32_t CpuBasedActivateSecondaryControls = 1u << 31;
+
+constexpr uint32_t VmExitHostAddressSpaceSize = 1u << 9;
+constexpr uint32_t VmExitSaveIa32Efer = 1u << 20;
+constexpr uint32_t VmExitLoadIa32Efer = 1u << 21;
+
+constexpr uint32_t VmEntryIa32eModeGuest = 1u << 9;
+constexpr uint32_t VmEntryLoadIa32Efer = 1u << 15;
+constexpr uint32_t VmEntryIntrInfoValid = 1u << 31;
 
 constexpr uint32_t VmExitReasonVmEntryFailure = 1u << 31;
+// CPUID.80000008H advertises 48 physical-address bits for gem5's x86 CPU.
+constexpr Addr MaxSupportedPhysAddr = mask(48);
+constexpr uint64_t RequiredRflagsBit = 1ull << 1;
+constexpr uint64_t ReservedRflagsMask =
+    mask(63, 22) | (1ull << 15) | (1ull << 5) | (1ull << 3);
+
+struct SegmentFieldSet
+{
+    int index;
+    VmcsField selector;
+    VmcsField base;
+    VmcsField limit;
+    VmcsField attr;
+};
+
+static constexpr std::array<SegmentFieldSet, 8> GuestSegments = {{
+    {segment_idx::Es, VmcsField::GuestEsSelector, VmcsField::GuestEsBase,
+        VmcsField::GuestEsLimit, VmcsField::GuestEsAccessRights},
+    {segment_idx::Cs, VmcsField::GuestCsSelector, VmcsField::GuestCsBase,
+        VmcsField::GuestCsLimit, VmcsField::GuestCsAccessRights},
+    {segment_idx::Ss, VmcsField::GuestSsSelector, VmcsField::GuestSsBase,
+        VmcsField::GuestSsLimit, VmcsField::GuestSsAccessRights},
+    {segment_idx::Ds, VmcsField::GuestDsSelector, VmcsField::GuestDsBase,
+        VmcsField::GuestDsLimit, VmcsField::GuestDsAccessRights},
+    {segment_idx::Fs, VmcsField::GuestFsSelector, VmcsField::GuestFsBase,
+        VmcsField::GuestFsLimit, VmcsField::GuestFsAccessRights},
+    {segment_idx::Gs, VmcsField::GuestGsSelector, VmcsField::GuestGsBase,
+        VmcsField::GuestGsLimit, VmcsField::GuestGsAccessRights},
+    {segment_idx::Tsl, VmcsField::GuestLdtrSelector,
+        VmcsField::GuestLdtrBase, VmcsField::GuestLdtrLimit,
+        VmcsField::GuestLdtrAccessRights},
+    {segment_idx::Tr, VmcsField::GuestTrSelector, VmcsField::GuestTrBase,
+        VmcsField::GuestTrLimit, VmcsField::GuestTrAccessRights},
+}};
+
+struct HostSelectorField
+{
+    int index;
+    VmcsField selector;
+};
+
+static constexpr std::array<HostSelectorField, 7> HostSelectors = {{
+    {segment_idx::Es, VmcsField::HostEsSelector},
+    {segment_idx::Cs, VmcsField::HostCsSelector},
+    {segment_idx::Ss, VmcsField::HostSsSelector},
+    {segment_idx::Ds, VmcsField::HostDsSelector},
+    {segment_idx::Fs, VmcsField::HostFsSelector},
+    {segment_idx::Gs, VmcsField::HostGsSelector},
+    {segment_idx::Tr, VmcsField::HostTrSelector},
+}};
 
 uint32_t
 vmcsRevisionId(ThreadContext *tc)
@@ -108,22 +201,123 @@ readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
 }
 
 bool
-vmxAvailable(ThreadContext *tc)
+validPhysicalAddress(Addr addr)
+{
+    return (addr & ~MaxSupportedPhysAddr) == 0;
+}
+
+bool
+validAlignedPhysicalAddress(Addr addr, size_t alignment)
+{
+    return validPhysicalAddress(addr) && (addr & (alignment - 1)) == 0;
+}
+
+bool
+canonicalAddress(Addr addr)
+{
+    const uint64_t high = bits(addr, 63, 48);
+    return high == (bits(addr, 47) ? mask(16) : 0);
+}
+
+bool
+uniformUpperLinearBits(Addr addr)
+{
+    const uint64_t high = bits(addr, 63, 48);
+    return high == 0 || high == mask(16);
+}
+
+bool
+readRequired(const Vmcs &vmcs, VmcsField field, uint64_t &value)
+{
+    return vmcs.read(field, value);
+}
+
+uint64_t
+readOrZero(const Vmcs &vmcs, VmcsField field)
+{
+    uint64_t value = 0;
+    vmcs.read(field, value);
+    return value;
+}
+
+bool
+controlsAllowed(uint32_t controls, uint64_t capability)
+{
+    const uint32_t requiredOne = bits(capability, 31, 0);
+    const uint32_t allowedOne = bits(capability, 63, 32);
+    return (controls & requiredOne) == requiredOne &&
+           (controls & ~allowedOne) == 0;
+}
+
+bool
+fixedBitsAllowed(uint64_t value, uint64_t fixed0, uint64_t fixed1,
+        uint64_t ignored = 0)
+{
+    const uint64_t required = fixed0 & ~ignored;
+    const uint64_t allowed = fixed1 | ignored;
+    return (value & required) == required && (value & ~allowed) == 0;
+}
+
+uint64_t
+vmxControlCapability(ThreadContext *tc, RegIndex legacyMsr,
+        RegIndex trueMsr)
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    const uint64_t basic = isa->readMiscRegNoEffect(misc_reg::VmxBasic);
+    return bits(basic, 55) ? isa->readMiscRegNoEffect(trueMsr) :
+        isa->readMiscRegNoEffect(legacyMsr);
+}
+
+bool
+vmxCr4Enabled(ThreadContext *tc)
 {
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     CR4 cr4 = isa->readMiscRegNoEffect(misc_reg::Cr4);
+    return cr4.vmxe;
+}
+
+bool
+vmxInstructionRecognized(ThreadContext *tc)
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    CR0 cr0 = isa->readMiscRegNoEffect(misc_reg::Cr0);
+    Efer efer = isa->readMiscRegNoEffect(misc_reg::Efer);
+    SegAttr cs = isa->readMiscRegNoEffect(misc_reg::CsAttr);
+    return cr0.pe && !(getRFlags(tc) & VMBit) &&
+        !(efer.lma && !cs.longMode);
+}
+
+bool
+atCpl0(ThreadContext *tc)
+{
+    HandyM5Reg m5Reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    return m5Reg.cpl == 0;
+}
+
+bool
+vmxAvailable(ThreadContext *tc)
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     const RegVal featureControl =
         isa->readMiscRegNoEffect(misc_reg::FeatureControl);
 
     const bool featureLocked = bits(featureControl, 0);
     const bool vmxonEnabled = bits(featureControl, 2);
-    return cr4.vmxe && featureLocked && vmxonEnabled;
+    const uint64_t cr0 = isa->readMiscRegNoEffect(misc_reg::Cr0);
+    const uint64_t cr4 = isa->readMiscRegNoEffect(misc_reg::Cr4);
+    return featureLocked && vmxonEnabled &&
+        fixedBitsAllowed(cr0,
+            isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
+            isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1)) &&
+        fixedBitsAllowed(cr4,
+            isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
+            isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1));
 }
 
 bool
 validateRegion(ThreadContext *tc, Addr regionPtr)
 {
-    if (regionPtr & (Vmcs::VmcsRegionSize - 1)) {
+    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
         return false;
     }
 
@@ -140,6 +334,97 @@ vmFailValid(Vmcs *vmcs, uint32_t error)
     panic_if(!vmcs, "VMfailValid requires a current VMCS");
     vmcs->setInstructionError(error);
     return VmxResult::failValid(error);
+}
+
+VmxResult
+vmFailIfCurrent(Vmcs *vmcs, VmxInstructionError error)
+{
+    return vmcs ? vmFailValid(vmcs, toInt(error)) :
+        VmxResult::failInvalid();
+}
+
+SegAttr
+vmcsAccessRightsToSegAttr(uint32_t accessRights)
+{
+    SegAttr attr = 0;
+    attr.type = bits(accessRights, 3, 0);
+    attr.system = bits(accessRights, 4);
+    attr.dpl = bits(accessRights, 6, 5);
+    attr.present = bits(accessRights, 7);
+    attr.avl = bits(accessRights, 12);
+    attr.longMode = bits(accessRights, 13);
+    attr.defaultSize = bits(accessRights, 14);
+    attr.granularity = bits(accessRights, 15);
+    attr.unusable = bits(accessRights, 16);
+
+    if (attr.system) {
+        const uint32_t type = attr.type;
+        const bool code = type & 0x8;
+        attr.readable = code ? bits(type, 1) : 1;
+        attr.writable = code ? 0 : bits(type, 1);
+        attr.expandDown = code ? 0 : bits(type, 2);
+    } else {
+        attr.readable = 1;
+        attr.writable = 1;
+        attr.expandDown = 0;
+    }
+
+    return attr;
+}
+
+uint32_t
+segAttrToVmcsAccessRights(SegAttr attr)
+{
+    uint32_t accessRights = 0;
+    replaceBits(accessRights, 3, 0, static_cast<uint32_t>(attr.type));
+    replaceBits(accessRights, 4, static_cast<uint32_t>(attr.system));
+    replaceBits(accessRights, 6, 5, static_cast<uint32_t>(attr.dpl));
+    replaceBits(accessRights, 7, static_cast<uint32_t>(attr.present));
+    replaceBits(accessRights, 12, static_cast<uint32_t>(attr.avl));
+    replaceBits(accessRights, 13, static_cast<uint32_t>(attr.longMode));
+    replaceBits(accessRights, 14, static_cast<uint32_t>(attr.defaultSize));
+    replaceBits(accessRights, 15, static_cast<uint32_t>(attr.granularity));
+    replaceBits(accessRights, 16, static_cast<uint32_t>(attr.unusable));
+    return accessRights;
+}
+
+SegAttr
+hostCodeAttr(bool longMode)
+{
+    SegAttr attr = 0;
+    attr.type = 0xb;
+    attr.system = 1;
+    attr.present = 1;
+    attr.readable = 1;
+    attr.longMode = longMode;
+    attr.defaultSize = longMode ? 0 : 1;
+    attr.granularity = 1;
+    return attr;
+}
+
+SegAttr
+hostDataAttr()
+{
+    SegAttr attr = 0;
+    attr.type = 0x3;
+    attr.system = 1;
+    attr.present = 1;
+    attr.readable = 1;
+    attr.writable = 1;
+    attr.defaultSize = 1;
+    attr.granularity = 1;
+    return attr;
+}
+
+SegAttr
+hostTssAttr()
+{
+    SegAttr attr = 0;
+    attr.type = 0xb;
+    attr.present = 1;
+    attr.readable = 1;
+    attr.writable = 1;
+    return attr;
 }
 
 Addr
@@ -184,7 +469,7 @@ ioQualification(bool read, uint16_t port, size_t size)
         panic("Unsupported VMX I/O exit size %zu", size);
     }
 
-    if (!read) {
+    if (read) {
         qualification |= 1ull << 3;
     }
     qualification |= static_cast<uint64_t>(port) << 16;
@@ -239,9 +524,572 @@ void
 VmxExitFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
-    if (!isa || !isa->vmxState().vmexitEvent(tc, exitInfo)) {
+    VmxExitInfo info = exitInfo;
+    if (info.hasInstructionLength && info.instructionLength == 0 && inst) {
+        info.instructionLength = inst->size();
+    }
+    if (!isa || !isa->vmxState().vmexitEvent(tc, info)) {
         panic("Unable to complete VMX exit fault");
     }
+}
+
+VmxState::VmEntryValidationResult
+VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    auto failInstruction = [](VmxInstructionError error) {
+        VmEntryValidationResult result;
+        result.valid = false;
+        result.vmEntryFailure = false;
+        result.instructionError = error;
+        return result;
+    };
+    auto failEntry = [](VmxExitReason reason) {
+        VmEntryValidationResult result;
+        result.valid = false;
+        result.vmEntryFailure = true;
+        result.exitReason = reason;
+        return result;
+    };
+
+    uint64_t pinControls = 0;
+    uint64_t procControls = 0;
+    uint64_t exitControls = 0;
+    uint64_t entryControls = 0;
+
+    if (!readRequired(vmcs, VmcsPinBasedVmExecControl, pinControls) ||
+            !readRequired(vmcs, VmcsCpuBasedVmExecControl, procControls) ||
+            !readRequired(vmcs, VmcsVmExitControls, exitControls) ||
+            !readRequired(vmcs, VmcsVmEntryControls, entryControls)) {
+        return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+    }
+
+    if (!controlsAllowed(bits(pinControls, 31, 0),
+                vmxControlCapability(tc, misc_reg::VmxPinbasedCtls,
+                    misc_reg::VmxTruePinbasedCtls)) ||
+            !controlsAllowed(bits(procControls, 31, 0),
+                vmxControlCapability(tc, misc_reg::VmxProcbasedCtls,
+                    misc_reg::VmxTrueProcbasedCtls)) ||
+            !controlsAllowed(bits(exitControls, 31, 0),
+                vmxControlCapability(tc, misc_reg::VmxExitCtls,
+                    misc_reg::VmxTrueExitCtls)) ||
+            !controlsAllowed(bits(entryControls, 31, 0),
+                vmxControlCapability(tc, misc_reg::VmxEntryCtls,
+                    misc_reg::VmxTrueEntryCtls))) {
+        return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+    }
+
+    if (procControls & CpuBasedActivateSecondaryControls) {
+        uint64_t secondaryControls = 0;
+        if (!readRequired(vmcs, VmcsSecondaryVmExecControl,
+                    secondaryControls) ||
+                !controlsAllowed(bits(secondaryControls, 31, 0),
+                    isa->readMiscRegNoEffect(misc_reg::VmxProcbasedCtls2))) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidControlFields);
+        }
+    }
+
+    const uint64_t cr3TargetCount = readOrZero(vmcs, VmcsCr3TargetCount);
+    if (cr3TargetCount != 0 ||
+            readOrZero(vmcs, VmcsExceptionBitmap) != 0 ||
+            readOrZero(vmcs, VmcsCr0GuestHostMask) != 0 ||
+            readOrZero(vmcs, VmcsCr4GuestHostMask) != 0 ||
+            readOrZero(vmcs, VmcsVmExitMsrStoreCount) != 0 ||
+            readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0 ||
+            readOrZero(vmcs, VmcsVmEntryMsrLoadCount) != 0 ||
+            (readOrZero(vmcs, VmcsVmEntryIntrInfoField) &
+             VmEntryIntrInfoValid)) {
+        return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+    }
+
+    if ((procControls & CpuBasedUseIoBitmaps) &&
+            (!validAlignedPhysicalAddress(readOrZero(vmcs, VmcsIoBitmapA),
+                 PageBytes) ||
+             !validAlignedPhysicalAddress(readOrZero(vmcs, VmcsIoBitmapB),
+                 PageBytes))) {
+        return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+    }
+
+    if ((procControls & CpuBasedUseMsrBitmaps) &&
+            !validAlignedPhysicalAddress(readOrZero(vmcs, VmcsMsrBitmap),
+                PageBytes)) {
+        return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+    }
+
+    uint64_t hostCr0 = 0;
+    uint64_t hostCr3 = 0;
+    uint64_t hostCr4 = 0;
+    uint64_t hostRsp = 0;
+    uint64_t hostRip = 0;
+    if (!readRequired(vmcs, VmcsHostCr0, hostCr0) ||
+            !readRequired(vmcs, VmcsHostCr3, hostCr3) ||
+            !readRequired(vmcs, VmcsHostCr4, hostCr4) ||
+            !readRequired(vmcs, VmcsHostRsp, hostRsp) ||
+            !readRequired(vmcs, VmcsHostRip, hostRip)) {
+        return failInstruction(VmxInstructionError::VmEntryInvalidHostState);
+    }
+
+    CR0 hostCr0Bits = hostCr0;
+    CR4 hostCr4Bits = hostCr4;
+    const bool hostIa32e = exitControls & VmExitHostAddressSpaceSize;
+    constexpr uint64_t ignoredCr0Bits = (1ull << 29) | (1ull << 30);
+    if (!fixedBitsAllowed(hostCr0,
+                isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
+                isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1),
+                ignoredCr0Bits) ||
+            !fixedBitsAllowed(hostCr4,
+                isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
+                isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1)) ||
+            !hostCr0Bits.pe || !hostCr4Bits.vmxe ||
+            (hostIa32e && (!hostCr0Bits.pg || !hostCr4Bits.pae)) ||
+            !validPhysicalAddress(hostCr3 & ~mask(12)) ||
+            (hostIa32e && !canonicalAddress(hostRip))) {
+        return failInstruction(VmxInstructionError::VmEntryInvalidHostState);
+    }
+
+    if (exitControls & VmExitLoadIa32Efer) {
+        Efer hostEfer = readOrZero(vmcs, VmcsHostIa32Efer);
+        if (hostEfer.lma != hostIa32e || hostEfer.lme != hostIa32e) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+    }
+
+    for (const auto &hostSelector : HostSelectors) {
+        uint64_t selector = 0;
+        if (!readRequired(vmcs, hostSelector.selector, selector)) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+        if ((hostSelector.index == segment_idx::Cs ||
+             hostSelector.index == segment_idx::Tr) && selector == 0) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+        if (bits(selector, 1, 0) != 0) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+        if (hostSelector.index == segment_idx::Ss && !hostIa32e &&
+                selector == 0) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+    }
+
+    for (const auto field : {VmcsField::HostFsBase,
+             VmcsField::HostGsBase, VmcsField::HostTrBase,
+             VmcsField::HostGdtrBase, VmcsField::HostIdtrBase}) {
+        if (!canonicalAddress(readOrZero(vmcs, field))) {
+            return failInstruction(
+                    VmxInstructionError::VmEntryInvalidHostState);
+        }
+    }
+
+    uint64_t guestCr0 = 0;
+    uint64_t guestCr3 = 0;
+    uint64_t guestCr4 = 0;
+    uint64_t guestRsp = 0;
+    uint64_t guestRip = 0;
+    uint64_t guestRflags = 0;
+    if (!readRequired(vmcs, VmcsGuestCr0, guestCr0) ||
+            !readRequired(vmcs, VmcsGuestCr3, guestCr3) ||
+            !readRequired(vmcs, VmcsGuestCr4, guestCr4) ||
+            !readRequired(vmcs, VmcsGuestRsp, guestRsp) ||
+            !readRequired(vmcs, VmcsGuestRip, guestRip) ||
+            !readRequired(vmcs, VmcsGuestRflags, guestRflags)) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    CR0 guestCr0Bits = guestCr0;
+    CR4 guestCr4Bits = guestCr4;
+    const bool guestIa32e = entryControls & VmEntryIa32eModeGuest;
+    if (!fixedBitsAllowed(guestCr0,
+                isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
+                isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1),
+                ignoredCr0Bits) ||
+            !fixedBitsAllowed(guestCr4,
+                isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
+                isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1)) ||
+            !guestCr0Bits.pe ||
+            !validPhysicalAddress(guestCr3 & ~mask(12)) ||
+            !(guestRflags & RequiredRflagsBit) ||
+            (guestRflags & ReservedRflagsMask) ||
+            (guestRflags & VMBit) ||
+            readOrZero(vmcs, VmcsGuestActivityState) != 0 ||
+            (guestIa32e && (!guestCr0Bits.pg || !guestCr4Bits.pae))) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    if (entryControls & VmEntryLoadIa32Efer) {
+        Efer guestEfer = readOrZero(vmcs, VmcsGuestIa32Efer);
+        if (guestEfer.lma != guestIa32e ||
+                (guestCr0Bits.pg && guestEfer.lme != guestIa32e)) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
+    }
+
+    uint64_t guestCsAccessRights = 0;
+    if (!readRequired(vmcs, VmcsField::GuestCsAccessRights,
+                guestCsAccessRights)) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+    if (guestIa32e && bits(guestCsAccessRights, 13) &&
+            !uniformUpperLinearBits(guestRip)) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+    if ((!guestIa32e || !bits(guestCsAccessRights, 13)) &&
+            bits(guestRip, 63, 32) != 0) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    for (const auto &segment : GuestSegments) {
+        uint64_t selector = 0;
+        uint64_t base = 0;
+        uint64_t limit = 0;
+        uint64_t attrValue = 0;
+        if (!readRequired(vmcs, segment.selector, selector) ||
+                !readRequired(vmcs, segment.base, base) ||
+                !readRequired(vmcs, segment.limit, limit) ||
+                !readRequired(vmcs, segment.attr, attrValue)) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
+
+        SegAttr attr = vmcsAccessRightsToSegAttr(attrValue);
+        if ((segment.index == segment_idx::Cs ||
+             segment.index == segment_idx::Tr) && attr.unusable) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
+        const bool alwaysCanonical =
+            segment.index == segment_idx::Tr ||
+            segment.index == segment_idx::Fs ||
+            segment.index == segment_idx::Gs;
+        const bool usableLdtr =
+            segment.index == segment_idx::Tsl && !attr.unusable;
+        if ((alwaysCanonical || usableLdtr) && !canonicalAddress(base)) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
+        const bool upper32MustBeZero =
+            segment.index == segment_idx::Cs ||
+            ((!attr.unusable) &&
+             (segment.index == segment_idx::Ss ||
+              segment.index == segment_idx::Ds ||
+              segment.index == segment_idx::Es));
+        if (upper32MustBeZero && bits(base, 63, 32) != 0) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
+    }
+
+    return {};
+}
+
+bool
+VmxState::loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const
+{
+    const uint64_t entryControls = readOrZero(vmcs, VmcsVmEntryControls);
+    const uint64_t guestCr0 = readOrZero(vmcs, VmcsGuestCr0);
+    const uint64_t guestCr3 = readOrZero(vmcs, VmcsGuestCr3);
+    const uint64_t guestCr4 = readOrZero(vmcs, VmcsGuestCr4);
+    const uint64_t guestRsp = readOrZero(vmcs, VmcsGuestRsp);
+    const uint64_t guestRflags = readOrZero(vmcs, VmcsGuestRflags);
+
+    Efer guestEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
+    if (entryControls & VmEntryLoadIa32Efer) {
+        guestEfer = readOrZero(vmcs, VmcsGuestIa32Efer);
+    } else {
+        const bool guestIa32e = entryControls & VmEntryIa32eModeGuest;
+        guestEfer.lma = guestIa32e;
+        CR0 guestCr0Bits = guestCr0;
+        if (guestCr0Bits.pg) {
+            guestEfer.lme = guestIa32e;
+        }
+    }
+    tc->setMiscRegNoEffect(misc_reg::Efer, guestEfer);
+    tc->setMiscReg(misc_reg::Cr4, guestCr4);
+    tc->setMiscReg(misc_reg::Cr0, guestCr0);
+    tc->setMiscReg(misc_reg::Cr3, guestCr3);
+    tc->setMiscReg(misc_reg::Dr7, readOrZero(vmcs, VmcsGuestDr7));
+
+    for (const auto &segment : GuestSegments) {
+        tc->setMiscReg(misc_reg::segSel(segment.index),
+                readOrZero(vmcs, segment.selector));
+        tc->setMiscReg(misc_reg::segBase(segment.index),
+                readOrZero(vmcs, segment.base));
+        tc->setMiscReg(misc_reg::segLimit(segment.index),
+                readOrZero(vmcs, segment.limit));
+        tc->setMiscReg(misc_reg::segAttr(segment.index),
+                vmcsAccessRightsToSegAttr(readOrZero(vmcs, segment.attr)));
+    }
+
+    tc->setMiscReg(misc_reg::TsgBase,
+            readOrZero(vmcs, VmcsField::GuestGdtrBase));
+    tc->setMiscReg(misc_reg::TsgLimit,
+            readOrZero(vmcs, VmcsField::GuestGdtrLimit));
+    tc->setMiscReg(misc_reg::IdtrBase,
+            readOrZero(vmcs, VmcsField::GuestIdtrBase));
+    tc->setMiscReg(misc_reg::IdtrLimit,
+            readOrZero(vmcs, VmcsField::GuestIdtrLimit));
+
+    tc->setMiscReg(misc_reg::SysenterCs,
+            readOrZero(vmcs, VmcsGuestIa32SysenterCs));
+    tc->setMiscReg(misc_reg::SysenterEsp,
+            readOrZero(vmcs, VmcsGuestIa32SysenterEsp));
+    tc->setMiscReg(misc_reg::SysenterEip,
+            readOrZero(vmcs, VmcsGuestIa32SysenterEip));
+
+    tc->setReg(int_reg::Rsp, guestRsp);
+    setRFlags(tc, guestRflags);
+    tc->setMiscReg(misc_reg::M5Reg, 0);
+
+    guestRip = readOrZero(vmcs, VmcsGuestRip) +
+        tc->readMiscRegNoEffect(misc_reg::CsBase);
+    tc->getMMUPtr()->flushAll();
+    DPRINTF(VMX, "VM-entry loaded guest state: RIP %#x RSP %#x "
+            "CR0 %#x CR3 %#x CR4 %#x RFLAGS %#x\n",
+            guestRip, guestRsp, guestCr0, guestCr3, guestCr4, guestRflags);
+    return true;
+}
+
+void
+VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs) const
+{
+    vmcs.writeUnchecked(VmcsGuestCr0,
+            tc->readMiscRegNoEffect(misc_reg::Cr0));
+    vmcs.writeUnchecked(VmcsGuestCr3,
+            tc->readMiscRegNoEffect(misc_reg::Cr3));
+    vmcs.writeUnchecked(VmcsGuestCr4,
+            tc->readMiscRegNoEffect(misc_reg::Cr4));
+    vmcs.writeUnchecked(VmcsGuestDr7,
+            tc->readMiscRegNoEffect(misc_reg::Dr7));
+    vmcs.writeUnchecked(VmcsGuestRsp, tc->getReg(int_reg::Rsp));
+    vmcs.writeUnchecked(VmcsGuestRip, currentRip(tc));
+    vmcs.writeUnchecked(VmcsGuestRflags, getRFlags(tc));
+    if (readOrZero(vmcs, VmcsVmExitControls) & VmExitSaveIa32Efer) {
+        vmcs.writeUnchecked(VmcsGuestIa32Efer,
+                tc->readMiscRegNoEffect(misc_reg::Efer));
+    }
+
+    for (const auto &segment : GuestSegments) {
+        vmcs.writeUnchecked(segment.selector,
+                tc->readMiscRegNoEffect(misc_reg::segSel(segment.index)));
+        vmcs.writeUnchecked(segment.base,
+                tc->readMiscRegNoEffect(misc_reg::segBase(segment.index)));
+        vmcs.writeUnchecked(segment.limit,
+                tc->readMiscRegNoEffect(misc_reg::segLimit(segment.index)));
+        vmcs.writeUnchecked(segment.attr,
+                segAttrToVmcsAccessRights(tc->readMiscRegNoEffect(
+                    misc_reg::segAttr(segment.index))));
+    }
+
+    vmcs.writeUnchecked(VmcsField::GuestGdtrBase,
+            tc->readMiscRegNoEffect(misc_reg::TsgBase));
+    vmcs.writeUnchecked(VmcsField::GuestGdtrLimit,
+            tc->readMiscRegNoEffect(misc_reg::TsgLimit));
+    vmcs.writeUnchecked(VmcsField::GuestIdtrBase,
+            tc->readMiscRegNoEffect(misc_reg::IdtrBase));
+    vmcs.writeUnchecked(VmcsField::GuestIdtrLimit,
+            tc->readMiscRegNoEffect(misc_reg::IdtrLimit));
+
+    vmcs.writeUnchecked(VmcsGuestIa32SysenterCs,
+            tc->readMiscRegNoEffect(misc_reg::SysenterCs));
+    vmcs.writeUnchecked(VmcsGuestIa32SysenterEsp,
+            tc->readMiscRegNoEffect(misc_reg::SysenterEsp));
+    vmcs.writeUnchecked(VmcsGuestIa32SysenterEip,
+            tc->readMiscRegNoEffect(misc_reg::SysenterEip));
+
+    DPRINTF(VMX, "VM-exit saved guest state: RIP %#x RSP %#x RFLAGS %#x\n",
+            readOrZero(vmcs, VmcsGuestRip), readOrZero(vmcs, VmcsGuestRsp),
+            readOrZero(vmcs, VmcsGuestRflags));
+}
+
+bool
+VmxState::loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const
+{
+    const uint64_t exitControls = readOrZero(vmcs, VmcsVmExitControls);
+    const bool hostIa32e = exitControls & VmExitHostAddressSpaceSize;
+
+    uint64_t hostCr0 = 0;
+    uint64_t hostCr3 = 0;
+    uint64_t hostCr4 = 0;
+    uint64_t hostRsp = 0;
+    if (!readRequired(vmcs, VmcsHostCr0, hostCr0) ||
+            !readRequired(vmcs, VmcsHostCr3, hostCr3) ||
+            !readRequired(vmcs, VmcsHostCr4, hostCr4) ||
+            !readRequired(vmcs, VmcsHostRsp, hostRsp) ||
+            !readRequired(vmcs, VmcsHostRip, hostRip)) {
+        return false;
+    }
+
+    Efer hostEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
+    hostEfer.lma = hostIa32e;
+    hostEfer.lme = hostIa32e;
+    if (exitControls & VmExitLoadIa32Efer) {
+        hostEfer = readOrZero(vmcs, VmcsHostIa32Efer);
+    }
+    tc->setMiscRegNoEffect(misc_reg::Efer, hostEfer);
+    tc->setMiscReg(misc_reg::Cr4, hostCr4);
+    tc->setMiscReg(misc_reg::Cr0, hostCr0);
+    tc->setMiscReg(misc_reg::Cr3, hostCr3);
+    tc->setMiscReg(misc_reg::Dr7, 0x400);
+
+    for (const auto &hostSelector : HostSelectors) {
+        const uint64_t selector = readOrZero(vmcs, hostSelector.selector);
+        uint64_t base = 0;
+        uint64_t limit = mask(32);
+        SegAttr attr = hostDataAttr();
+
+        if (hostSelector.index == segment_idx::Cs) {
+            attr = hostCodeAttr(hostIa32e);
+        } else if (hostSelector.index == segment_idx::Tr) {
+            base = readOrZero(vmcs, VmcsField::HostTrBase);
+            limit = 0x67;
+            attr = hostTssAttr();
+        } else if (hostSelector.index == segment_idx::Fs) {
+            base = readOrZero(vmcs, VmcsField::HostFsBase);
+        } else if (hostSelector.index == segment_idx::Gs) {
+            base = readOrZero(vmcs, VmcsField::HostGsBase);
+        }
+
+        if (selector == 0) {
+            attr.unusable = 1;
+        }
+        tc->setMiscReg(misc_reg::segSel(hostSelector.index), selector);
+        tc->setMiscReg(misc_reg::segBase(hostSelector.index), base);
+        tc->setMiscReg(misc_reg::segLimit(hostSelector.index), limit);
+        tc->setMiscReg(misc_reg::segAttr(hostSelector.index), attr);
+    }
+
+    SegAttr unusable = 0;
+    unusable.unusable = 1;
+    tc->setMiscReg(misc_reg::segSel(segment_idx::Tsl), 0);
+    tc->setMiscReg(misc_reg::segBase(segment_idx::Tsl), 0);
+    tc->setMiscReg(misc_reg::segLimit(segment_idx::Tsl), 0);
+    tc->setMiscReg(misc_reg::segAttr(segment_idx::Tsl), unusable);
+
+    tc->setMiscReg(misc_reg::TsgBase,
+            readOrZero(vmcs, VmcsField::HostGdtrBase));
+    tc->setMiscReg(misc_reg::TsgLimit, 0xffff);
+    tc->setMiscReg(misc_reg::IdtrBase,
+            readOrZero(vmcs, VmcsField::HostIdtrBase));
+    tc->setMiscReg(misc_reg::IdtrLimit, 0xffff);
+
+    tc->setMiscReg(misc_reg::SysenterCs,
+            readOrZero(vmcs, VmcsHostIa32SysenterCs));
+    tc->setMiscReg(misc_reg::SysenterEsp,
+            readOrZero(vmcs, VmcsHostIa32SysenterEsp));
+    tc->setMiscReg(misc_reg::SysenterEip,
+            readOrZero(vmcs, VmcsHostIa32SysenterEip));
+
+    tc->setReg(int_reg::Rsp, hostRsp);
+    setRFlags(tc, RequiredRflagsBit);
+    tc->setMiscReg(misc_reg::M5Reg, 0);
+    tc->getMMUPtr()->flushAll();
+    DPRINTF(VMX, "VM-exit loaded host state: RIP %#x RSP %#x "
+            "CR0 %#x CR3 %#x CR4 %#x\n",
+            hostRip, hostRsp, hostCr0, hostCr3, hostCr4);
+    return true;
+}
+
+VmxResult
+VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
+        VmxExitReason reason)
+{
+    const uint32_t encodedReason =
+        toInt(reason) | VmExitReasonVmEntryFailure;
+    vmcs.writeUnchecked(VmcsVmExitReason, encodedReason);
+    vmcs.writeUnchecked(VmcsExitQualification, 0);
+    vmcs.writeUnchecked(VmcsVmExitInstructionLen, 0);
+    vmcs.writeUnchecked(VmcsVmxInstructionInfo, 0);
+    vmcs.writeUnchecked(VmcsVmExitInterruptionInfo, 0);
+    vmcs.writeUnchecked(VmcsVmExitInterruptionErrorCode, 0);
+    vmcs.writeUnchecked(VmcsGuestLinearAddress, 0);
+    vmcs.writeUnchecked(VmcsGuestPhysicalAddress, 0);
+
+    Addr hostRip = 0;
+    panic_if(!loadHostState(tc, vmcs, hostRip),
+            "Validated VM-entry host state could not be loaded");
+
+    inVmxNonRoot = false;
+    DPRINTF(VMX, "VM-entry failed after entry began: reason %u "
+            "encoded %#x host RIP %#x VMCS %#x\n",
+            toInt(reason), encodedReason, hostRip, currentVmcsPtr);
+    return VmxResult::successRedirect(hostRip);
+}
+
+VmxResult
+VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
+{
+    auto *tc = xc->tcBase();
+    Vmcs *vmcs = currentVmcs();
+
+    DPRINTF(VMX, "%s start VMCS %#x\n",
+            launch ? "VMLAUNCH" : "VMRESUME", currentVmcsPtr);
+
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc,
+                launch ? VmxExitReason::Vmlaunch : VmxExitReason::Vmresume,
+                instructionSize);
+    }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
+    }
+    if (!vmcs) {
+        return VmxResult::failInvalid();
+    }
+    if (launch && vmcs->launched()) {
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmlaunchNonClearVmcs));
+    }
+    if (!launch && !vmcs->launched()) {
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmresumeNonLaunchedVmcs));
+    }
+
+    const auto validation = validateVmEntry(tc, *vmcs);
+    if (!validation.valid) {
+        if (validation.vmEntryFailure) {
+            DPRINTF(VMX, "VM-entry validation reached guest-state "
+                    "failure class: reason %u\n",
+                    toInt(validation.exitReason));
+            return failVmEntry(tc, *vmcs, validation.exitReason);
+        }
+
+        DPRINTF(VMX, "VM-entry validation failed before entry: error %u\n",
+                toInt(validation.instructionError));
+        return vmFailValid(vmcs, toInt(validation.instructionError));
+    }
+
+    DPRINTF(VMX, "VM-entry validation passed: pin %#x primary %#x "
+            "exit %#x entry %#x VMCS %#x\n",
+            readOrZero(*vmcs, VmcsPinBasedVmExecControl),
+            readOrZero(*vmcs, VmcsCpuBasedVmExecControl),
+            readOrZero(*vmcs, VmcsVmExitControls),
+            readOrZero(*vmcs, VmcsVmEntryControls), currentVmcsPtr);
+
+    Addr guestRip = 0;
+    if (!loadGuestState(tc, *vmcs, guestRip)) {
+        return failVmEntry(tc, *vmcs,
+                VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    inVmxNonRoot = true;
+    if (launch) {
+        vmcs->setLaunched(true);
+    }
+
+    DPRINTF(VMX, "%s entered VMX non-root at %#x using VMCS %#x\n",
+            launch ? "VMLAUNCH" : "VMRESUME", guestRip, currentVmcsPtr);
+    return VmxResult::successRedirect(guestRip);
 }
 
 bool
@@ -253,17 +1101,12 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
         return false;
     }
 
-    uint64_t hostRipValue = 0;
-    if (!vmcs->read(VmcsHostRip, hostRipValue)) {
-        return false;
-    }
-
     uint32_t reason = toInt(exitInfo.reason);
     if (exitInfo.vmEntryFailure) {
         reason |= VmExitReasonVmEntryFailure;
     }
 
-    vmcs->writeUnchecked(VmcsGuestRip, currentRip(tc));
+    saveGuestState(tc, *vmcs);
     vmcs->writeUnchecked(VmcsVmExitReason, reason);
     vmcs->writeUnchecked(VmcsExitQualification,
             exitInfo.hasQualification ? exitInfo.qualification : 0);
@@ -283,12 +1126,18 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
             exitInfo.hasGuestPhysicalAddress ?
             exitInfo.guestPhysicalAddress : 0);
 
-    rootSnapshot.restore(tc);
+    Addr hostRipValue = 0;
+    if (!loadHostState(tc, *vmcs, hostRipValue)) {
+        return false;
+    }
+
     inVmxNonRoot = false;
 
     if (hostRip) {
         *hostRip = hostRipValue;
     }
+    DPRINTF(VMX, "VM exit reason %u from VMCS %#x to host RIP %#x\n",
+            reason, currentVmcsPtr, hostRipValue);
     return true;
 }
 
@@ -309,6 +1158,10 @@ VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
         uint8_t instructionSize, uint64_t qualification,
         uint32_t instructionInfo)
 {
+    DPRINTF(VMX, "VM-exit requested by instruction reason %u size %u "
+            "guest RIP %#x\n",
+            toInt(reason), instructionSize, currentRip(xc->tcBase()));
+
     VmxExitInfo exitInfo;
     exitInfo.reason = reason;
     exitInfo.hasInstructionLength = true;
@@ -319,9 +1172,8 @@ VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
     exitInfo.instructionInfo = instructionInfo;
 
     Addr hostRip = 0;
-    if (!vmexit(xc->tcBase(), exitInfo, &hostRip)) {
-        return VmxResult::failInvalid();
-    }
+    panic_if(!vmexit(xc->tcBase(), exitInfo, &hostRip),
+            "Instruction-triggered VM exit could not load host state");
 
     redirectNextPc(xc->tcBase(), hostRip);
     return VmxResult::successRedirect(hostRip);
@@ -591,81 +1443,6 @@ VmxState::msrExitFault(bool read, uint32_t msr) const
     return std::make_shared<VmxExitFault>(exitInfo);
 }
 
-void
-VmxState::RootSnapshot::capture(ThreadContext *tc)
-{
-    panic_if(!tc, "RootSnapshot::capture requires a valid ThreadContext");
-    for (size_t idx = 0; idx < NumSegmentRegs; ++idx) {
-        selector[idx] = tc->readMiscRegNoEffect(misc_reg::segSel(idx));
-        base[idx] = tc->readMiscRegNoEffect(misc_reg::segBase(idx));
-        effBase[idx] = tc->readMiscRegNoEffect(misc_reg::segEffBase(idx));
-        limit[idx] = tc->readMiscRegNoEffect(misc_reg::segLimit(idx));
-        attr[idx] = tc->readMiscRegNoEffect(misc_reg::segAttr(idx));
-    }
-    m5Reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
-    valid = true;
-}
-
-void
-VmxState::RootSnapshot::restore(ThreadContext *tc) const
-{
-    panic_if(!tc, "RootSnapshot::restore requires a valid ThreadContext");
-    if (!valid) {
-        return;
-    }
-
-    for (size_t idx = 0; idx < NumSegmentRegs; ++idx) {
-        tc->setMiscRegNoEffect(misc_reg::segSel(idx), selector[idx]);
-        tc->setMiscRegNoEffect(misc_reg::segBase(idx), base[idx]);
-        tc->setMiscRegNoEffect(misc_reg::segEffBase(idx), effBase[idx]);
-        tc->setMiscRegNoEffect(misc_reg::segLimit(idx), limit[idx]);
-        tc->setMiscRegNoEffect(misc_reg::segAttr(idx), attr[idx]);
-    }
-
-    tc->setMiscRegNoEffect(misc_reg::M5Reg, m5Reg);
-    tc->getDecoderPtr()->as<Decoder>().setM5Reg(m5Reg);
-}
-
-void
-VmxState::RootSnapshot::clear()
-{
-    valid = false;
-    selector = {};
-    base = {};
-    effBase = {};
-    limit = {};
-    attr = {};
-    m5Reg = 0;
-}
-
-void
-VmxState::RootSnapshot::serialize(CheckpointOut &cp) const
-{
-    SERIALIZE_SCALAR(valid);
-    arrayParamOut(cp, "selector", selector.data(), NumSegmentRegs);
-    arrayParamOut(cp, "base", base.data(), NumSegmentRegs);
-    arrayParamOut(cp, "effBase", effBase.data(), NumSegmentRegs);
-    arrayParamOut(cp, "limit", limit.data(), NumSegmentRegs);
-    arrayParamOut(cp, "attr", attr.data(), NumSegmentRegs);
-    SERIALIZE_SCALAR(m5Reg);
-}
-
-void
-VmxState::RootSnapshot::unserialize(CheckpointIn &cp)
-{
-    if (!UNSERIALIZE_OPT_SCALAR(valid)) {
-        clear();
-        return;
-    }
-
-    arrayParamIn(cp, "selector", selector.data(), NumSegmentRegs);
-    arrayParamIn(cp, "base", base.data(), NumSegmentRegs);
-    arrayParamIn(cp, "effBase", effBase.data(), NumSegmentRegs);
-    arrayParamIn(cp, "limit", limit.data(), NumSegmentRegs);
-    arrayParamIn(cp, "attr", attr.data(), NumSegmentRegs);
-    UNSERIALIZE_SCALAR(m5Reg);
-}
-
 Vmcs *
 VmxState::findVmcs(Addr regionPtr)
 {
@@ -683,13 +1460,15 @@ VmxState::findVmcs(Addr regionPtr) const
 Vmcs *
 VmxState::currentVmcs()
 {
-    return currentVmcsPtr ? findVmcs(currentVmcsPtr) : nullptr;
+    return currentVmcsPtr != InvalidVmcsPointer ?
+        findVmcs(currentVmcsPtr) : nullptr;
 }
 
 const Vmcs *
 VmxState::currentVmcs() const
 {
-    return currentVmcsPtr ? findVmcs(currentVmcsPtr) : nullptr;
+    return currentVmcsPtr != InvalidVmcsPointer ?
+        findVmcs(currentVmcsPtr) : nullptr;
 }
 
 VmxResult
@@ -698,46 +1477,66 @@ VmxState::vmxon(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
 
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmxon,
-                instructionSize);
+    if (!vmxCr4Enabled(tc) || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
+
+    if (vmxActive) {
+        if (inVmxNonRoot) {
+            return vmexitInstruction(xc, VmxExitReason::Vmxon,
+                    instructionSize);
+        }
+        if (!atCpl0(tc)) {
+            return VmxResult::propagateFault(
+                    std::make_shared<GeneralProtection>(0));
+        }
+        return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmxonInRoot);
+    }
+
+    if (!atCpl0(tc) || !vmxAvailable(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
     }
 
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
-
     if (fault != NoFault) {
         return VmxResult::propagateFault(fault);
     }
 
-    if (vmxActive || !vmxAvailable(tc) || !validateRegion(tc, regionPtr)) {
+    if (!validateRegion(tc, regionPtr)) {
         return VmxResult::failInvalid();
     }
 
     vmxActive = true;
     inVmxNonRoot = false;
     vmxonRegion = regionPtr;
-    currentVmcsPtr = 0;
-    rootSnapshot.clear();
+    currentVmcsPtr = InvalidVmcsPointer;
+    DPRINTF(VMX, "VMXON region %#x\n", vmxonRegion);
     return VmxResult::success();
 }
 
 VmxResult
 VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
 {
+    auto *tc = xc->tcBase();
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmxoff,
                 instructionSize);
     }
-
-    if (!vmxActive) {
-        return VmxResult::failInvalid();
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
     }
 
     vmxActive = false;
     inVmxNonRoot = false;
     vmxonRegion = 0;
-    currentVmcsPtr = 0;
-    rootSnapshot.clear();
+    currentVmcsPtr = InvalidVmcsPointer;
+    DPRINTF(VMX, "VMXOFF\n");
     return VmxResult::success();
 }
 
@@ -747,9 +1546,16 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
 
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmclear,
                 instructionSize);
+    }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
     }
 
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
@@ -758,13 +1564,22 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
         return VmxResult::propagateFault(fault);
     }
 
-    if (!vmxActive || regionPtr == vmxonRegion ||
-        !validateRegion(tc, regionPtr)) {
-        return VmxResult::failInvalid();
+    Vmcs *current = currentVmcs();
+    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmclearInvalidPhysicalAddress);
+    }
+    if (regionPtr == vmxonRegion) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmclearWithVmxonPointer);
+    }
+    if (!validateRegion(tc, regionPtr)) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmclearInvalidPhysicalAddress);
     }
 
     if (currentVmcsPtr == regionPtr) {
-        currentVmcsPtr = 0;
+        currentVmcsPtr = InvalidVmcsPointer;
     }
 
     auto [it, inserted] = vmcsRegions.try_emplace(
@@ -773,18 +1588,26 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
         it->second.clear();
     }
 
+    DPRINTF(VMX, "VMCLEAR VMCS %#x\n", regionPtr);
     return VmxResult::success();
 }
 
 VmxResult
 VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase();// VMPTRLD requires VMX operation and selects the current VMCS.
+    auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
 
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmptrld,
                 instructionSize);
+    }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
     }
 
     auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
@@ -793,29 +1616,43 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
         return VmxResult::propagateFault(fault);
     }
 
-    if (!vmxActive || regionPtr == vmxonRegion ||
-        !validateRegion(tc, regionPtr)) {
-        return VmxResult::failInvalid();
+    Vmcs *current = currentVmcs();
+    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmptrldInvalidPhysicalAddress);
+    }
+    if (regionPtr == vmxonRegion) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmptrldWithVmxonPointer);
+    }
+    if (!validateRegion(tc, regionPtr)) {
+        return vmFailIfCurrent(current,
+                VmxInstructionError::VmptrldIncorrectVmcsRevision);
     }
 
     vmcsRegions.try_emplace(regionPtr, regionPtr, vmcsRevisionId(tc));
     currentVmcsPtr = regionPtr;
+    DPRINTF(VMX, "VMPTRLD current VMCS %#x\n", currentVmcsPtr);
     return VmxResult::success();
 }
 
 VmxResult
 VmxState::vmptrst(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 {
-    uint64_t regionPtr = currentVmcsPtr ? currentVmcsPtr : mask(64); // if no current VMCS, return all 1s per SDM
-    const std::vector<bool> byteEnable(sizeof(regionPtr), true); // Enable all bytes for the write
+    uint64_t regionPtr = currentVmcsPtr;
+    const std::vector<bool> byteEnable(sizeof(regionPtr), true);
 
+    auto *tc = xc->tcBase();
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmptrst,
                 instructionSize);
     }
-
-    if (!vmxActive) {
-        return VmxResult::failInvalid();
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
     }
 
     auto fault = xc->writeMem(
@@ -831,78 +1668,40 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 VmxResult
 VmxState::vmlaunch(ExecContext *xc, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase();
-    Vmcs *vmcs = currentVmcs();
-
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmlaunch,
-                instructionSize);
-    }
-
-    if (!vmxActive || inVmxNonRoot || !vmcs) {
-        return VmxResult::failInvalid();
-    }
-    if (vmcs->launched()) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmlaunchNonClearVmcs));
-    }
-
-    uint64_t guestRip = 0;
-    if (!vmcs->read(VmcsGuestRip, guestRip)) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent));
-    }
-
-    rootSnapshot.capture(tc);
-    inVmxNonRoot = true;
-    vmcs->setLaunched(true);
-    return VmxResult::successRedirect(guestRip);
+    return vmEntry(xc, true, instructionSize);
 }
 
 VmxResult
 VmxState::vmresume(ExecContext *xc, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase();
-    Vmcs *vmcs = currentVmcs();
-
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmresume,
-                instructionSize);
-    }
-
-    if (!vmxActive || inVmxNonRoot || !vmcs) {
-        return VmxResult::failInvalid();
-    }
-    if (!vmcs->launched()) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmresumeNonLaunchedVmcs));
-    }
-
-    uint64_t guestRip = 0;
-    if (!vmcs->read(VmcsGuestRip, guestRip)) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent));
-    }
-
-    rootSnapshot.capture(tc);
-    inVmxNonRoot = true;
-    return VmxResult::successRedirect(guestRip);
+    return vmEntry(xc, false, instructionSize);
 }
 
 VmxResult
 VmxState::vmcall(ExecContext *xc, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
+    auto *tc = xc->tcBase();
 
-    if (!vmxActive || !vmcs) {
+    DPRINTF(VMX, "VMCALL executed at RIP %#x vmxActive=%d nonRoot=%d "
+            "VMCS %#x\n",
+            currentRip(xc->tcBase()), vmxActive, inVmxNonRoot,
+            currentVmcsPtr);
+
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, VmxExitReason::Vmcall, instructionSize);
+    }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
+    }
+    if (!vmcs) {
         return VmxResult::failInvalid();
     }
-    if (!inVmxNonRoot) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmcallInRoot));
-    }
-
-    return vmexitInstruction(xc, VmxExitReason::Vmcall, instructionSize);
+    return vmFailValid(vmcs, toInt(VmxInstructionError::VmcallInRoot));
 }
 
 VmxResult
@@ -910,33 +1709,37 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         uint64_t &value, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
-    // If there is no current VMCS or VMX is not active, instruction fails with VMfailInvalid (make sure to select a vmcs with vmptrld before vmwrite or vmread)
-    if (!vmxActive || !vmcs) {
-        return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
+    auto *tc = xc->tcBase();
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
     }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmread,
                 instructionSize);
     }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
+    }
+    if (!vmcs) {
+        return VmxResult::failInvalid();
+    }
 
     Vmcs::FieldEncoding encoding;
-    // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    // checks if the field is readable. If not, the instruction fails with VMfailValid
     if (!vmcs->read(encoding, value)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
 
-    return VmxResult::success(); // Field read, CF=0, ZF=0
+    return VmxResult::success();
 }
 
 VmxResult
@@ -944,38 +1747,42 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         uint64_t value, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
+    auto *tc = xc->tcBase();
 
-    // If there is no current VMCS or VMX is not active, instruction fails with VMfailInvalid (make sure to select a vmcs with vmptrld before vmwrite or vmread)
-    if (!vmxActive || !vmcs) {
-        return VmxResult::failInvalid(); // CF=1, ZF=0, VM-instruction error field = 0
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
     }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmwrite,
                 instructionSize);
     }
-    // Decodes the raw VMCS-field encoding operand (64-bit immediate) to determine the VMCS field to be accessed, also rejects invalid encodings (i.e. reserved bits set)
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
+                    0));
+    }
+    if (!vmcs) {
+        return VmxResult::failInvalid();
+    }
     Vmcs::FieldEncoding encoding;
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    // looks up the VMCS field specified, if the field is not supported(not in supportedFields[]), the instruction fails with VMfailValid
     if (!Vmcs::fieldSupported(encoding)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 12
+                toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    // Once field is determined, checks if the field is read-only. If true then the instruction fails with VMfailValid
     if (!Vmcs::fieldWritable(encoding)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 13
+                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent));
     }
 
     if (!vmcs->write(encoding, value)) {
         return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent)); // CF=1, ZF=0, VM-instruction error field = 13
+                toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent));
     }
 
-    return VmxResult::success(); // Field written, CF=0, ZF=0
+    return VmxResult::success();
 }
 
 void
@@ -987,10 +1794,6 @@ VmxState::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
     SERIALIZE_SCALAR(numVmcsRegions);
-    {
-        Serializable::ScopedCheckpointSection sec(cp, "rootSnapshot");
-        rootSnapshot.serialize(cp);
-    }
     // Serialize each VMCS region with a unique section name.
     size_t index = 0;
     for (const auto &[regionPtr, vmcs] : vmcsRegions) {
@@ -1003,14 +1806,13 @@ VmxState::serialize(CheckpointOut &cp) const
 void
 VmxState::unserialize(CheckpointIn &cp)
 {
-    // if vmx is not active, skip serializing the rest of the state since it should be ignored on vmxoff and vmxon resets the state
+    // If VMX is inactive, ignore any stale serialized VMX state.
     if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;
         inVmxNonRoot = false;
         vmxonRegion = 0;
-        currentVmcsPtr = 0;
+        currentVmcsPtr = InvalidVmcsPointer;
         vmcsRegions.clear();
-        rootSnapshot.clear();
         return;
     }
 
@@ -1021,13 +1823,6 @@ VmxState::unserialize(CheckpointIn &cp)
     UNSERIALIZE_SCALAR(vmxonRegion);
     UNSERIALIZE_SCALAR(currentVmcsPtr);
     UNSERIALIZE_SCALAR(numVmcsRegions);
-
-    if (cp.sectionExists(Serializable::currentSection() + ".rootSnapshot")) {
-        Serializable::ScopedCheckpointSection sec(cp, "rootSnapshot");
-        rootSnapshot.unserialize(cp);
-    } else {
-        rootSnapshot.clear();
-    }
 
     vmcsRegions.clear();
     for (size_t index = 0; index < numVmcsRegions; ++index) {
