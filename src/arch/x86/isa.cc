@@ -49,6 +49,42 @@ namespace X86ISA
 {
 uint32_t VmxVmcsRevisionId = 1;
 
+namespace
+{
+
+constexpr uint32_t VmxRegionSize = 4096;
+constexpr uint32_t VmxMemoryTypeWriteBack = 6;
+
+constexpr uint32_t PinBasedExternalInterruptExiting = 1u << 0;
+constexpr uint32_t PinBasedNmiExiting = 1u << 3;
+
+constexpr uint32_t CpuBasedHltExiting = 1u << 7;
+constexpr uint32_t CpuBasedInvlpgExiting = 1u << 9;
+constexpr uint32_t CpuBasedCr3LoadExiting = 1u << 15;
+constexpr uint32_t CpuBasedCr3StoreExiting = 1u << 16;
+constexpr uint32_t CpuBasedCr8LoadExiting = 1u << 19;
+constexpr uint32_t CpuBasedCr8StoreExiting = 1u << 20;
+constexpr uint32_t CpuBasedMovDrExiting = 1u << 23;
+constexpr uint32_t CpuBasedUnconditionalIoExiting = 1u << 24;
+constexpr uint32_t CpuBasedUseIoBitmaps = 1u << 25;
+constexpr uint32_t CpuBasedUseMsrBitmaps = 1u << 28;
+
+constexpr uint32_t VmExitHostAddressSpaceSize = 1u << 9;
+constexpr uint32_t VmExitSaveIa32Efer = 1u << 20;
+constexpr uint32_t VmExitLoadIa32Efer = 1u << 21;
+
+constexpr uint32_t VmEntryIa32eModeGuest = 1u << 9;
+constexpr uint32_t VmEntryLoadIa32Efer = 1u << 15;
+
+constexpr uint64_t
+vmxControlCapabilityMsr(uint32_t required_one, uint32_t allowed_one)
+{
+    return static_cast<uint64_t>(required_one) |
+        (static_cast<uint64_t>(allowed_one) << 32);
+}
+
+} // namespace
+
 void
 ISA::updateHandyM5Reg(Efer efer, CR0 cr0,
                       SegAttr csAttr, SegAttr ssAttr, RFLAGS rflags)
@@ -127,13 +163,69 @@ ISA::clear()
     regVal[misc_reg::Pat] = 0x0007040600070406ULL;
 
     regVal[misc_reg::FeatureControl] = (1ULL << 0) | (1ULL << 2);
-    
-    regVal[misc_reg::VmxBasic] = 
-      (uint64_t)VmxVmcsRevisionId | // bits 30:0
-      (0x1000ULL << 32) | // bits 44:32 = 4096 bytes
-      (6ULL << 50) | // bits 53:50 = WB
-      (1ULL << 55); // true controls supported
-    //regVal[misc_reg::VmxEptVpidCap]
+
+    regVal[misc_reg::VmxBasic] =
+        (uint64_t)VmxVmcsRevisionId |
+        (static_cast<uint64_t>(VmxRegionSize) << 32) |
+        (static_cast<uint64_t>(VmxMemoryTypeWriteBack) << 50) |
+        (1ULL << 55);
+
+    const uint32_t supportedPinbased =
+        PinBasedExternalInterruptExiting | PinBasedNmiExiting;
+    const uint32_t supportedProcbased =
+        CpuBasedHltExiting |
+        CpuBasedInvlpgExiting |
+        CpuBasedCr3LoadExiting |
+        CpuBasedCr3StoreExiting |
+        CpuBasedCr8LoadExiting |
+        CpuBasedCr8StoreExiting |
+        CpuBasedMovDrExiting |
+        CpuBasedUnconditionalIoExiting |
+        CpuBasedUseIoBitmaps |
+        CpuBasedUseMsrBitmaps;
+    const uint32_t supportedExit =
+        VmExitHostAddressSpaceSize |
+        VmExitSaveIa32Efer |
+        VmExitLoadIa32Efer;
+    const uint32_t supportedEntry =
+        VmEntryIa32eModeGuest |
+        VmEntryLoadIa32Efer;
+
+    regVal[misc_reg::VmxPinbasedCtls] =
+        vmxControlCapabilityMsr(0, supportedPinbased);
+    regVal[misc_reg::VmxProcbasedCtls] =
+        vmxControlCapabilityMsr(0, supportedProcbased);
+    regVal[misc_reg::VmxExitCtls] =
+        vmxControlCapabilityMsr(0, supportedExit);
+    regVal[misc_reg::VmxEntryCtls] =
+        vmxControlCapabilityMsr(0, supportedEntry);
+    regVal[misc_reg::VmxTruePinbasedCtls] =
+        regVal[misc_reg::VmxPinbasedCtls];
+    regVal[misc_reg::VmxTrueProcbasedCtls] =
+        regVal[misc_reg::VmxProcbasedCtls];
+    regVal[misc_reg::VmxTrueExitCtls] =
+        regVal[misc_reg::VmxExitCtls];
+    regVal[misc_reg::VmxTrueEntryCtls] =
+        regVal[misc_reg::VmxEntryCtls];
+    regVal[misc_reg::VmxMisc] = 0;
+    regVal[misc_reg::VmxCr0Fixed0] = (1ULL << 0) | (1ULL << 5) |
+        (1ULL << 31);
+    regVal[misc_reg::VmxCr0Fixed1] = (1ULL << 0) | (1ULL << 1) |
+        (1ULL << 2) | (1ULL << 3) | (1ULL << 4) | (1ULL << 5) |
+        (1ULL << 16) | (1ULL << 18) | (1ULL << 29) | (1ULL << 30) |
+        (1ULL << 31);
+    regVal[misc_reg::VmxCr4Fixed0] = 1ULL << 13;
+    regVal[misc_reg::VmxCr4Fixed1] = (1ULL << 0) | (1ULL << 1) |
+        (1ULL << 2) | (1ULL << 3) | (1ULL << 4) | (1ULL << 5) |
+        (1ULL << 6) | (1ULL << 7) | (1ULL << 8) | (1ULL << 9) |
+        (1ULL << 10) | (1ULL << 13) | (1ULL << 16) | (1ULL << 17) |
+        (1ULL << 18);
+    regVal[misc_reg::VmxVmcsEnum] = 0x2c;
+    regVal[misc_reg::VmxProcbasedCtls2] = 0;
+    regVal[misc_reg::VmxEptVpidCap] = 0;
+    regVal[misc_reg::VmxVmfunc] = 0;
+    regVal[misc_reg::VmxProcbasedCtls3] = 0;
+    regVal[misc_reg::VmxExitCtls2] = 0;
 
     // Bit 11 is mttr enable (1), bit 10 is fixed range enable (1)
     // bits 0-7 is default type (6, which means WB)
