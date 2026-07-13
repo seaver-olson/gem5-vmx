@@ -35,6 +35,94 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 microcode = """
+def macroop SGDT_M
+{
+    .serialize_before
+    .adjust_env maxOsz
+
+    rdlimit t1, tsg, dataSize=2
+    rdbase t2, tsg
+    st t1, seg, sib, disp, dataSize=2
+    st t2, seg, sib, 'adjustedDisp + 2'
+};
+
+def macroop SGDT_P
+{
+    .serialize_before
+    .adjust_env maxOsz
+
+    rdip t7
+    rdlimit t1, tsg, dataSize=2
+    rdbase t2, tsg
+    st t1, seg, riprel, disp, dataSize=2
+    st t2, seg, riprel, 'adjustedDisp + 2'
+};
+
+def macroop SIDT_M
+{
+    .serialize_before
+    .adjust_env maxOsz
+
+    rdlimit t1, idtr, dataSize=2
+    rdbase t2, idtr
+    st t1, seg, sib, disp, dataSize=2
+    st t2, seg, sib, 'adjustedDisp + 2'
+};
+
+def macroop SIDT_P
+{
+    .serialize_before
+    .adjust_env maxOsz
+
+    rdip t7
+    rdlimit t1, idtr, dataSize=2
+    rdbase t2, idtr
+    st t1, seg, riprel, disp, dataSize=2
+    st t2, seg, riprel, 'adjustedDisp + 2'
+};
+
+def macroop SLDT_R
+{
+    .serialize_before
+    rdsel reg, tsl, dataSize=2
+};
+
+def macroop SLDT_M
+{
+    .serialize_before
+    rdsel t1, tsl, dataSize=2
+    st t1, seg, sib, disp, dataSize=2
+};
+
+def macroop SLDT_P
+{
+    .serialize_before
+    rdip t7
+    rdsel t1, tsl, dataSize=2
+    st t1, seg, riprel, disp, dataSize=2
+};
+
+def macroop STR_R
+{
+    .serialize_before
+    rdsel reg, tr, dataSize=2
+};
+
+def macroop STR_M
+{
+    .serialize_before
+    rdsel t1, tr, dataSize=2
+    st t1, seg, sib, disp, dataSize=2
+};
+
+def macroop STR_P
+{
+    .serialize_before
+    rdip t7
+    rdsel t1, tr, dataSize=2
+    st t1, seg, riprel, disp, dataSize=2
+};
+
 def macroop LGDT_M
 {
     .serialize_after

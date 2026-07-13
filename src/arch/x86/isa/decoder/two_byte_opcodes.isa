@@ -46,8 +46,8 @@
         0x00: decode OPCODE_OP_BOTTOM3 {
             //0x00: group6();
             0x00: decode MODRM_REG {
-                0x0: sldt_Mw_or_Rv();
-                0x1: str_Mw_or_Rv();
+                0x0: Inst::SLDT(Ew);
+                0x1: Inst::STR(Ew);
                 0x2: decode MODE_SUBMODE {
                     0x0: Cpl0Inst::LLDT_64(Ew);
                     default: Cpl0Inst::LLDT(Ew);
@@ -65,13 +65,13 @@
             0x01: decode MODRM_REG {
                 0x0: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
-                        0x1: Cpl0VmxNoOperandInst::VMCALL();
-                        0x2: Cpl0VmxNoOperandInst::VMLAUNCH();
-                        0x3: Cpl0VmxNoOperandInst::VMRESUME();
-                        0x4: Cpl0VmxNoOperandInst::VMXOFF();
+                        0x1: VmxNoOperandInst::VMCALL();
+                        0x2: VmxNoOperandInst::VMLAUNCH();
+                        0x3: VmxNoOperandInst::VMRESUME();
+                        0x4: VmxNoOperandInst::VMXOFF();
                         default: Inst::UD2();
                     }
-                    default: sgdt_Ms();
+                    default: Inst::SGDT(M);
                 }
                 0x1: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
@@ -91,7 +91,7 @@
                         }});
                         default: Inst::UD2();
                     }
-                    default: sidt_Ms();
+                    default: Inst::SIDT(M);
                 }
                 0x2: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
@@ -617,10 +617,10 @@
                 // no prefix
                 0x0: decode OPCODE_OP_BOTTOM3 {
                     0x0: decode MODRM_MOD {
-                        default: Cpl0VmxRegMemInst::VMREAD();
+                        default: VmxRegMemInst::VMREAD();
                     }
                     0x1: decode MODRM_MOD {
-                        default: Cpl0VmxRegMemInst::VMWRITE();
+                        default: VmxRegMemInst::VMWRITE();
                     }
                     0x6: MOVD(Edp,Pdp);
                     0x7: MOVQ(Qq,Pq);
@@ -846,49 +846,49 @@
                         0x1: decode MODRM_MOD {
                             0x0: decode MODE_SUBMODE {
                                 0x4: decode MODRM_RM {
-                                    0x5: Cpl0VmxMemInst::VMCLEAR_P_0(true);
-                                    default: Cpl0VmxMemInst::VMCLEAR_M_0(false);
+                                    0x5: VmxMemInst::VMCLEAR_P_0(true);
+                                    default: VmxMemInst::VMCLEAR_M_0(false);
                                 }
-                                default: Cpl0VmxMemInst::VMCLEAR_M_1(false);
+                                default: VmxMemInst::VMCLEAR_M_1(false);
                             }
                             0x3: UD2();
-                            default: Cpl0VmxMemInst::VMCLEAR_M_2(false);
+                            default: VmxMemInst::VMCLEAR_M_2(false);
                         }
                         default: decode LEGACY_REP {
                             0x1: decode MODRM_MOD {
                                 0x0: decode MODE_SUBMODE {
                                     0x4: decode MODRM_RM {
-                                        0x5: Cpl0VmxMemInst::VMXON_P_0(true);
-                                        default: Cpl0VmxMemInst::VMXON_M_0(false);
+                                        0x5: VmxMemInst::VMXON_P_0(true);
+                                        default: VmxMemInst::VMXON_M_0(false);
                                     }
-                                    default: Cpl0VmxMemInst::VMXON_M_1(false);
+                                    default: VmxMemInst::VMXON_M_1(false);
                                 }
                                 0x3: UD2();
-                                default: Cpl0VmxMemInst::VMXON_M_2(false);
+                                default: VmxMemInst::VMXON_M_2(false);
                             }
                             0x0: decode MODRM_MOD {
                                 0x0: decode MODE_SUBMODE {
                                     0x4: decode MODRM_RM {
-                                        0x5: Cpl0VmxMemInst::VMPTRLD_P_0(true);
-                                        default: Cpl0VmxMemInst::VMPTRLD_M_0(false);
+                                        0x5: VmxMemInst::VMPTRLD_P_0(true);
+                                        default: VmxMemInst::VMPTRLD_M0(false);
                                     }
-                                    default: Cpl0VmxMemInst::VMPTRLD_M_1(false);
+                                    default: VmxMemInst::VMPTRLD_M_1(false);
                                 }
                                 0x3: UD2();
-                                default: Cpl0VmxMemInst::VMPTRLD_M_2(false);
+                                default: VmxMemInst::VMPTRLD_M_2(false);
                             }
                         }
                     }
                     0x7: decode MODRM_MOD {
                         0x0: decode MODE_SUBMODE {
                             0x4: decode MODRM_RM {
-                                0x5: Cpl0VmxMemInst::VMPTRST_P_0(true);
-                                default: Cpl0VmxMemInst::VMPTRST_M_0(false);
+                                0x5: VmxMemInst::VMPTRST_P_0(true);
+                                default: VmxMemInst::VMPTRST_M_0(false);
                             }
-                            default: Cpl0VmxMemInst::VMPTRST_M_1(false);
+                            default: VmxMemInst::VMPTRST_M_1(false);
                         }
                         0x3: UD2();
-                        default: Cpl0VmxMemInst::VMPTRST_M_2(false);
+                        default: VmxMemInst::VMPTRST_M_2(false);
                     }
                     default: UD2();
                 }
