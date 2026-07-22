@@ -124,15 +124,10 @@ const MsrMap::value_type msrMapData[] = {
     MsrVal(0x488, misc_reg::VmxCr4Fixed0), // IA32_VMX_CR4_FIXED0
     MsrVal(0x489, misc_reg::VmxCr4Fixed1), // IA32_VMX_CR4_FIXED1
     MsrVal(0x48A, misc_reg::VmxVmcsEnum), // IA32_VMX_VMCS_ENUM
-    MsrVal(0x48B, misc_reg::VmxProcbasedCtls2), // IA32_VMX_PROCBASED_CTLS2
-    MsrVal(0x48C, misc_reg::VmxEptVpidCap), // IA32_VMX_EPT_VPID_CAP
     MsrVal(0x48D, misc_reg::VmxTruePinbasedCtls), // IA32_VMX_TRUE_PINBASED_CTLS
     MsrVal(0x48E, misc_reg::VmxTrueProcbasedCtls), // IA32_VMX_TRUE_PROCBASED_CTLS
     MsrVal(0x48F, misc_reg::VmxTrueExitCtls), // IA32_VMX_TRUE_EXIT_CTLS
     MsrVal(0x490, misc_reg::VmxTrueEntryCtls), // IA32_VMX_TRUE_ENTRY_CTLS
-    MsrVal(0x491, misc_reg::VmxVmfunc), // IA32_VMX_VMFUNC
-    MsrVal(0x492, misc_reg::VmxProcbasedCtls3), // IA32_VMX_PROCBASED_CTLS3
-    MsrVal(0x493, misc_reg::VmxExitCtls2), // IA32_VMX_EXIT_CTLS2
     MsrVal(0xC0000080, misc_reg::Efer),
     MsrVal(0xC0000081, misc_reg::Star),
     MsrVal(0xC0000082, misc_reg::Lstar),

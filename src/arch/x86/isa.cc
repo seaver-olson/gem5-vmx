@@ -34,6 +34,7 @@
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/vmx_utils.hh"
 #include "base/compiler.hh"
 #include "cpu/base.hh"
 #include "cpu/thread_context.hh"
@@ -55,19 +56,7 @@ namespace
 constexpr uint32_t VmxRegionSize = 4096;
 constexpr uint32_t VmxMemoryTypeWriteBack = 6;
 
-constexpr uint32_t PinBasedExternalInterruptExiting = 1u << 0;
-constexpr uint32_t PinBasedNmiExiting = 1u << 3;
-
-constexpr uint32_t CpuBasedHltExiting = 1u << 7;
-constexpr uint32_t CpuBasedInvlpgExiting = 1u << 9;
 constexpr uint32_t CpuBasedCr3LoadExiting = 1u << 15;
-constexpr uint32_t CpuBasedCr3StoreExiting = 1u << 16;
-constexpr uint32_t CpuBasedCr8LoadExiting = 1u << 19;
-constexpr uint32_t CpuBasedCr8StoreExiting = 1u << 20;
-constexpr uint32_t CpuBasedMovDrExiting = 1u << 23;
-constexpr uint32_t CpuBasedUnconditionalIoExiting = 1u << 24;
-constexpr uint32_t CpuBasedUseIoBitmaps = 1u << 25;
-constexpr uint32_t CpuBasedUseMsrBitmaps = 1u << 28;
 
 constexpr uint32_t VmExitHostAddressSpaceSize = 1u << 9;
 constexpr uint32_t VmExitSaveIa32Efer = 1u << 20;
@@ -75,13 +64,6 @@ constexpr uint32_t VmExitLoadIa32Efer = 1u << 21;
 
 constexpr uint32_t VmEntryIa32eModeGuest = 1u << 9;
 constexpr uint32_t VmEntryLoadIa32Efer = 1u << 15;
-
-constexpr uint64_t
-vmxControlCapabilityMsr(uint32_t required_one, uint32_t allowed_one)
-{
-    return static_cast<uint64_t>(required_one) |
-        (static_cast<uint64_t>(allowed_one) << 32);
-}
 
 } // namespace
 
@@ -149,6 +131,12 @@ ISA::updateHandyM5Reg(Efer efer, CR0 cr0,
 void
 ISA::clear()
 {
+    // VMX operation and all current/active VMCS associations are
+    // per-logical-processor state and are reset along with the rest of the
+    // architectural state.  Keeping a stale current VMCS across reset would
+    // allow VMREAD/VMWRITE after the processor has left VMX operation.
+    vmx = VmxState{};
+
     // Blank everything. 0 might not be an appropriate value for some things,
     // but it is for most.
     memset(regVal, 0, misc_reg::NumRegs * sizeof(RegVal));
@@ -170,19 +158,14 @@ ISA::clear()
         (static_cast<uint64_t>(VmxMemoryTypeWriteBack) << 50) |
         (1ULL << 55);
 
-    const uint32_t supportedPinbased =
-        PinBasedExternalInterruptExiting | PinBasedNmiExiting;
-    const uint32_t supportedProcbased =
-        CpuBasedHltExiting |
-        CpuBasedInvlpgExiting |
-        CpuBasedCr3LoadExiting |
-        CpuBasedCr3StoreExiting |
-        CpuBasedCr8LoadExiting |
-        CpuBasedCr8StoreExiting |
-        CpuBasedMovDrExiting |
-        CpuBasedUnconditionalIoExiting |
-        CpuBasedUseIoBitmaps |
-        CpuBasedUseMsrBitmaps;
+    // External-interrupt and NMI exiting are not advertised until event
+    // acknowledgement/pending-state behavior is modeled end to end.
+    const uint32_t supportedPinbased = 0;
+    // CR3-load exiting is the only optional primary execution control in
+    // the audited contract.  Other interception hooks remain present for
+    // future work, but exposing their bits before their complete exit
+    // metadata and integration tests exist would overstate the model.
+    const uint32_t supportedProcbased = CpuBasedCr3LoadExiting;
     const uint32_t supportedExit =
         VmExitHostAddressSpaceSize |
         VmExitSaveIa32Efer |
@@ -192,13 +175,18 @@ ISA::clear()
         VmEntryLoadIa32Efer;
 
     regVal[misc_reg::VmxPinbasedCtls] =
-        vmxControlCapabilityMsr(0, supportedPinbased);
+        vmx::controlCapabilityMsr(0, supportedPinbased);
     regVal[misc_reg::VmxProcbasedCtls] =
-        vmxControlCapabilityMsr(0, supportedProcbased);
-    regVal[misc_reg::VmxExitCtls] =
-        vmxControlCapabilityMsr(0, supportedExit);
-    regVal[misc_reg::VmxEntryCtls] =
-        vmxControlCapabilityMsr(0, supportedEntry);
+        vmx::controlCapabilityMsr(0, supportedProcbased);
+    // The audited implementation intentionally supports only IA-32e guests
+    // and 64-bit hosts.  In particular, legacy-PAE VM entry would also have
+    // to validate and load the four PDPTEs; accepting it without doing so can
+    // select a stale translation root.  Make these two mode controls
+    // required-one until that wider mode support exists.
+    regVal[misc_reg::VmxExitCtls] = vmx::controlCapabilityMsr(
+        VmExitHostAddressSpaceSize, supportedExit);
+    regVal[misc_reg::VmxEntryCtls] = vmx::controlCapabilityMsr(
+        VmEntryIa32eModeGuest, supportedEntry);
     regVal[misc_reg::VmxTruePinbasedCtls] =
         regVal[misc_reg::VmxPinbasedCtls];
     regVal[misc_reg::VmxTrueProcbasedCtls] =
@@ -218,9 +206,10 @@ ISA::clear()
     regVal[misc_reg::VmxCr4Fixed1] = (1ULL << 0) | (1ULL << 1) |
         (1ULL << 2) | (1ULL << 3) | (1ULL << 4) | (1ULL << 5) |
         (1ULL << 6) | (1ULL << 7) | (1ULL << 8) | (1ULL << 9) |
-        (1ULL << 10) | (1ULL << 13) | (1ULL << 16) | (1ULL << 17) |
-        (1ULL << 18);
-    regVal[misc_reg::VmxVmcsEnum] = 0x2c;
+        (1ULL << 10) | (1ULL << 13) | (1ULL << 16) | (1ULL << 18);
+    // Guest IA32_SYSENTER_CS (encoding 0x482a, index 0x15) has the
+    // highest index among the VMCS fields supported by this implementation.
+    regVal[misc_reg::VmxVmcsEnum] = 0x2a;
     regVal[misc_reg::VmxProcbasedCtls2] = 0;
     regVal[misc_reg::VmxEptVpidCap] = 0;
     regVal[misc_reg::VmxVmfunc] = 0;
@@ -295,6 +284,14 @@ copyMiscRegs(ThreadContext *src, ThreadContext *dest)
         if (!misc_reg::isValid(i))
              continue;
 
+        // VMX capability MSRs describe the destination CPU model; they are
+        // not writable architectural state.  In particular, copying them
+        // from a KVM fast-forward CPU leaks the physical host's VMX feature
+        // set into gem5 and advertises controls the detailed model cannot
+        // execute.  Preserve the destination ISA's initialized contract.
+        if (i >= misc_reg::VmxBasic && i <= misc_reg::VmxExitCtls2)
+            continue;
+
         dest->setMiscRegNoEffect(i, src->readMiscRegNoEffect(i));
     }
 
@@ -318,6 +315,12 @@ ISA::copyRegsFrom(ThreadContext *src)
     for (auto &id: ccRegClass)
         tc->setReg(id, src->getReg(id));
     copyMiscRegs(src, tc);
+    // CPU model switching moves the logical processor, not merely its
+    // general registers.  Preserve VMXON/non-root state, current VMCS, launch
+    // state, and the implementation-specific VMCS field representation.
+    auto *src_isa = dynamic_cast<ISA *>(src->getIsaPtr());
+    panic_if(!src_isa, "Cannot copy x86 VMX state from a non-x86 ISA");
+    vmx = src_isa->vmxState();
     tc->pcState(src->pcState());
 }
 

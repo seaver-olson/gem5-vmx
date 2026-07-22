@@ -8,6 +8,7 @@
 #include "arch/x86/vmcs.hh"
 #include "base/types.hh"
 #include "cpu/null_static_inst.hh"
+#include "mem/request.hh"
 #include "sim/faults.hh"
 #include "sim/serialize.hh"
 
@@ -18,6 +19,9 @@ class ThreadContext;
 
 namespace X86ISA
 {
+
+Fault vmxMemoryOperandFault(ThreadContext *tc, Addr linear,
+        size_t size, Request::Flags operandFlags);
 
 // Intel SDM Vol. 3 Appendix C basic VM-exit reasons.
 enum class VmxExitReason : uint32_t
@@ -273,20 +277,21 @@ class VmxState
     Addr currentVmcsPointer() const { return currentVmcsPtr; }
 
     VmxResult vmxon(ExecContext *xc, Addr operandEA,
-            uint8_t instructionSize);
+            Request::Flags operandFlags, uint8_t instructionSize);
     VmxResult vmxoff(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmclear(ExecContext *xc, Addr operandEA,
-            uint8_t instructionSize);
+            Request::Flags operandFlags, uint8_t instructionSize);
     VmxResult vmptrld(ExecContext *xc, Addr operandEA,
-            uint8_t instructionSize);
+            Request::Flags operandFlags, uint8_t instructionSize);
     VmxResult vmptrst(ExecContext *xc, Addr operandEA,
-            uint8_t instructionSize);
+            Request::Flags operandFlags, uint8_t instructionSize);
     VmxResult vmlaunch(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmresume(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmcall(ExecContext *xc, uint8_t instructionSize);
 
     VmxResult vmread(ExecContext *xc, Vmcs::RawEncoding encoding,
             uint64_t &value, uint8_t instructionSize);
+    VmxResult vmwritePrecheck(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmwrite(ExecContext *xc, Vmcs::RawEncoding encoding,
             uint64_t value, uint8_t instructionSize);
 
@@ -302,6 +307,11 @@ class VmxState
             size_t size) const;
     bool controlRegisterAccessCausesExit(uint8_t cr, VmxCrAccessType type,
             uint64_t value = 0) const;
+    uint64_t controlRegisterReadValue(uint8_t cr, uint64_t liveValue) const;
+    uint64_t controlRegisterWriteValue(uint8_t cr, uint64_t requestedValue,
+            uint64_t liveValue) const;
+    bool controlRegisterWriteAllowed(ThreadContext *tc, uint8_t cr,
+            uint64_t value) const;
 
     VmxResult vmexitInstruction(ExecContext *xc, VmxExitReason reason,
             uint8_t instructionSize, uint64_t qualification = 0,

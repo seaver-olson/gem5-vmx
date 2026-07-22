@@ -1395,12 +1395,19 @@ let {{
                         dest, 0, StaticInst::size());
                 return NoFault;
             } else {
+                RegVal controlValue = ControlSrc1;
+                if (auto *isa =
+                        dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr())) {
+                    controlValue = isa->vmxState().controlRegisterReadValue(
+                            src1, controlValue);
+                }
                 %s
             }
         '''
         code = rdcrCode % \
-                "DestReg = merge(DestReg, dest, ControlSrc1, dataSize);"
-        big_code = rdcrCode % "DestReg = ControlSrc1 & mask(dataSize * 8);"
+                "DestReg = merge(DestReg, dest, controlValue, dataSize);"
+        big_code = rdcrCode % \
+                "DestReg = controlValue & mask(dataSize * 8);"
 
     class Wrcr(RegOp):
         operand_types = (CrDestOp, FoldedSrc1Op)
@@ -1412,15 +1419,24 @@ let {{
             } else {
                 RegVal newVal = PSrcReg1;
 
-                if (auto *isa =
-                        dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
-                        isa && isa->vmxState().controlRegisterAccessCausesExit(
+                auto *vmxIsa =
+                    dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                if (vmxIsa &&
+                        vmxIsa->vmxState().controlRegisterAccessCausesExit(
                             dest, VmxCrAccessType::MovToCr, newVal)) {
-                    isa->vmxState().controlRegisterExit(
+                    vmxIsa->vmxState().controlRegisterExit(
                             xc, dest, VmxCrAccessType::MovToCr,
                             src1, newVal, StaticInst::size());
                     return NoFault;
                 } else {
+                if (vmxIsa) {
+                    newVal = vmxIsa->vmxState().controlRegisterWriteValue(
+                            dest, newVal, ControlDest);
+                    if (!vmxIsa->vmxState().controlRegisterWriteAllowed(
+                                xc->tcBase(), dest, newVal)) {
+                        fault = std::make_shared<GeneralProtection>(0);
+                    }
+                }
                 // Check for any modifications that would cause a fault.
                 switch(dest) {
                   case 0:
@@ -1475,10 +1491,41 @@ let {{
                     fault = std::make_shared<GenericISA::M5PanicFault>(
                             "Unrecognized control register %d.\\n", dest);
                 }
-                ControlDest = newVal;
+                // Fault-like control-register writes leave architectural
+                // state unchanged.  In particular, do not let a VMX
+                // fixed-bit #GP install a new CR value or trigger its MMU
+                // side effects before the fault is delivered.
+                if (fault == NoFault)
+                    ControlDest = newVal;
                 }
             }
             '''
+
+    # CLTS and LMSW use the same architectural CR write machinery as MOV to
+    # CR0, but Intel assigns distinct VM-exit qualification access types.
+    # Keep separate generated micro-ops so those encodings cannot silently
+    # collapse into MOV-to-CR exits.
+    class WrcrClts(RegOp):
+        operand_types = (CrDestOp, FoldedSrc1Op)
+        def __init__(self, dest, src1, flags=None, dataSize="env.dataSize"):
+            super().__init__(dest, src1, flags=flags, dataSize=dataSize)
+        code = Wrcr.code.replace(
+                "VmxCrAccessType::MovToCr", "VmxCrAccessType::Clts").replace(
+                "src1, newVal, StaticInst::size()",
+                "0, newVal, StaticInst::size()")
+
+    class WrcrLmsw(RegOp):
+        operand_types = (CrDestOp, FoldedSrc1Op, FoldedSrc2Op)
+        def __init__(self, dest, src1, src2, flags=None,
+                dataSize="env.dataSize"):
+            super().__init__(dest, src1, src2, flags=flags,
+                    dataSize=dataSize)
+        code = Wrcr.code.replace(
+                "VmxCrAccessType::MovToCr", "VmxCrAccessType::Lmsw").replace(
+                "dest, VmxCrAccessType::Lmsw, newVal",
+                "dest, VmxCrAccessType::Lmsw, PSrcReg2").replace(
+                "src1, newVal, StaticInst::size()",
+                "0, PSrcReg2, StaticInst::size()")
 
     # Microops for manipulating segmentation registers
     class SegOp(RegOp):
@@ -1698,6 +1745,19 @@ let {{
     class Rdtsc(RdRegOp):
         code = '''
             DestReg = TscOp;
+        '''
+
+    class Rdtscp(RdRegOp):
+        code = '''
+            // Enable-RDTSCP is a secondary execution control. Secondary
+            // controls are not exposed by gem5-vmx, so RDTSCP in non-root
+            // operation must #UD rather than execute approximately.
+            if (auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                    isa && isa->vmxState().nonRootActive()) {
+                fault = std::make_shared<InvalidOpcode>();
+            } else {
+                DestReg = TscOp;
+            }
         '''
 
     class Rdm5reg(RdRegOp):

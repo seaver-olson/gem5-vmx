@@ -191,6 +191,16 @@ TLB::demapPage(Addr va, uint64_t asn)
 namespace
 {
 
+bool
+readOnlyVmxMsr(Addr msr)
+{
+    // IA32_VMX_BASIC through IA32_VMX_VMCS_ENUM and the true-control MSRs
+    // are read-only. Unsupported optional VMX MSRs are absent from the MSR
+    // map and therefore fault on both reads and writes.
+    return (msr >= 0x480 && msr <= 0x48a) ||
+        (msr >= 0x48d && msr <= 0x490);
+}
+
 Cycles
 localMiscRegAccess(bool read, RegIndex regNum,
                    ThreadContext *tc, PacketPtr pkt)
@@ -234,6 +244,11 @@ TLB::translateInt(bool read, RequestPtr req, ThreadContext *tc)
         RegIndex regNum;
         if (!msrAddrToIndex(regNum, vaddr))
             return std::make_shared<GeneralProtection>(0);
+        if (!read && (readOnlyVmxMsr(vaddr) ||
+                (vaddr == 0x3a &&
+                 bits(tc->readMiscRegNoEffect(regNum), 0)))) {
+            return std::make_shared<GeneralProtection>(0);
+        }
 
         req->setPaddr(req->getVaddr());
         req->setLocalAccessor(

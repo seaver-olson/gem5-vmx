@@ -120,11 +120,26 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
                  dynamic_cast<OverflowTrap *>(this)) ?
                 VmxInterruptionType::SoftwareException :
                 VmxInterruptionType::HardwareException;
+            if (type == VmxInterruptionType::SoftwareException && inst) {
+                exitInfo.hasInstructionLength = true;
+                exitInfo.instructionLength = inst->size();
+            }
             exitInfo.hasInterruptionInfo = true;
             exitInfo.interruptionInfo = vmxInterruptionInfo(
                     vector, type, hasErrorCode);
             exitInfo.hasInterruptionErrorCode = hasErrorCode;
             exitInfo.interruptionErrorCode = checkedErrorCode;
+            if (dynamic_cast<DebugException *>(this)) {
+                // SDM Table 30-1: the supported #DB sources use the DR6
+                // B0-B3, BD, and BS positions. Bus-lock and RTM debug
+                // sources are not enumerated by this x86 model.
+                constexpr uint64_t supportedDebugQualification =
+                    0xf | (1ull << 13) | (1ull << 14);
+                exitInfo.hasQualification = true;
+                exitInfo.qualification =
+                    tc->readMiscRegNoEffect(misc_reg::Dr6) &
+                    supportedDebugQualification;
+            }
         }
 
         if (shouldExit && isa->vmxState().vmexitEvent(tc, exitInfo)) {
@@ -183,12 +198,35 @@ X86Trap::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     // This is the same as a fault, but it happens -after- the
     // instruction.
-    X86FaultBase::invoke(tc);
+    X86FaultBase::invoke(tc, inst);
 }
 
 void
 X86Abort::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    // gem5 does not have a general in-guest delivery path for abort-class
+    // exceptions, but an exception-bitmap VM exit occurs before that
+    // delivery and is architecturally well defined.  Honor that interception
+    // instead of panicking before VMX gets an opportunity to exit.
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    const uint64_t checkedErrorCode =
+        errorCode == (uint64_t)-1 ? 0 : errorCode;
+    if (isa && isa->vmxState().nonRootActive() &&
+            isa->vmxState().shouldExitOnException(vector,
+                checkedErrorCode)) {
+        VmxExitInfo exitInfo;
+        exitInfo.reason = VmxExitReason::ExceptionOrNmi;
+        exitInfo.hasInterruptionInfo = true;
+        const bool hasErrorCode = errorCode != (uint64_t)-1;
+        exitInfo.interruptionInfo = vmxInterruptionInfo(vector,
+                VmxInterruptionType::HardwareException, hasErrorCode);
+        exitInfo.hasInterruptionErrorCode = hasErrorCode;
+        exitInfo.interruptionErrorCode = checkedErrorCode;
+        if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
+            return;
+        }
+    }
+
     panic("Abort exception!");
 }
 
@@ -219,9 +257,11 @@ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
                     vector, VmxInterruptionType::HardwareException, true);
             exitInfo.hasInterruptionErrorCode = true;
             exitInfo.interruptionErrorCode = checkedErrorCode;
+            // SDM 30.2.1: a page fault that directly causes a VM exit does
+            // not update CR2; its faulting linear address is instead saved
+            // in the exit-qualification field.
             exitInfo.hasQualification = true;
             exitInfo.qualification = addr;
-
             if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
                 return;
             }

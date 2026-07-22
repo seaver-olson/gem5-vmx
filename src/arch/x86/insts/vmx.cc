@@ -9,10 +9,12 @@
 #include "arch/x86/decoder.hh"
 #include "arch/x86/faults.hh"
 #include "arch/x86/isa.hh"
+#include "arch/x86/ldstflags.hh"
 #include "arch/x86/page_size.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/utility.hh"
+#include "arch/x86/vmx_utils.hh"
 #include "base/bitfield.hh"
 #include "cpu/exec_context.hh"
 #include "cpu/thread_context.hh"
@@ -24,6 +26,29 @@ namespace gem5
 {
 namespace X86ISA
 {
+
+Fault
+vmxMemoryOperandFault(ThreadContext *tc, Addr linear,
+        size_t size, Request::Flags operandFlags)
+{
+    HandyM5Reg mode = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    if (mode.mode == LongMode) {
+        const auto canonical = [](Addr address) {
+            const uint64_t high = bits(address, 63, 48);
+            return high == (bits(address, 47) ? mask(16) : 0);
+        };
+        const bool wraps = size && linear > MaxAddr - (size - 1);
+        const Addr last = size ? linear + size - 1 : linear;
+        if (wraps || !canonical(linear) || !canonical(last)) {
+            const int segment = operandFlags & SegmentFlagMask;
+            return segment == segment_idx::Ss ?
+                Fault(std::make_shared<StackFault>(0)) :
+                Fault(std::make_shared<GeneralProtection>(0));
+        }
+    }
+    return NoFault;
+}
+
 namespace
 {
 constexpr uint32_t
@@ -115,19 +140,19 @@ constexpr uint32_t CpuBasedUseMsrBitmaps = 1u << 28;
 constexpr uint32_t CpuBasedActivateSecondaryControls = 1u << 31;
 
 constexpr uint32_t VmExitHostAddressSpaceSize = 1u << 9;
+constexpr uint32_t VmExitSaveDebugControls = 1u << 2;
 constexpr uint32_t VmExitSaveIa32Efer = 1u << 20;
 constexpr uint32_t VmExitLoadIa32Efer = 1u << 21;
 
 constexpr uint32_t VmEntryIa32eModeGuest = 1u << 9;
 constexpr uint32_t VmEntryLoadIa32Efer = 1u << 15;
-constexpr uint32_t VmEntryIntrInfoValid = 1u << 31;
 
 constexpr uint32_t VmExitReasonVmEntryFailure = 1u << 31;
-// CPUID.80000008H advertises 48 physical-address bits for gem5's x86 CPU.
-constexpr Addr MaxSupportedPhysAddr = mask(48);
 constexpr uint64_t RequiredRflagsBit = 1ull << 1;
 constexpr uint64_t ReservedRflagsMask =
     mask(63, 22) | (1ull << 15) | (1ull << 5) | (1ull << 3);
+constexpr uint64_t SupportedEferBits =
+    (1ull << 0) | (1ull << 8) | (1ull << 10) | (1ull << 11);
 
 struct SegmentFieldSet
 {
@@ -182,13 +207,19 @@ vmcsRevisionId(ThreadContext *tc)
 }
 
 Fault
-readOperand(ExecContext *xc, Addr operandEA, uint64_t &value, size_t size)
+readOperand(ExecContext *xc, Addr operandEA, Request::Flags operandFlags,
+        uint64_t &value, size_t size)
 {
+    if (auto fault = vmxMemoryOperandFault(
+                xc->tcBase(), operandEA, size, operandFlags);
+            fault != NoFault) {
+        return fault;
+    }
     const std::vector<bool> byteEnable(size, true);
     value = 0;
     auto fault = xc->readMem(
             operandEA, reinterpret_cast<uint8_t *>(&value), size,
-            Request::Flags(0), byteEnable);
+            operandFlags, byteEnable);
     return fault;
 }
 
@@ -203,7 +234,7 @@ readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
 bool
 validPhysicalAddress(Addr addr)
 {
-    return (addr & ~MaxSupportedPhysAddr) == 0;
+    return vmx::validPhysicalAddress(addr, 48);
 }
 
 bool
@@ -238,24 +269,6 @@ readOrZero(const Vmcs &vmcs, VmcsField field)
     uint64_t value = 0;
     vmcs.read(field, value);
     return value;
-}
-
-bool
-controlsAllowed(uint32_t controls, uint64_t capability)
-{
-    const uint32_t requiredOne = bits(capability, 31, 0);
-    const uint32_t allowedOne = bits(capability, 63, 32);
-    return (controls & requiredOne) == requiredOne &&
-           (controls & ~allowedOne) == 0;
-}
-
-bool
-fixedBitsAllowed(uint64_t value, uint64_t fixed0, uint64_t fixed1,
-        uint64_t ignored = 0)
-{
-    const uint64_t required = fixed0 & ~ignored;
-    const uint64_t allowed = fixed1 | ignored;
-    return (value & required) == required && (value & ~allowed) == 0;
 }
 
 uint64_t
@@ -306,10 +319,10 @@ vmxAvailable(ThreadContext *tc)
     const uint64_t cr0 = isa->readMiscRegNoEffect(misc_reg::Cr0);
     const uint64_t cr4 = isa->readMiscRegNoEffect(misc_reg::Cr4);
     return featureLocked && vmxonEnabled &&
-        fixedBitsAllowed(cr0,
+        vmx::fixedBitsAllowed(cr0,
             isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
             isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1)) &&
-        fixedBitsAllowed(cr4,
+        vmx::fixedBitsAllowed(cr4,
             isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
             isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1));
 }
@@ -388,6 +401,94 @@ segAttrToVmcsAccessRights(SegAttr attr)
     return accessRights;
 }
 
+bool
+validSegmentLimit(uint32_t limit, SegAttr attr)
+{
+    if (attr.granularity) {
+        return bits(limit, 11, 0) == mask(12);
+    }
+    return bits(limit, 31, 20) == 0;
+}
+
+bool
+validGuestSegment(int index, uint16_t selector, uint64_t base,
+        uint32_t limit, uint32_t accessRights, bool ia32e, uint8_t cpl)
+{
+    const SegAttr attr = vmcsAccessRightsToSegAttr(accessRights);
+    if ((index == segment_idx::Cs || index == segment_idx::Tr) &&
+            attr.unusable) {
+        return false;
+    }
+    // On an Intel-64-capable processor these base checks are per register,
+    // not a generic IA-32e/usable rule (SDM 29.3.1.2). FS and GS must be
+    // canonical even when unusable; a usable LDTR and TR must also be
+    // canonical. CS and usable SS/DS/ES instead require zero upper 32 bits.
+    const bool canonicalBase = index == segment_idx::Fs ||
+        index == segment_idx::Gs || index == segment_idx::Tr ||
+        (index == segment_idx::Tsl && !attr.unusable);
+    const bool base32 = index == segment_idx::Cs ||
+        ((index == segment_idx::Ss || index == segment_idx::Ds ||
+          index == segment_idx::Es) && !attr.unusable);
+    if ((canonicalBase && !canonicalAddress(base)) ||
+            (base32 && bits(base, 63, 32) != 0)) {
+        return false;
+    }
+    if (attr.unusable) {
+        return true;
+    }
+
+    // For ordinary unusable segments Intel does not check these reserved
+    // positions. CS and TR cannot be unusable and therefore reach this check.
+    // Bit 16 is the VMX-specific unusable bit; bit 12 is software available.
+    if (accessRights & (mask(31, 17) | mask(11, 8))) {
+        return false;
+    }
+    if (!attr.present || !validSegmentLimit(limit, attr)) {
+        return false;
+    }
+
+    const uint8_t type = attr.type;
+    const uint8_t rpl = bits(selector, 1, 0);
+    switch (index) {
+      case segment_idx::Cs:
+        if (!attr.system || !(type & 0x8) || !(type & 0x1) ||
+                (attr.longMode && attr.defaultSize) ||
+                (!ia32e && attr.longMode)) {
+            return false;
+        }
+        // Conforming code may have a lower DPL; nonconforming code must
+        // match the guest CPL exactly.
+        return (type & 0x4) ? attr.dpl <= rpl : attr.dpl == rpl;
+
+      case segment_idx::Ss:
+        return attr.system && !(type & 0x8) && (type & 0x3) == 0x3 &&
+            attr.dpl == cpl && rpl == cpl;
+
+      case segment_idx::Es:
+      case segment_idx::Ds:
+      case segment_idx::Fs:
+      case segment_idx::Gs:
+        if (!attr.system || !(type & 0x1) ||
+                ((type & 0x8) && !(type & 0x2))) {
+            return false;
+        }
+        if (!(type & 0x8) || !(type & 0x4)) {
+            return attr.dpl >= rpl;
+        }
+        return true;
+
+      case segment_idx::Tsl:
+        return !attr.system && type == 0x2 && !bits(selector, 2);
+
+      case segment_idx::Tr:
+        return !attr.system && (type == 0x3 || type == 0xb) &&
+            (!ia32e || type == 0xb) && !bits(selector, 2);
+
+      default:
+        return false;
+    }
+}
+
 SegAttr
 hostCodeAttr(bool longMode)
 {
@@ -431,7 +532,7 @@ Addr
 currentRip(ThreadContext *tc)
 {
     const auto &pc = tc->pcState().as<PCState>();
-    const Addr csBase = tc->readMiscRegNoEffect(misc_reg::CsBase);
+    const Addr csBase = tc->readMiscRegNoEffect(misc_reg::CsEffBase);
     return pc.instAddr() - csBase;
 }
 
@@ -565,16 +666,16 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
 
-    if (!controlsAllowed(bits(pinControls, 31, 0),
+    if (!vmx::controlsAllowed(bits(pinControls, 31, 0),
                 vmxControlCapability(tc, misc_reg::VmxPinbasedCtls,
                     misc_reg::VmxTruePinbasedCtls)) ||
-            !controlsAllowed(bits(procControls, 31, 0),
+            !vmx::controlsAllowed(bits(procControls, 31, 0),
                 vmxControlCapability(tc, misc_reg::VmxProcbasedCtls,
                     misc_reg::VmxTrueProcbasedCtls)) ||
-            !controlsAllowed(bits(exitControls, 31, 0),
+            !vmx::controlsAllowed(bits(exitControls, 31, 0),
                 vmxControlCapability(tc, misc_reg::VmxExitCtls,
                     misc_reg::VmxTrueExitCtls)) ||
-            !controlsAllowed(bits(entryControls, 31, 0),
+            !vmx::controlsAllowed(bits(entryControls, 31, 0),
                 vmxControlCapability(tc, misc_reg::VmxEntryCtls,
                     misc_reg::VmxTrueEntryCtls))) {
         return failInstruction(
@@ -585,7 +686,7 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
         uint64_t secondaryControls = 0;
         if (!readRequired(vmcs, VmcsSecondaryVmExecControl,
                     secondaryControls) ||
-                !controlsAllowed(bits(secondaryControls, 31, 0),
+                !vmx::controlsAllowed(bits(secondaryControls, 31, 0),
                     isa->readMiscRegNoEffect(misc_reg::VmxProcbasedCtls2))) {
             return failInstruction(
                     VmxInstructionError::VmEntryInvalidControlFields);
@@ -594,14 +695,10 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
 
     const uint64_t cr3TargetCount = readOrZero(vmcs, VmcsCr3TargetCount);
     if (cr3TargetCount != 0 ||
-            readOrZero(vmcs, VmcsExceptionBitmap) != 0 ||
-            readOrZero(vmcs, VmcsCr0GuestHostMask) != 0 ||
-            readOrZero(vmcs, VmcsCr4GuestHostMask) != 0 ||
             readOrZero(vmcs, VmcsVmExitMsrStoreCount) != 0 ||
             readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0 ||
             readOrZero(vmcs, VmcsVmEntryMsrLoadCount) != 0 ||
-            (readOrZero(vmcs, VmcsVmEntryIntrInfoField) &
-             VmEntryIntrInfoValid)) {
+            readOrZero(vmcs, VmcsVmEntryIntrInfoField) != 0) {
         return failInstruction(
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
@@ -638,24 +735,36 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
     CR0 hostCr0Bits = hostCr0;
     CR4 hostCr4Bits = hostCr4;
     const bool hostIa32e = exitControls & VmExitHostAddressSpaceSize;
+    const bool guestIa32e = entryControls & VmEntryIa32eModeGuest;
+    Efer currentEfer = tc->readMiscRegNoEffect(misc_reg::Efer);
     constexpr uint64_t ignoredCr0Bits = (1ull << 29) | (1ull << 30);
-    if (!fixedBitsAllowed(hostCr0,
+    if (!vmx::fixedBitsAllowed(hostCr0,
                 isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
                 isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1),
                 ignoredCr0Bits) ||
-            !fixedBitsAllowed(hostCr4,
+            !vmx::fixedBitsAllowed(hostCr4,
                 isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
                 isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1)) ||
             !hostCr0Bits.pe || !hostCr4Bits.vmxe ||
+            (currentEfer.lma ? !hostIa32e :
+                (hostIa32e || guestIa32e)) ||
             (hostIa32e && (!hostCr0Bits.pg || !hostCr4Bits.pae)) ||
-            !validPhysicalAddress(hostCr3 & ~mask(12)) ||
-            (hostIa32e && !canonicalAddress(hostRip))) {
+            !vmx::validCr3(hostCr3, hostCr4Bits, hostIa32e, 48) ||
+            (hostIa32e ? !canonicalAddress(hostRip) :
+                bits(hostRip, 63, 32) != 0) ||
+            !canonicalAddress(readOrZero(vmcs, VmcsHostIa32SysenterEsp)) ||
+            !canonicalAddress(readOrZero(vmcs,
+                    VmcsHostIa32SysenterEip))) {
         return failInstruction(VmxInstructionError::VmEntryInvalidHostState);
     }
 
     if (exitControls & VmExitLoadIa32Efer) {
-        Efer hostEfer = readOrZero(vmcs, VmcsHostIa32Efer);
-        if (hostEfer.lma != hostIa32e || hostEfer.lme != hostIa32e) {
+        const uint64_t hostEferValue =
+            readOrZero(vmcs, VmcsHostIa32Efer);
+        Efer hostEfer = hostEferValue;
+        if ((hostEferValue & ~SupportedEferBits) ||
+                hostEfer.lma != hostIa32e ||
+                hostEfer.lme != hostIa32e) {
             return failInstruction(
                     VmxInstructionError::VmEntryInvalidHostState);
         }
@@ -672,7 +781,7 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
             return failInstruction(
                     VmxInstructionError::VmEntryInvalidHostState);
         }
-        if (bits(selector, 1, 0) != 0) {
+        if (bits(selector, 2, 0) != 0) {
             return failInstruction(
                     VmxInstructionError::VmEntryInvalidHostState);
         }
@@ -709,35 +818,42 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
 
     CR0 guestCr0Bits = guestCr0;
     CR4 guestCr4Bits = guestCr4;
-    const bool guestIa32e = entryControls & VmEntryIa32eModeGuest;
-    if (!fixedBitsAllowed(guestCr0,
+    if (!vmx::fixedBitsAllowed(guestCr0,
                 isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed0),
                 isa->readMiscRegNoEffect(misc_reg::VmxCr0Fixed1),
                 ignoredCr0Bits) ||
-            !fixedBitsAllowed(guestCr4,
+            !vmx::fixedBitsAllowed(guestCr4,
                 isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
                 isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1)) ||
             !guestCr0Bits.pe ||
-            !validPhysicalAddress(guestCr3 & ~mask(12)) ||
+            !vmx::validCr3(guestCr3, guestCr4Bits, guestIa32e, 48) ||
             !(guestRflags & RequiredRflagsBit) ||
             (guestRflags & ReservedRflagsMask) ||
             (guestRflags & VMBit) ||
             readOrZero(vmcs, VmcsGuestActivityState) != 0 ||
+            readOrZero(vmcs, VmcsField::GuestInterruptibilityState) != 0 ||
+            readOrZero(vmcs, VmcsField::VmcsLinkPointer) != mask(64) ||
             (guestIa32e && (!guestCr0Bits.pg || !guestCr4Bits.pae))) {
         return failEntry(VmxExitReason::VmEntryInvalidGuestState);
     }
 
     if (entryControls & VmEntryLoadIa32Efer) {
-        Efer guestEfer = readOrZero(vmcs, VmcsGuestIa32Efer);
-        if (guestEfer.lma != guestIa32e ||
+        const uint64_t guestEferValue =
+            readOrZero(vmcs, VmcsGuestIa32Efer);
+        Efer guestEfer = guestEferValue;
+        if ((guestEferValue & ~SupportedEferBits) ||
+                guestEfer.lma != guestIa32e ||
                 (guestCr0Bits.pg && guestEfer.lme != guestIa32e)) {
             return failEntry(VmxExitReason::VmEntryInvalidGuestState);
         }
     }
 
     uint64_t guestCsAccessRights = 0;
+    uint64_t guestCsSelector = 0;
     if (!readRequired(vmcs, VmcsField::GuestCsAccessRights,
-                guestCsAccessRights)) {
+                guestCsAccessRights) ||
+            !readRequired(vmcs, VmcsField::GuestCsSelector,
+                guestCsSelector)) {
         return failEntry(VmxExitReason::VmEntryInvalidGuestState);
     }
     if (guestIa32e && bits(guestCsAccessRights, 13) &&
@@ -761,29 +877,28 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
             return failEntry(VmxExitReason::VmEntryInvalidGuestState);
         }
 
-        SegAttr attr = vmcsAccessRightsToSegAttr(attrValue);
-        if ((segment.index == segment_idx::Cs ||
-             segment.index == segment_idx::Tr) && attr.unusable) {
+        if (!validGuestSegment(segment.index, bits(selector, 15, 0), base,
+                    bits(limit, 31, 0), bits(attrValue, 31, 0), guestIa32e,
+                    bits(guestCsSelector, 1, 0))) {
             return failEntry(VmxExitReason::VmEntryInvalidGuestState);
         }
-        const bool alwaysCanonical =
-            segment.index == segment_idx::Tr ||
-            segment.index == segment_idx::Fs ||
-            segment.index == segment_idx::Gs;
-        const bool usableLdtr =
-            segment.index == segment_idx::Tsl && !attr.unusable;
-        if ((alwaysCanonical || usableLdtr) && !canonicalAddress(base)) {
-            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
-        }
-        const bool upper32MustBeZero =
-            segment.index == segment_idx::Cs ||
-            ((!attr.unusable) &&
-             (segment.index == segment_idx::Ss ||
-              segment.index == segment_idx::Ds ||
-              segment.index == segment_idx::Es));
-        if (upper32MustBeZero && bits(base, 63, 32) != 0) {
-            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
-        }
+    }
+
+    const uint64_t guestGdtrBase =
+        readOrZero(vmcs, VmcsField::GuestGdtrBase);
+    const uint64_t guestIdtrBase =
+        readOrZero(vmcs, VmcsField::GuestIdtrBase);
+    const uint64_t guestGdtrLimit =
+        readOrZero(vmcs, VmcsField::GuestGdtrLimit);
+    const uint64_t guestIdtrLimit =
+        readOrZero(vmcs, VmcsField::GuestIdtrLimit);
+    if ((guestIa32e && (!canonicalAddress(guestGdtrBase) ||
+                       !canonicalAddress(guestIdtrBase))) ||
+            (!guestIa32e && (bits(guestGdtrBase, 63, 32) != 0 ||
+                             bits(guestIdtrBase, 63, 32) != 0)) ||
+            bits(guestGdtrLimit, 31, 16) != 0 ||
+            bits(guestIdtrLimit, 31, 16) != 0) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
     }
 
     return {};
@@ -812,9 +927,12 @@ VmxState::loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const
     }
     tc->setMiscRegNoEffect(misc_reg::Efer, guestEfer);
     tc->setMiscReg(misc_reg::Cr4, guestCr4);
-    tc->setMiscReg(misc_reg::Cr0, guestCr0);
+    tc->setMiscReg(misc_reg::Cr0, vmx::mergeLoadedCr0(
+                tc->readMiscRegNoEffect(misc_reg::Cr0), guestCr0));
     tc->setMiscReg(misc_reg::Cr3, guestCr3);
-    tc->setMiscReg(misc_reg::Dr7, readOrZero(vmcs, VmcsGuestDr7));
+    // Load-debug-controls is not advertised. Intel specifies the reset DR7
+    // value when that entry control is clear.
+    tc->setMiscReg(misc_reg::Dr7, 0x400);
 
     for (const auto &segment : GuestSegments) {
         tc->setMiscReg(misc_reg::segSel(segment.index),
@@ -848,7 +966,7 @@ VmxState::loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const
     tc->setMiscReg(misc_reg::M5Reg, 0);
 
     guestRip = readOrZero(vmcs, VmcsGuestRip) +
-        tc->readMiscRegNoEffect(misc_reg::CsBase);
+        tc->readMiscRegNoEffect(misc_reg::CsEffBase);
     tc->getMMUPtr()->flushAll();
     DPRINTF(VMX, "VM-entry loaded guest state: RIP %#x RSP %#x "
             "CR0 %#x CR3 %#x CR4 %#x RFLAGS %#x\n",
@@ -865,8 +983,10 @@ VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs) const
             tc->readMiscRegNoEffect(misc_reg::Cr3));
     vmcs.writeUnchecked(VmcsGuestCr4,
             tc->readMiscRegNoEffect(misc_reg::Cr4));
-    vmcs.writeUnchecked(VmcsGuestDr7,
-            tc->readMiscRegNoEffect(misc_reg::Dr7));
+    if (readOrZero(vmcs, VmcsVmExitControls) & VmExitSaveDebugControls) {
+        vmcs.writeUnchecked(VmcsGuestDr7,
+                tc->readMiscRegNoEffect(misc_reg::Dr7));
+    }
     vmcs.writeUnchecked(VmcsGuestRsp, tc->getReg(int_reg::Rsp));
     vmcs.writeUnchecked(VmcsGuestRip, currentRip(tc));
     vmcs.writeUnchecked(VmcsGuestRflags, getRFlags(tc));
@@ -934,7 +1054,8 @@ VmxState::loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const
     }
     tc->setMiscRegNoEffect(misc_reg::Efer, hostEfer);
     tc->setMiscReg(misc_reg::Cr4, hostCr4);
-    tc->setMiscReg(misc_reg::Cr0, hostCr0);
+    tc->setMiscReg(misc_reg::Cr0, vmx::mergeLoadedCr0(
+                tc->readMiscRegNoEffect(misc_reg::Cr0), hostCr0));
     tc->setMiscReg(misc_reg::Cr3, hostCr3);
     tc->setMiscReg(misc_reg::Dr7, 0x400);
 
@@ -1004,12 +1125,10 @@ VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
         toInt(reason) | VmExitReasonVmEntryFailure;
     vmcs.writeUnchecked(VmcsVmExitReason, encodedReason);
     vmcs.writeUnchecked(VmcsExitQualification, 0);
-    vmcs.writeUnchecked(VmcsVmExitInstructionLen, 0);
-    vmcs.writeUnchecked(VmcsVmxInstructionInfo, 0);
-    vmcs.writeUnchecked(VmcsVmExitInterruptionInfo, 0);
-    vmcs.writeUnchecked(VmcsVmExitInterruptionErrorCode, 0);
-    vmcs.writeUnchecked(VmcsGuestLinearAddress, 0);
-    vmcs.writeUnchecked(VmcsGuestPhysicalAddress, 0);
+    // SDM 29.8 updates only the exit reason and qualification for an
+    // invalid-guest-state VM-entry failure. Other VM-exit information fields
+    // retain their previous values; clearing them here loses architecturally
+    // visible diagnostic state.
 
     Addr hostRip = 0;
     panic_if(!loadHostState(tc, vmcs, hostRip),
@@ -1061,6 +1180,9 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
             DPRINTF(VMX, "VM-entry validation reached guest-state "
                     "failure class: reason %u\n",
                     toInt(validation.exitReason));
+            // A late VM-entry failure is delivered through the host-state
+            // path like a VM exit, but the VMLAUNCH operation sets launch
+            // state only after guest-state and MSR loading succeed.
             return failVmEntry(tc, *vmcs, validation.exitReason);
         }
 
@@ -1415,10 +1537,68 @@ VmxState::controlRegisterAccessCausesExit(uint8_t cr, VmxCrAccessType type,
                 guestHostMask);
         vmcs->read(cr == 0 ? VmcsCr0ReadShadow : VmcsCr4ReadShadow,
                 readShadow);
+        if (type == VmxCrAccessType::Clts) {
+            return vmx::cltsCausesExit(guestHostMask, readShadow);
+        }
+        if (type == VmxCrAccessType::Lmsw) {
+            return vmx::lmswCausesExit(guestHostMask, readShadow, value);
+        }
         return ((value ^ readShadow) & guestHostMask) != 0;
     }
 
     return false;
+}
+
+uint64_t
+VmxState::controlRegisterReadValue(uint8_t cr, uint64_t liveValue) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs || (cr != 0 && cr != 4)) {
+        return liveValue;
+    }
+
+    uint64_t guestHostMask = 0;
+    uint64_t readShadow = 0;
+    vmcs->read(cr == 0 ? VmcsCr0GuestHostMask : VmcsCr4GuestHostMask,
+            guestHostMask);
+    vmcs->read(cr == 0 ? VmcsCr0ReadShadow : VmcsCr4ReadShadow,
+            readShadow);
+    return (liveValue & ~guestHostMask) | (readShadow & guestHostMask);
+}
+
+uint64_t
+VmxState::controlRegisterWriteValue(uint8_t cr, uint64_t requestedValue,
+        uint64_t liveValue) const
+{
+    const Vmcs *vmcs = currentVmcs();
+    if (!vmxActive || !inVmxNonRoot || !vmcs || (cr != 0 && cr != 4)) {
+        return requestedValue;
+    }
+
+    uint64_t guestHostMask = 0;
+    vmcs->read(cr == 0 ? VmcsCr0GuestHostMask : VmcsCr4GuestHostMask,
+            guestHostMask);
+    // Masked bits belong to the host and are never changed by a non-exiting
+    // guest write. Unmasked bits receive the guest's requested value.
+    return (liveValue & guestHostMask) |
+        (requestedValue & ~guestHostMask);
+}
+
+bool
+VmxState::controlRegisterWriteAllowed(ThreadContext *tc, uint8_t cr,
+        uint64_t value) const
+{
+    if (!vmxActive || (cr != 0 && cr != 4)) {
+        return true;
+    }
+
+    const auto *isa = static_cast<const ISA *>(tc->getIsaPtr());
+    const RegIndex fixed0Reg = cr == 0 ? misc_reg::VmxCr0Fixed0 :
+        misc_reg::VmxCr4Fixed0;
+    const RegIndex fixed1Reg = cr == 0 ? misc_reg::VmxCr0Fixed1 :
+        misc_reg::VmxCr4Fixed1;
+    return vmx::fixedBitsAllowed(value, isa->readMiscRegNoEffect(fixed0Reg),
+            isa->readMiscRegNoEffect(fixed1Reg));
 }
 
 Fault
@@ -1472,7 +1652,8 @@ VmxState::currentVmcs() const
 }
 
 VmxResult
-VmxState::vmxon(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
+VmxState::vmxon(ExecContext *xc, Addr operandEA,
+        Request::Flags operandFlags, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
@@ -1499,7 +1680,8 @@ VmxState::vmxon(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
                     0));
     }
 
-    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
+    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
+            sizeof(regionPtr));
     if (fault != NoFault) {
         return VmxResult::propagateFault(fault);
     }
@@ -1532,6 +1714,9 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
                     0));
     }
 
+    for (auto &entry : vmcsRegions) {
+        entry.second.setActive(false);
+    }
     vmxActive = false;
     inVmxNonRoot = false;
     vmxonRegion = 0;
@@ -1541,7 +1726,8 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
 }
 
 VmxResult
-VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
+VmxState::vmclear(ExecContext *xc, Addr operandEA,
+        Request::Flags operandFlags, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
@@ -1558,7 +1744,8 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
                     0));
     }
 
-    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
+    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
+            sizeof(regionPtr));
 
     if (fault != NoFault) {
         return VmxResult::propagateFault(fault);
@@ -1573,11 +1760,6 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
         return vmFailIfCurrent(current,
                 VmxInstructionError::VmclearWithVmxonPointer);
     }
-    if (!validateRegion(tc, regionPtr)) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmclearInvalidPhysicalAddress);
-    }
-
     if (currentVmcsPtr == regionPtr) {
         currentVmcsPtr = InvalidVmcsPointer;
     }
@@ -1593,7 +1775,8 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
 }
 
 VmxResult
-VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
+VmxState::vmptrld(ExecContext *xc, Addr operandEA,
+        Request::Flags operandFlags, uint8_t instructionSize)
 {
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
@@ -1610,7 +1793,8 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
                     0));
     }
 
-    auto fault = readOperand(xc, operandEA, regionPtr, sizeof(regionPtr));
+    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
+            sizeof(regionPtr));
 
     if (fault != NoFault) {
         return VmxResult::propagateFault(fault);
@@ -1630,14 +1814,17 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
                 VmxInstructionError::VmptrldIncorrectVmcsRevision);
     }
 
-    vmcsRegions.try_emplace(regionPtr, regionPtr, vmcsRevisionId(tc));
+    auto it = vmcsRegions.try_emplace(
+            regionPtr, regionPtr, vmcsRevisionId(tc)).first;
+    it->second.setActive(true);
     currentVmcsPtr = regionPtr;
     DPRINTF(VMX, "VMPTRLD current VMCS %#x\n", currentVmcsPtr);
     return VmxResult::success();
 }
 
 VmxResult
-VmxState::vmptrst(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
+VmxState::vmptrst(ExecContext *xc, Addr operandEA,
+        Request::Flags operandFlags, uint8_t instructionSize)
 {
     uint64_t regionPtr = currentVmcsPtr;
     const std::vector<bool> byteEnable(sizeof(regionPtr), true);
@@ -1655,9 +1842,14 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA, uint8_t instructionSize)
                     0));
     }
 
-    auto fault = xc->writeMem(
+    auto fault = vmxMemoryOperandFault(
+            tc, operandEA, sizeof(regionPtr), operandFlags);
+    if (fault != NoFault) {
+        return VmxResult::propagateFault(fault);
+    }
+    fault = xc->writeMem(
             reinterpret_cast<uint8_t *>(&regionPtr), sizeof(regionPtr),
-            operandEA, Request::Flags(0), nullptr, byteEnable);
+            operandEA, operandFlags, nullptr, byteEnable);
     if (fault != NoFault) {
         return VmxResult::propagateFault(fault);
     }
@@ -1743,8 +1935,7 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
 }
 
 VmxResult
-VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
-        uint64_t value, uint8_t instructionSize)
+VmxState::vmwritePrecheck(ExecContext *xc, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
     auto *tc = xc->tcBase();
@@ -1763,6 +1954,20 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
     if (!vmcs) {
         return VmxResult::failInvalid();
     }
+    return VmxResult::success();
+}
+
+VmxResult
+VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
+        uint64_t value, uint8_t instructionSize)
+{
+    VmxResult precheck = vmwritePrecheck(xc, instructionSize);
+    if (!precheck.succeeded() || precheck.redirectsNextPc) {
+        return precheck;
+    }
+
+    Vmcs *vmcs = currentVmcs();
+    panic_if(!vmcs, "Successful VMWRITE precheck requires a current VMCS");
     Vmcs::FieldEncoding encoding;
     if (!Vmcs::decodeEncoding(rawEncoding, encoding)) {
         return vmFailValid(vmcs,
@@ -1830,8 +2035,26 @@ VmxState::unserialize(CheckpointIn &cp)
                 cp, "vmcsRegion" + std::to_string(index));
         Vmcs vmcs;
         vmcs.unserialize(cp);
-        vmcsRegions.emplace(vmcs.pointer(), std::move(vmcs));
+        const auto [it, inserted] =
+            vmcsRegions.emplace(vmcs.pointer(), std::move(vmcs));
+        panic_if(!inserted,
+                "Malformed VMX checkpoint: duplicate VMCS pointer %#x",
+                it->first);
     }
+
+    panic_if(inVmxNonRoot && !vmxActive,
+            "Malformed VMX checkpoint: non-root state without VMX operation");
+    panic_if(vmxActive &&
+            !validAlignedPhysicalAddress(vmxonRegion, PageBytes),
+            "Malformed VMX checkpoint: invalid VMXON pointer %#x",
+            vmxonRegion);
+    Vmcs *current = currentVmcs();
+    panic_if(currentVmcsPtr != InvalidVmcsPointer &&
+            (!vmxActive || !current || !current->active()),
+            "Malformed VMX checkpoint: invalid current VMCS pointer %#x",
+            currentVmcsPtr);
+    panic_if(inVmxNonRoot && !current,
+            "Malformed VMX checkpoint: non-root state without current VMCS");
 }
 
 } // namespace X86ISA

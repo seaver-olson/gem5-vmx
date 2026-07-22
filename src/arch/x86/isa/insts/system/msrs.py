@@ -68,7 +68,7 @@ def macroop RDTSCP
 {
     .serialize_before
     mfence
-    rdtsc t1
+    rdtscp t1
     mov rax, rax, t1, dataSize=4
     srli rdx, t1, 32, dataSize=8
     rdval rcx, ctrlRegIdx("misc_reg::TscAux"), dataSize=4

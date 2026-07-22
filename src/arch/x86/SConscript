@@ -69,6 +69,9 @@ Source('tlb.cc', tags=['x86 isa'])
 Source('types.cc', tags=['x86 isa'])
 Source('utility.cc', tags=['x86 isa'])
 
+GTest('vmcs.test', 'vmcs.test.cc')
+GTest('vmx_utils.test', 'vmx_utils.test.cc', '../../base/debug.cc')
+
 SimObject(
     'X86SeWorkload.py',
     sim_objects=['X86EmuLinux'],

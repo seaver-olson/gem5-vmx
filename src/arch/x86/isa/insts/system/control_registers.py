@@ -28,7 +28,7 @@ microcode = """
 def macroop CLTS {
     rdcr t1, cr0, dataSize=8
     andi t1, t1, 0xF7, dataSize=1
-    wrcr cr0, t1, dataSize=8
+    wrcrclts cr0, t1, dataSize=8
 };
 
 def macroop LMSW_R {
@@ -39,7 +39,7 @@ def macroop LMSW_R {
     and t1, t1, t2, dataSize=8
     andi t2, reg, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcr cr0, t1, dataSize=8
+    wrcrlmsw cr0, t1, t2, dataSize=8
 };
 
 def macroop LMSW_M {
@@ -51,7 +51,7 @@ def macroop LMSW_M {
     and t1, t1, t2, dataSize=8
     andi t2, t3, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcr cr0, t1, dataSize=8
+    wrcrlmsw cr0, t1, t2, dataSize=8
 };
 
 def macroop LMSW_P {
@@ -64,7 +64,7 @@ def macroop LMSW_P {
     and t1, t1, t2, dataSize=8
     andi t2, t3, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcr cr0, t1, dataSize=8
+    wrcrlmsw cr0, t1, t2, dataSize=8
 };
 
 def macroop SMSW_R {

@@ -419,6 +419,7 @@ class Vmcs
   private:
     Addr regionPointer = 0;
     VmcsHeader header = {};
+    bool activeState = false;
     LaunchState launchState = LaunchState::Clear;
     FieldMap fields;
 
@@ -455,17 +456,31 @@ class Vmcs
             VMCS_FIELD(IoBitmapA, VmExecutionControl, true),
             VMCS_FIELD(IoBitmapB, VmExecutionControl, true),
             VMCS_FIELD(MsrBitmap, VmExecutionControl, true),
+            VMCS_FIELD(VmExitMsrStoreAddress, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrLoadAddress, VmExitControl, true),
+            VMCS_FIELD(VmEntryMsrLoadAddress, VmEntryControl, true),
 
             VMCS_FIELD(GuestPhysicalAddress, VmExitInformation, false),
 
             VMCS_FIELD(GuestIa32Efer, GuestState, true),
+            VMCS_FIELD(VmcsLinkPointer, GuestState, true),
 
             VMCS_FIELD(HostIa32Efer, HostState, true),
 
             VMCS_FIELD(PinBasedVmExecControl, VmExecutionControl, true),
             VMCS_FIELD(CpuBasedVmExecControl, VmExecutionControl, true),
+            VMCS_FIELD(ExceptionBitmap, VmExecutionControl, true),
+            VMCS_FIELD(PageFaultErrorCodeMask, VmExecutionControl, true),
+            VMCS_FIELD(PageFaultErrorCodeMatch, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetCount, VmExecutionControl, true),
             VMCS_FIELD(VmExitControls, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrStoreCount, VmExitControl, true),
+            VMCS_FIELD(VmExitMsrLoadCount, VmExitControl, true),
             VMCS_FIELD(VmEntryControls, VmEntryControl, true),
+            VMCS_FIELD(VmEntryMsrLoadCount, VmEntryControl, true),
+            VMCS_FIELD(VmEntryIntrInfoField, VmEntryControl, true),
+            VMCS_FIELD(VmEntryExceptionErrorCode, VmEntryControl, true),
+            VMCS_FIELD(VmEntryInstructionLen, VmEntryControl, true),
 
             VMCS_FIELD(VmInstructionError, VmExitInformation, false),
             VMCS_FIELD(VmExitReason, VmExitInformation, false),
@@ -497,6 +512,15 @@ class Vmcs
             VMCS_FIELD(GuestSysenterCs, GuestState, true),
 
             VMCS_FIELD(HostIa32SysenterCs, HostState, true),
+
+            VMCS_FIELD(Cr0GuestHostMask, VmExecutionControl, true),
+            VMCS_FIELD(Cr4GuestHostMask, VmExecutionControl, true),
+            VMCS_FIELD(Cr0ReadShadow, VmExecutionControl, true),
+            VMCS_FIELD(Cr4ReadShadow, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue0, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue1, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue2, VmExecutionControl, true),
+            VMCS_FIELD(Cr3TargetValue3, VmExecutionControl, true),
 
             VMCS_FIELD(ExitQualification, VmExitInformation, false),
             VMCS_FIELD(GuestLinearAddress, VmExitInformation, false),
@@ -650,6 +674,18 @@ class Vmcs
     }
 
     bool
+    active() const
+    {
+        return activeState;
+    }
+
+    void
+    setActive(bool active)
+    {
+        activeState = active;
+    }
+
+    bool
     launched() const
     {
         return launchState == LaunchState::Launched;
@@ -666,16 +702,20 @@ class Vmcs
     {
         regionPointer = region_ptr;
         header.revisionId = revision_id;
-        clear();
+        activeState = false;
+        header.abortIndicator = 0;
+        launchState = LaunchState::Clear;
+        fields.clear();
+        fields.emplace(VmInstructionError, 0);
     }
 
     void
     clear()
     {
-        header.abortIndicator = 0;
+        // VMCLEAR changes lifecycle state and makes implementation-specific
+        // VMCS data coherent in memory. It does not zero VMCS components.
+        activeState = false;
         launchState = LaunchState::Clear;
-        fields.clear();
-        fields.emplace(VmInstructionError, 0);
     }
 
     static uint64_t
@@ -858,6 +898,7 @@ class Vmcs
         SERIALIZE_SCALAR(regionPointer);
         SERIALIZE_SCALAR(header.revisionId);
         SERIALIZE_SCALAR(header.abortIndicator);
+        SERIALIZE_SCALAR(activeState);
         SERIALIZE_SCALAR(launch_state);
         SERIALIZE_CONTAINER(encodings);
         SERIALIZE_CONTAINER(values);
@@ -873,6 +914,9 @@ class Vmcs
         UNSERIALIZE_SCALAR(regionPointer);
         UNSERIALIZE_SCALAR(header.revisionId);
         UNSERIALIZE_SCALAR(header.abortIndicator);
+        if (!UNSERIALIZE_OPT_SCALAR(activeState)) {
+            activeState = false;
+        }
         UNSERIALIZE_SCALAR(launch_state);
         UNSERIALIZE_CONTAINER(encodings);
         UNSERIALIZE_CONTAINER(values);

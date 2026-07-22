@@ -65,10 +65,22 @@
             0x01: decode MODRM_REG {
                 0x0: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
-                        0x1: VmxNoOperandInst::VMCALL();
-                        0x2: VmxNoOperandInst::VMLAUNCH();
-                        0x3: VmxNoOperandInst::VMRESUME();
-                        0x4: VmxNoOperandInst::VMXOFF();
+                        0x1: decode LEGACY_DECODEVAL {
+                            0x0: VmxNoOperandInst::VMCALL();
+                            default: Inst::UD2();
+                        }
+                        0x2: decode LEGACY_DECODEVAL {
+                            0x0: VmxNoOperandInst::VMLAUNCH();
+                            default: Inst::UD2();
+                        }
+                        0x3: decode LEGACY_DECODEVAL {
+                            0x0: VmxNoOperandInst::VMRESUME();
+                            default: Inst::UD2();
+                        }
+                        0x4: decode LEGACY_DECODEVAL {
+                            0x0: VmxNoOperandInst::VMXOFF();
+                            default: Inst::UD2();
+                        }
                         default: Inst::UD2();
                     }
                     default: Inst::SGDT(M);
@@ -96,7 +108,8 @@
                 0x2: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
                         0x0: xgetbv();
-                        0x1: xsetbv();
+                        0x1: VmxUnconditionalExitInst::XSETBV(
+                            {{VmxExitReason::Xsetbv}});
                     }
                     default: decode MODE_SUBMODE {
                         0x0: Cpl0Inst::LGDT(M);
@@ -188,7 +201,7 @@
             }
         }
         0x01: decode OPCODE_OP_BOTTOM3 {
-            0x0: invd(); // privileged
+            0x0: VmxUnconditionalExitInst::INVD({{VmxExitReason::Invd}});
             0x1: wbinvd(); // privileged
             0x2: Inst::UD2();
             0x3: Inst::UD2();
@@ -371,7 +384,7 @@
             }
             0x5: sysexit(); // privileged
             0x6: Inst::UD2();
-            0x7: getsec();
+            0x7: VmxUnconditionalExitInst::GETSEC({{VmxExitReason::Getsec}});
         }
         0x07: decode VEX_PRESENT {
             0x0: decode OPCODE_OP_BOTTOM3 {
@@ -842,7 +855,8 @@
                 0x7: decode MODRM_REG {
                     //Also CMPXCHG16B
                     0x1: CMPXCHG8B(Mdp);
-                    0x6: decode LEGACY_OP {
+                    0x6: decode LEGACY_DECODEVAL {
+                        // VMCLEAR requires exactly the 66H mandatory prefix.
                         0x1: decode MODRM_MOD {
                             0x0: decode MODE_SUBMODE {
                                 0x4: decode MODRM_RM {
@@ -854,41 +868,45 @@
                             0x3: UD2();
                             default: VmxMemInst::VMCLEAR_M_2(false);
                         }
-                        default: decode LEGACY_REP {
-                            0x1: decode MODRM_MOD {
-                                0x0: decode MODE_SUBMODE {
-                                    0x4: decode MODRM_RM {
-                                        0x5: VmxMemInst::VMXON_P_0(true);
-                                        default: VmxMemInst::VMXON_M_0(false);
-                                    }
-                                    default: VmxMemInst::VMXON_M_1(false);
+                        // VMXON requires exactly the F3H mandatory prefix.
+                        0x4: decode MODRM_MOD {
+                            0x0: decode MODE_SUBMODE {
+                                0x4: decode MODRM_RM {
+                                    0x5: VmxMemInst::VMXON_P_0(true);
+                                    default: VmxMemInst::VMXON_M_0(false);
                                 }
-                                0x3: UD2();
-                                default: VmxMemInst::VMXON_M_2(false);
+                                default: VmxMemInst::VMXON_M_1(false);
                             }
-                            0x0: decode MODRM_MOD {
-                                0x0: decode MODE_SUBMODE {
-                                    0x4: decode MODRM_RM {
-                                        0x5: VmxMemInst::VMPTRLD_P_0(true);
-                                        default: VmxMemInst::VMPTRLD_M0(false);
-                                    }
-                                    default: VmxMemInst::VMPTRLD_M_1(false);
-                                }
-                                0x3: UD2();
-                                default: VmxMemInst::VMPTRLD_M_2(false);
-                            }
+                            0x3: UD2();
+                            default: VmxMemInst::VMXON_M_2(false);
                         }
+                        // VMPTRLD has no mandatory prefix.
+                        0x0: decode MODRM_MOD {
+                            0x0: decode MODE_SUBMODE {
+                                0x4: decode MODRM_RM {
+                                    0x5: VmxMemInst::VMPTRLD_P_0(true);
+                                    default: VmxMemInst::VMPTRLD_M0(false);
+                                }
+                                default: VmxMemInst::VMPTRLD_M_1(false);
+                            }
+                            0x3: UD2();
+                            default: VmxMemInst::VMPTRLD_M_2(false);
+                        }
+                        default: UD2();
                     }
-                    0x7: decode MODRM_MOD {
-                        0x0: decode MODE_SUBMODE {
-                            0x4: decode MODRM_RM {
-                                0x5: VmxMemInst::VMPTRST_P_0(true);
-                                default: VmxMemInst::VMPTRST_M_0(false);
+                    0x7: decode LEGACY_DECODEVAL {
+                        0x0: decode MODRM_MOD {
+                            0x0: decode MODE_SUBMODE {
+                                0x4: decode MODRM_RM {
+                                    0x5: VmxMemInst::VMPTRST_P_0(true);
+                                    default: VmxMemInst::VMPTRST_M_0(false);
+                                }
+                                default: VmxMemInst::VMPTRST_M_1(false);
                             }
-                            default: VmxMemInst::VMPTRST_M_1(false);
+                            0x3: UD2();
+                            default: VmxMemInst::VMPTRST_M_2(false);
                         }
-                        0x3: UD2();
-                        default: VmxMemInst::VMPTRST_M_2(false);
+                        default: UD2();
                     }
                     default: UD2();
                 }
