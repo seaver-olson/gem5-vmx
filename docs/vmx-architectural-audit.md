@@ -1,24 +1,36 @@
 # VMX architectural audit
 
-## Scope, references, and conclusion
+## Scope, status, and conclusion
 
-This audit defines the supported architectural contract of `gem5-vmx`.  The
-primary architectural reference is the Intel 64 and IA-32 Architectures
+This audit was refreshed against `c9a1a2efcc` on 2026-07-26.  The only commit
+after the original VMX hardening change (`8f48cd2035`) deletes root-level
+workspace notes; it does not change VMX source, tests, or this audit.  The
+source review below therefore applies to the current branch, including the
+narrow repair recorded in the findings table.
+
+The primary architectural reference is the Intel 64 and IA-32 Architectures
 Software Developer's Manual, Volume 3C, June 2026, order number
-326019-092US.  Section numbers below refer to that edition.  The simulator
-integration reference is upstream gem5 v25.1's x86 ISA, decoder, fault,
-misc-register, MMU/TLB, CPU-switch, and serialization machinery.
+326019-092US.  Intel's current manual index still lists version 092.  Section
+numbers below refer to that edition.  The simulator-integration reference is
+this branch's x86 ISA, decoder, fault, misc-register, MMU/TLB, CPU-switch, and
+serialization machinery.
 
-The result is intentionally narrow.  The verified target is one logical
-processor running a controlled 64-bit host and 64-bit IA-32e guest without
+The intended contract is intentionally narrow: one logical processor running a
+controlled 64-bit host and 64-bit IA-32e guest without
 EPT, VPID, APIC virtualization, event injection, or MSR lists.  Within that
 target, VM entry changes the page-table root used by instruction and data
 translation, guest CR3 writes use the normal gem5 x86 CR3 path, and VM exit
 restores the host translation and execution state before the handler runs.
 Capabilities have been reduced to that implementation.  This is suitable for
-foundational single-vCPU VMX experiments covered by the regressions below; it
-is not a general virtualization platform or a model for interrupt-heavy,
-nested-OS, or multiprocessor VMX research.
+foundational single-vCPU VMX experiments after the recorded regressions are
+re-run; it is not a general virtualization platform or a model for
+interrupt-heavy, nested-OS, or multiprocessor VMX research.
+
+The prior integration test run remains useful evidence, but it is not evidence
+that the current checkout has been revalidated: the full-system resources
+needed to repeat it are not present in this workspace.  The **Recorded
+verification** section preserves the exact historical commands and results
+separately from this source audit.
 
 A repository-wide file and marker search was followed by detailed review of
 the VMX-modified paths and their callers.  The reviewed subsystems include:
@@ -39,12 +51,15 @@ the VMX-modified paths and their callers.  The reviewed subsystems include:
 - TODO/FIXME/XXX/HACK/workaround/stub/unsupported/panic/fatal/warn and direct
   architectural-state manipulation searches across the repository.
 
-## Supported feature matrix
+## How to read this audit
 
-"Implemented" below means implemented in the stated single-vCPU contract,
-not the complete Intel facility.  "Recognized and rejected" means entry
-requires zero, an enabling capability is absent, or access fails
-architecturally.  A typed enum or dormant helper is not considered support.
+"Implemented" means the code provides the stated behavior in the single-vCPU
+contract.  "Partially implemented" identifies an intentional boundary, an
+open validation gap, or incomplete runtime coverage.  "Recognized and
+rejected" means entry requires zero, an enabling capability is absent, or
+access fails architecturally.  A typed enum or dormant helper is not support.
+
+## Supported feature matrix
 
 | Feature | Audited status | Contract and regression evidence |
 |---|---|---|
@@ -58,7 +73,7 @@ architecturally.  A typed enum or dormant helper is not considered support.
 | VMCALL | Implemented for the narrow contract | Non-root execution exits with reason 18 and length 3; root execution reports the VM-instruction result. Transition test covers exit, saved RIP, and resume. |
 | VMX root / non-root operation | Partially implemented | Per-ISA state is integrated with ordinary instruction/fault paths and CPU switching. SMM dual-monitor, nested VMX, and multi-vCPU ownership are excluded. |
 | VMCS lifecycle | Partially implemented | Current, active, clear, and launched state are explicit and serialized. Ordinary/shadow headers are distinguished. Cross-logical-processor active ownership is not modeled. |
-| VM-entry validation | Implemented for accepted fields | Capability masks, counts, host/guest control state, selectors, bases, limits, access rights, RFLAGS, EFER, canonicality, activity, interruptibility zero, link pointer, CR3, and paging relationships are checked. Unsupported counts/event injection fail with error 7. |
+| VM-entry validation | Implemented; integration verification pending | Capability masks, counts, host/guest control state, selectors, bases, limits, access rights, RFLAGS, EFER, canonicality, activity, interruptibility zero, link pointer, CR3, paging relationships, and guest `IA32_SYSENTER_ESP/EIP` are checked. A focused transition case covers the new failure path, but cannot run without the full-system resources. Unsupported counts/event injection fail with error 7. |
 | VM-entry state loading | Implemented for verified 64-bit mode | Guest CR0/3/4, EFER, segments/caches, tables, SYSENTER, DR7 reset state, RIP/RSP/RFLAGS, decoder mode, and MMU context are installed through gem5 interfaces. Transition test proves execution at guest RIP/RSP and guest translations. |
 | VM exits | Partially implemented | The common path records supported metadata, saves guest state before replacement, loads coherent host state, leaves non-root mode, and redirects to host RIP. Advanced exit causes and abort handling remain limited. |
 | Guest-state save / host-state load | Implemented for accepted state | Includes CR0/3/4, DR7, segments, tables, SYSENTER, EFER when selected, RIP/RSP/RFLAGS, and mode/MMU updates. Transition test proves guest save and immediate host mapping restoration. |
@@ -86,8 +101,9 @@ architecturally.  A typed enum or dormant helper is not considered support.
 ## Capability contract
 
 Every allowed-one bit is treated as an implementation promise.  The smoke
-test reads this exact contract after a KVM-to-Atomic CPU switch, which also
-prevents physical-host capabilities from leaking into the simulated CPU.
+test recorded below reads this exact contract after a KVM-to-Atomic CPU switch,
+which also prevents physical-host capabilities from leaking into the simulated
+CPU.
 
 | Architectural interface | Reported value / rule |
 |---|---|
@@ -107,16 +123,15 @@ prevents physical-host capabilities from leaking into the simulated CPU.
 
 ## Findings and repairs
 
-The state column is either **Closed** with regression evidence or
-**Restricted** where the implementation now fails safely and the capability
-contract excludes the missing facility.
+The state column records repair and verification status, as well as behavior
+excluded by the capability contract.
 
 | ID | Classification / severity | Intel rule and gem5 mechanism | Defect found | Repair and proving test | State |
 |---|---|---|---|---|---|
 | A-01 | Critical architectural error | SDM 29.3.2, 30.3.1, 30.5.1; gem5 effective segment bases | RIP save/load used raw CS base, which is ignored for 64-bit code. | Use `CsEffBase`; transition test reaches exact guest RIP and verifies saved VMCALL RIP. | **Closed** |
 | A-02 | Critical architectural error | SDM 29.2.2, 29.3.1.1, 30.5.1; `ISA::setMiscReg(Cr3)` and MMU walker | CR3 checks ignored mode-dependent low bits and PCID consistency; no test proved the walker changed roots. | Add mode-aware CR3 validation, exclude PCIDE, write CR3 through the architectural interface, and flush the VPID-0 transition context. Unit tests cover encodings; transition maps one VA to three physical pages and proves all three. | **Closed** |
 | A-03 | Major correctness error | SDM 29.3.2.1 and 30.5.1 | Entry/exit overwrote CR0 bits that VMX does not load. | Merge only the Intel-loaded CR0 bits with live CR0 before the normal gem5 write. Unit tests protect the mask; transition exercises mask/shadow behavior. | **Closed** |
-| A-04 | Missing validation / major correctness | SDM 29.2-29.3 | Host selectors/SYSENTER, EFER relationships, canonical bases, guest segment types/DPL/limits/access rights, RFLAGS, and other accepted state were under-validated; DR7 was loaded without advertising load-debug-controls. | Add validation for the accepted 64-bit subset and load reset DR7=0x400 when the control is clear. Positive entry and malformed early/late entry cases run in the transition test. | **Closed for accepted subset** |
+| A-04 | Missing validation / narrow correctness gap | SDM 29.3.1.1 | Guest `IA32_SYSENTER_ESP/EIP` were loaded without the canonical-address checks required on Intel 64 processors. The SDM does not impose the `IA32_SYSENTER_CS` validation previously suspected, and host ESP/EIP checks were already present. DR7 reset behavior is implemented. | Validate both guest addresses before state loading and make `GUEST_SYSENTER_EIP=1<<48` take the existing late VM-entry-invalid-guest-state path. The focused transition case checks preserved exit information, clear launch state, and restored host mapping. | **Fixed in code; integration pending** |
 | A-05 | Missing validation | SDM 25.6, 29.2.1, 29.3.1 | Consumed foundational fields were absent from VMCS metadata, causing architectural VMWRITE failures followed by internal default-zero reads. | Add all consumed foundational fields, widths, high access, and read-only metadata; require unsupported counts/injection to be zero; correct VMCS enumeration. Nine VMCS unit cases plus integration entry cover this. | **Closed** |
 | A-06 | Missing interception / major correctness | SDM 30.2.1, 30.4 and Table 30-1; gem5 common fault path | Exception fields were unreachable; direct #PF treatment and software-exception lengths/debug qualification were incomplete. | Route supported synchronous exceptions through the shared VMX fault path; direct #PF writes the faulting linear address to qualification and does not update CR2; add software length and #DB qualification. Transition proves #PF metadata/CR2. | **Closed for synchronous tested subset** |
 | A-07 | Incomplete feature / capability mismatch | SDM Appendix A and 28.1 | Broad pin, I/O, bitmap, HLT, INVLPG, MOV-DR, and CR8 controls were advertised without complete end-to-end behavior or exit metadata. | Reduce allowed controls to CR3-load exiting, required 64-bit modes, and optional EFER save/load; unmap optional capability MSRs. Smoke asserts exact masks after CPU switching. | **Restricted safely** |
@@ -171,10 +186,14 @@ direct #PF all prove the host CR3 and host mapping at the first C handler code.
 This assessment does not extend to VMX-abort/machine-check/shutdown paths or
 multi-vCPU ownership, which are not modeled.
 
-## Verification record
+## Recorded verification
 
-The following commands were run from the repository root.  All listed tests
-passed:
+The following commands and results were recorded with the original VMX
+hardening change (`8f48cd2035`, 2026-07-22).  The full recorded suite has not
+been re-run during this refresh because this checkout lacks the required
+full-system resources.  The VMX object and standalone unit tests were built
+and run after A-04 was repaired, but they do not replace the full suite.  The
+recorded suite should be re-run after any behavior change:
 
 ```sh
 CC=gcc-14 CXX=g++-14 scons build/X86/gem5.opt \
@@ -195,16 +214,16 @@ python3 util/style.py src/arch/x86/vmcs.test.cc \
     src/arch/x86/vmx_utils.hh src/arch/x86/vmx_utils.test.cc
 ```
 
-The VMCS unit binary ran 9 tests and the validation/helper binary ran 7.  The
-transition integration ran 10 PASS markers (nine architectural groups plus
-completion).  Normal smoke, active-root checkpoint creation, and restore each
-passed every instruction/state check.  The optimized and fast X86 gem5
-targets built successfully.  The build emitted existing/environmental
-warnings: GCC 14.3 is just beyond gem5's declared 14.2 support ceiling, and
-the cached configuration did not enable optional Capstone, PNG, or HDF5
-support.  Linux 5.4 module preparation also warns that stack validation is
-disabled; the modules are deliberately built with the frame-pointer unwinder.
-No VMX test failed in the final run.
+The recorded VMCS unit binary ran 9 tests and the validation/helper binary ran
+7.  The transition integration reported 10 PASS markers (nine architectural
+groups plus completion).  Normal smoke, active-root checkpoint creation, and
+restore each passed every instruction/state check.  The optimized and fast X86
+gem5 targets built successfully.  The recorded build emitted existing or
+environmental warnings: GCC 14.3 was just beyond gem5's declared 14.2 support
+ceiling, and the cached configuration did not enable optional Capstone, PNG,
+or HDF5 support.  Linux 5.4 module preparation also warned that stack
+validation was disabled; the modules were deliberately built with the
+frame-pointer unwinder.  No VMX test failed in that recorded run.
 
 Real-hardware differential tests were not run because a dedicated Intel bare
 metal host was not available.  Non-root checkpoint/restore, compatibility

@@ -848,6 +848,13 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
         }
     }
 
+    // SDM Vol. 3C, 29.3.1.1 requires these guest-state fields to be
+    // canonical on processors that support Intel 64 architecture.
+    if (!canonicalAddress(readOrZero(vmcs, VmcsGuestIa32SysenterEsp)) ||
+            !canonicalAddress(readOrZero(vmcs, VmcsGuestIa32SysenterEip))) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+
     uint64_t guestCsAccessRights = 0;
     uint64_t guestCsSelector = 0;
     if (!readRequired(vmcs, VmcsField::GuestCsAccessRights,

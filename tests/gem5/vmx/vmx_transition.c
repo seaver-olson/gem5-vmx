@@ -970,9 +970,10 @@ vmexit_pf_handler:
 				IA32_VMX_TRUE_EXIT_CTLS)) != VMX_SUCCESS ||
 	    vmwrite_checked(VM_ENTRY_CONTROLS,
 			adjust_controls(VM_ENTRY_IA32E_MODE |
-				VM_ENTRY_LOAD_IA32_EFER,
-				IA32_VMX_TRUE_ENTRY_CTLS)) != VMX_SUCCESS ||
-	    vmwrite_checked(GUEST_RFLAGS, 0) != VMX_SUCCESS ||
+					VM_ENTRY_LOAD_IA32_EFER,
+					IA32_VMX_TRUE_ENTRY_CTLS)) != VMX_SUCCESS ||
+	    vmwrite_checked(GUEST_RFLAGS, X86_EFLAGS_FIXED) != VMX_SUCCESS ||
+	    vmwrite_checked(GUEST_SYSENTER_EIP, 1ULL << 48) != VMX_SUCCESS ||
 	    vmwrite_checked(HOST_RIP,
 			(unsigned long)&&vmentry_failure_handler) != VMX_SUCCESS) {
 		ret = -EIO;
@@ -1050,7 +1051,7 @@ vmentry_failure_handler:
 		"CR2 preservation\n");
 	pr_info("vmx_transition: PASS: VMCALL/VMRESUME/RSP/host restoration\n");
 	pr_info("vmx_transition: PASS: VMCLEAR launch lifecycle and VMfail flags\n");
-	pr_info("vmx_transition: PASS: late VM-entry failure preserves "
+	pr_info("vmx_transition: PASS: late VM-entry SYSENTER validation preserves "
 		"exit fields and clear launch state\n");
 	pr_info("vmx_transition: PASS: early VM-entry failure is atomic\n");
 	pr_info("vmx_transition: PASS: COMPLETE\n");
