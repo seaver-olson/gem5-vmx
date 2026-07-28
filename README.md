@@ -96,10 +96,27 @@ build/X86/gem5.opt --debug-flags=VMX --debug-file=vmx.trace \
 
 ## Related x86 instruction support
 
-`SGDT`, `SIDT`, `SLDT`, and `STR` now support their required register, memory,
-and RIP-relative forms. A loadable VMM can therefore collect the descriptor
-table and task-state values needed to populate VMCS host state without relying
-on gem5-specific shortcuts.
+The VMX work also fills in four baseline x86 instructions that a normal VMM
+uses while collecting host state. They are not VMX controls themselves, but a
+VMM needs their results to populate the descriptor-table and task-state parts
+of a VMCS without relying on gem5-specific shortcuts.
+
+- `SGDT` stores the current global-descriptor-table limit and base to memory.
+- `SIDT` does the same for the interrupt-descriptor table.
+- `SLDT` returns the local-descriptor-table selector to a general-purpose
+  register or memory.
+- `STR` returns the current task-register selector to a general-purpose
+  register or memory.
+
+Before this work, the decoder selected legacy helper stubs for these store
+forms, but the corresponding executable microcode was absent. The decoder now
+selects concrete instruction macro-operations. `SGDT` and `SIDT` read the
+architectural limit and base and store the packed pseudo-descriptor; `SLDT` and
+`STR` read the architectural selector and store or return its 16-bit value.
+Each instruction has ordinary memory and RIP-relative variants, and `SLDT` and
+`STR` also have register forms. The micro-operations are serializing and use
+gem5's normal address-generation and segment handling, so VMM code can use
+ordinary x86 instruction encodings rather than simulator-only access paths.
 
 ## Building
 
