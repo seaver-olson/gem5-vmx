@@ -39,21 +39,25 @@ clear and launched state, VM-instruction errors, entry and exit information,
 and supported control and state fields. VMX state is also included in gem5
 checkpoint serialization.
 
-The x86 capability MSRs describe the functionality implemented by this branch:
+The x86 capability MSRs are intentionally conservative: an allowed control bit
+is a promise that the corresponding behavior is implemented and tested. This
+branch advertises:
 
 - VMCS revision, 4 KiB region size, write-back memory type, and true controls
-- CR0 and CR4 fixed-bit requirements for paged protected-mode VMX operation
-- pin-based external-interrupt and NMI exiting
-- HLT and INVLPG exiting
-- CR3 and CR8 load/store exiting
-- debug-register access exiting
-- unconditional I/O exiting and I/O bitmaps
-- MSR bitmaps
+- CR0 and CR4 fixed-bit requirements for the supported paged, 64-bit VMX mode
+- CR3-load exiting as the only optional primary processor control; CR3 targets
+  are unavailable
 - 64-bit host operation and guest/host `IA32_EFER` transitions
 
-Unsupported secondary controls, EPT, VPID, VMFUNC, and related capability MSRs
-are reported as unavailable rather than being advertised without an
-implementation.
+All pin-based controls are required to be zero. The model therefore does not
+advertise external-interrupt or NMI exiting. It also does not advertise HLT,
+INVLPG, MOV-DR, RDTSC, or CR8 access exiting; unconditional-I/O exiting or I/O
+bitmaps; or MSR bitmaps. Some of those paths have internal hooks for future
+work, but they are not part of the supported VMX interface.
+
+Secondary controls, EPT, VPID, VMFUNC, and related capability MSRs are also
+unavailable. The complete capability and verification matrix is in
+[the VMX architectural audit](docs/vmx-architectural-audit.md).
 
 ## VM entry and exit
 
@@ -74,16 +78,13 @@ instruction-pointer, debug, and EFER state is loaded from the host-state area.
 The host restore no longer depends on a simulator-only snapshot taken before
 VM entry.
 
-Implemented exit sources include:
-
-- `VMCALL` and `HLT`
-- external interrupts and NMIs when their controls request exiting
-- CR0, CR3, CR4, and CR8 accesses covered by the implemented controls
-- debug-register moves
-- `INVLPG`
-- I/O instructions, including unconditional and bitmap-controlled exits
-- `RDMSR` and `WRMSR`, including bitmap-controlled exits
-- VMX instructions executed in non-root operation
+The supported exit contract includes `VMCALL`, CR0/CR4 access exits governed by
+guest/host masks, configured CR3-load exits, exception-bitmap exits, and
+unconditional non-root exits for `CPUID` and VMX instructions. `RDMSR` and
+`WRMSR` have a partial unconditional-exit path in non-root operation, but MSR
+bitmap filtering and an end-to-end MSR-exit regression are unavailable. The
+remaining interception hooks are deliberately not advertised as supported
+controls; see the architectural audit for their status and test coverage.
 
 The `VMX` debug flag prints concise traces of VMXON, VMCS selection, entry
 validation, guest and host state transitions, exit reasons, and VMXOFF:
@@ -120,7 +121,7 @@ The end-to-end lifecycle exercised during development is:
 
 ```text
 VMXON -> VMCLEAR -> VMPTRLD -> VMWRITE/VMREAD -> VMLAUNCH
-      -> VMCALL exit (18) -> VMRESUME -> HLT exit (12) -> VMXOFF
+      -> VMCALL exit (18) -> VMRESUME -> VMCALL exit (18) -> VMXOFF
 ```
 
 This sequence has been validated with a Linux 5.4.49 external module in the
@@ -134,6 +135,9 @@ The following facilities are not implemented and are not advertised:
 
 - Extended Page Tables (EPT)
 - Virtual Processor Identifiers (VPID)
+- external-interrupt, NMI, and interrupt-window exiting
+- HLT, INVLPG, MOV-DR, RDTSC, and CR8 access exiting
+- unconditional-I/O exiting, I/O bitmaps, and MSR bitmaps
 - unrestricted guests and real-mode guests
 - APIC virtualization, virtual interrupts, and posted interrupts
 - VM-entry event injection
