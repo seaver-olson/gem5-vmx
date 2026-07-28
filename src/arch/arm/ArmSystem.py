@@ -91,6 +91,10 @@ class ArmExtension(ScopedEnum):
         "FEAT_BF16",  # Optional in Armv8.2
         "FEAT_AA32BF16",  # Optional in Armv8.2
         "FEAT_EBF16",  # Optional in Armv8.2
+        "FEAT_SHA3",
+        "FEAT_SHA512",
+        "FEAT_SM3",
+        "FEAT_SM4",
         # Armv8.3
         "FEAT_FCMA",
         "FEAT_JSCVT",
@@ -116,6 +120,7 @@ class ArmExtension(ScopedEnum):
         # Armv8.7
         "FEAT_HCX",
         "FEAT_XS",
+        "FEAT_WFxT",
         # Armv8.9
         "FEAT_SCTLR2",
         "FEAT_TCR2",
@@ -242,6 +247,7 @@ class ArmDefaultRelease(Armv8):
         # Armv8.7
         "FEAT_HCX",
         "FEAT_XS",
+        "FEAT_WFxT",
         # Armv9.0
         "FEAT_SVE2",
         # Armv9.2
@@ -285,6 +291,10 @@ class Armv82(Armv81):
         "FEAT_BF16",
         "FEAT_AA32BF16",
         "FEAT_EBF16",
+        "FEAT_SHA3",
+        "FEAT_SHA512",
+        "FEAT_SM3",
+        "FEAT_SM4",
     ]
 
 
@@ -324,6 +334,7 @@ class Armv87(Armv86):
     extensions = Armv86.extensions + [
         "FEAT_HCX",
         "FEAT_XS",
+        "FEAT_WFxT",
     ]
 
 

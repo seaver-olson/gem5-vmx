@@ -32,33 +32,22 @@ gem5 while still being functinal.
 """
 
 import argparse
-import importlib
+import sys
 
-from m5.util import fatal
-
-from gem5.components.boards.mem_mode import MemMode
 from gem5.components.boards.simple_board import SimpleBoard
 from gem5.components.cachehierarchies.classic.no_cache import NoCache
 from gem5.components.memory import SingleChannelDDR3_1600
-from gem5.components.processors.base_cpu_core import BaseCPUCore
-from gem5.components.processors.base_cpu_processor import BaseCPUProcessor
 from gem5.components.processors.cpu_types import (
-    CPUTypes,
     get_cpu_type_from_str,
     get_cpu_types_str_set,
 )
-from gem5.components.processors.simple_core import SimpleCore
 from gem5.components.processors.simple_processor import SimpleProcessor
-from gem5.isas import (
-    ISA,
-    get_isa_from_str,
-    get_isas_str_set,
-)
-from gem5.resources.resource import Resource
+from gem5.isas import ISA
+from gem5.resources.resource import obtain_resource
 from gem5.simulate.simulator import Simulator
 
 parser = argparse.ArgumentParser(
-    description="A gem5 script for running simple binaries in SE mode."
+    description="A gem5 script for testing RISC-V instructions"
 )
 
 parser.add_argument(
@@ -66,10 +55,30 @@ parser.add_argument(
 )
 
 parser.add_argument(
+    "cpu", type=str, choices=get_cpu_types_str_set(), help="The CPU type used."
+)
+
+parser.add_argument(
+    "--riscv-32bits",
+    action="store_true",
+    help="Use 32 bits core of Riscv CPU",
+)
+
+parser.add_argument(
+    "-r",
     "--resource-directory",
     type=str,
     required=False,
     help="The directory in which resources will be downloaded or exist.",
+)
+
+parser.add_argument(
+    "-n",
+    "--num-cores",
+    type=int,
+    default=1,
+    required=False,
+    help="The number of CPU cores to run.",
 )
 
 args = parser.parse_args()
@@ -79,10 +88,28 @@ cache_hierarchy = NoCache()
 memory = SingleChannelDDR3_1600()
 
 processor = SimpleProcessor(
-    cpu_type=CPUTypes.ATOMIC,
-    isa=ISA.X86,
-    num_cores=1,
+    cpu_type=get_cpu_type_from_str(args.cpu),
+    isa=ISA.RISCV,
+    num_cores=args.num_cores,
 )
+
+if args.riscv_32bits:
+    for simple_core in processor.cores:
+        for i in range(len(simple_core.core.isa)):
+            isa = simple_core.core.isa[i]
+            isa.riscv_profile = "RVI20U32"
+            isa.extra_extensions = [
+                "M",
+                "A",
+                "F",
+                "D",
+                "C",
+                "Zba",
+                "Zbb",
+                "Zbs",
+                "Zicsr",
+                "Zifencei",
+            ]
 
 motherboard = SimpleBoard(
     clk_freq="3GHz",
@@ -92,7 +119,9 @@ motherboard = SimpleBoard(
 )
 
 # Set the workload
-binary = Resource(args.resource, resource_directory=args.resource_directory)
+binary = obtain_resource(
+    args.resource, resource_directory=args.resource_directory
+)
 motherboard.set_se_binary_workload(binary)
 
 # Run the simulation
@@ -104,3 +133,5 @@ print(
         simulator.get_current_tick(), simulator.get_last_exit_event_cause()
     )
 )
+
+sys.exit(simulator.get_last_exit_event_code())

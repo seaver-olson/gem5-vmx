@@ -64,6 +64,19 @@ CacheController::CacheController(const Params &p)
     };
 }
 
+void
+CacheController::init()
+{
+    uint64_t max_nodes_system = std::max(
+        {m_ruby_system->MachineType_base_count(ruby::MachineType_Cache),
+         m_ruby_system->MachineType_base_count(ruby::MachineType_Memory),
+         m_ruby_system->MachineType_base_count(ruby::MachineType_MiscNode)});
+    panic_if(max_nodes_system > MAX_NODES,
+             "Increse number of supported MAX_NODES\n");
+
+    CHIGenericController::init();
+}
+
 Port &
 CacheController::getPort(const std::string &if_name, PortID idx)
 {
@@ -111,6 +124,8 @@ CacheController::pCreditGrant(const CHIResponseMsg *msg)
     phase.channel = ARM::CHI::CHANNEL_RSP;
     phase.rsp_opcode = ARM::CHI::RSP_OPCODE_PCRD_GRANT;
     phase.pcrd_type = 0; // TODO: set this one depending on allow retry
+    phase.c_busy = msg->m_cbusy;
+    phase.src_id = ruby_to_tlm::srcId(msg->m_responder);
 
     bw(payload, &phase);
 
@@ -187,16 +202,16 @@ CacheController::Transaction::handle(const CHIResponseMsg *msg)
     phase.rsp_opcode = opcode;
     phase.resp = ruby_to_tlm::rspResp(msg->m_type);
     phase.txn_id = msg->m_txnId;
+    phase.c_busy = msg->m_cbusy;
+    phase.src_id = ruby_to_tlm::srcId(msg->m_responder);
 
     controller->bw(payload, &phase);
-    return opcode != ARM::CHI::RSP_OPCODE_RETRY_ACK;
+    return true;
 }
 
 bool
 CacheController::ReadTransaction::handle(const CHIDataMsg *msg)
 {
-    dataMsgCnt++;
-
     for (auto byte = 0; byte < controller->cacheLineSize; byte++) {
         if (msg->m_bitMask.test(byte))
             payload->data[byte] = msg->m_dataBlk.getByte(byte);
@@ -208,14 +223,47 @@ CacheController::ReadTransaction::handle(const CHIDataMsg *msg)
     phase.resp = ruby_to_tlm::datResp(msg->m_type);
     phase.txn_id = msg->m_txnId;
     phase.data_id = dataId(msg->m_addr + msg->m_bitMask.firstBitSet(true));
+    phase.c_busy = msg->m_cbusy;
+    phase.src_id = ruby_to_tlm::srcId(msg->m_responder);
 
-    // This is a hack, we should fix it on the ruby side
+    dataMsgCnt++;
+    if (phase.dat_opcode == ARM::CHI::DAT_OPCODE_COMP_DATA) {
+        // A CompData counts as a (COMP) response
+        rspMsgCnt++;
+    }
+
     if (forward(msg)) {
         controller->bw(payload, &phase);
     }
 
-    if (dataMsgCnt == controller->dataMsgsPerLine) {
+    return handleCompletion();
+}
+
+bool
+CacheController::ReadTransaction::compRespToMakeReadUnique(
+    const ARM::CHI::Phase &resp)
+{
+    return orig.req_opcode == ARM::CHI::REQ_OPCODE_MAKE_READ_UNIQUE &&
+           resp.channel == ARM::CHI::CHANNEL_RSP &&
+           resp.rsp_opcode == ARM::CHI::RSP_OPCODE_COMP;
+}
+
+bool
+CacheController::ReadTransaction::retryAckResp(const ARM::CHI::Phase &resp)
+{
+    return resp.channel == ARM::CHI::CHANNEL_RSP &&
+           resp.rsp_opcode == ARM::CHI::RSP_OPCODE_RETRY_ACK;
+}
+
+bool
+CacheController::ReadTransaction::handleCompletion()
+{
+    if (retryAckResp(phase)) {
+        return true;
+    } else if (compRespToMakeReadUnique(phase) ||
+               (dataMsgCnt == controller->dataMsgsPerLine && rspMsgCnt != 0)) {
         if (phase.exp_comp_ack == false) {
+            // This is a hack, we should fix it on the ruby side
             // The client is not sending a CompAck but ruby is
             // expecting it so we send it anyway
             controller->sendCompAck(*payload, phase);
@@ -231,7 +279,15 @@ CacheController::ReadTransaction::handle(const CHIResponseMsg *msg)
 {
     /// TODO: remove this, DBID is not sent
     phase.dbid = msg->m_dbid;
-    return Transaction::handle(msg);
+    Transaction::handle(msg);
+
+    if (!retryAckResp(phase)) {
+        assert(rspMsgCnt == 0);
+        assert(phase.rsp_opcode == ARM::CHI::RSP_OPCODE_RESP_SEP_DATA);
+        rspMsgCnt++;
+    }
+
+    return handleCompletion();
 }
 
 bool
@@ -278,7 +334,10 @@ CacheController::WriteTransaction::handle(const CHIResponseMsg *msg)
     phase.dbid = msg->m_dbid;
     Transaction::handle(msg);
 
-    return recvComp && recvDBID;
+    // RetryAck closes this Ruby request attempt; the TLM requester will
+    // resend the transaction after receiving P-credit.
+    return (opcode == ARM::CHI::RSP_OPCODE_RETRY_ACK) ||
+           (recvComp && recvDBID);
 }
 
 void
@@ -366,6 +425,11 @@ CacheController::sendRequestMsg(ARM::CHI::Payload &payload,
     req_msg->m_ns = payload.ns;
     req_msg->m_lpid = payload.lpid;
 
+    panic_if(pendingTransactions.find(req_msg->m_txnId) !=
+                 pendingTransactions.end(),
+             "Duplicate pending transaction: %s\n",
+             transactionToString(payload, phase));
+
     sendRequestMsg(req_msg);
 
     pendingTransactions[req_msg->m_txnId] = Transaction::gen(
@@ -418,9 +482,9 @@ CacheController::sendResponseMsg(ARM::CHI::Payload &payload,
 }
 
 CacheController::Transaction::Transaction(CacheController *_controller,
-    ARM::CHI::Payload &_payload,
-    ARM::CHI::Phase &_phase)
-  : controller(_controller), payload(&_payload), phase(_phase)
+                                          ARM::CHI::Payload &_payload,
+                                          ARM::CHI::Phase &_phase)
+    : controller(_controller), payload(&_payload), phase(_phase), orig(_phase)
 {
     payload->ref();
 }
