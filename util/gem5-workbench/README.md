@@ -11,7 +11,7 @@ The initial scaffold provides:
 - draggable board, processor, cache, memory, and workload nodes;
 - a declarative project model;
 - `.g5proj` JSON save/load;
-- a basic inspector and automatic relationship lines.
+- a basic inspector and persistent component identities.
 
 Milestone 2 will add editable parameters, validation, a permanent gem5 runner,
 and the first end-to-end syscall-emulation simulation.
@@ -21,8 +21,8 @@ and the first end-to-end syscall-emulation simulation.
 From the gem5 repository root:
 
 ```bash
-python -m pip install -r util/gem5-workbench/requirements.txt
-python util/gem5-workbench/gem5_workbench.py
+python3 -m pip install -r util/gem5-workbench/requirements.txt
+python3 util/gem5-workbench/run.py
 ```
 
 The current project is saved to:
@@ -30,6 +30,8 @@ The current project is saved to:
 ```text
 util/gem5-workbench/projects/current.g5proj
 ```
+
+Use `Ctrl+N` for a new project, `Ctrl+S` to save, and `Ctrl+O` to load.
 
 ## Design rule
 
