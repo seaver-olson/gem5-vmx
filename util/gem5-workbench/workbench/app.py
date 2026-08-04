@@ -1,9 +1,6 @@
 """Main pygame application for the gem5 Workbench."""
 
-import json
-import math
 from pathlib import Path
-from typing import Any
 
 import pygame
 
@@ -13,22 +10,30 @@ from workbench.constants import (
     TARGET_FPS,
     WIN_TITLE,
 )
-from workbench.state import CanvasNode, WorkbenchState
+from workbench.document import ProjectDocument
+from workbench.persistence import (
+    ProjectFileError,
+    load_project_document,
+    save_project_document,
+)
+from workbench.registry import create_builtin_registry
+from workbench.state import WorkbenchState
 from workbench.ui.base import Panel
 from workbench.ui.canvas import Canvas
 from workbench.ui.inspector import Inspector
-from workbench.ui.layout import create_layout
 from workbench.ui.palette import Palette
 from workbench.ui.theme import Theme
 from workbench.ui.toolbar import Toolbar
 from workbench.ui.widgets import draw_text, ellipsize, get_font
+from workbench.ui.window_layout import create_layout
+from workbench.validation import validate_project
 
 
 PROJECT_PATH = Path(__file__).resolve().parent.parent / "projects" / "current.g5proj"
 
 
 class WorkbenchApp:
-    """Own the pygame lifecycle, shared state, and top-level panels."""
+    """Own the pygame lifecycle, project document, registry, and UI panels."""
 
     def __init__(self) -> None:
         pygame.init()
@@ -36,19 +41,24 @@ class WorkbenchApp:
         self.surface = pygame.display.set_mode(INITIAL_WINDOW_SIZE, pygame.RESIZABLE)
         self.clock = pygame.time.Clock()
         self.theme = Theme()
+        self.registry = create_builtin_registry()
         self.state = WorkbenchState()
-        self.layout = create_layout(self.surface.get_size())
+        self.window_layout = create_layout(self.surface.get_size())
 
         self.toolbar = Toolbar(
-            self.layout.toolbar,
+            self.window_layout.toolbar,
             self.theme,
             on_new=self.new_project,
             on_save=self.save_project,
             on_load=self.load_project,
         )
-        self.palette = Palette(self.layout.palette, self.theme)
-        self.canvas = Canvas(self.layout.canvas, self.theme)
-        self.inspector = Inspector(self.layout.inspector, self.theme)
+        self.palette = Palette(
+            self.window_layout.palette, self.theme, self.registry
+        )
+        self.canvas = Canvas(self.window_layout.canvas, self.theme)
+        self.inspector = Inspector(
+            self.window_layout.inspector, self.theme, self.registry
+        )
         self.panels: tuple[Panel, ...] = (
             self.toolbar,
             self.palette,
@@ -57,112 +67,60 @@ class WorkbenchApp:
         )
         self.running = False
 
+    def refresh_validation(self) -> None:
+        document = self.state.document
+        self.state.diagnostics = validate_project(document, self.registry)
+
     def _resize(self, size: tuple[int, int]) -> None:
         width = max(MINIMUM_WINDOW_SIZE[0], int(size[0]))
         height = max(MINIMUM_WINDOW_SIZE[1], int(size[1]))
         new_size = (width, height)
         if self.surface.get_size() != new_size:
             self.surface = pygame.display.set_mode(new_size, pygame.RESIZABLE)
-        self.layout = create_layout(new_size)
-        self.toolbar.set_rect(self.layout.toolbar)
-        self.palette.set_rect(self.layout.palette)
-        self.canvas.set_rect(self.layout.canvas)
-        self.canvas.constrain_nodes(self.state)
-        self.inspector.set_rect(self.layout.inspector)
+        self.window_layout = create_layout(new_size)
+        self.toolbar.set_rect(self.window_layout.toolbar)
+        self.palette.set_rect(self.window_layout.palette)
+        self.canvas.set_rect(self.window_layout.canvas)
+        self.inspector.set_rect(self.window_layout.inspector)
 
     def new_project(self) -> None:
-        self.state.nodes.clear()
-        self.state.selected_component = None
-        self.state.selected_node_id = None
+        self.state.document = ProjectDocument()
+        self.state.selected_type_id = None
+        self.state.selected_component_id = None
+        self.state.selected_connection_id = None
+        self.state.diagnostics.clear()
         self.state.status_message = "New project"
 
     def save_project(self) -> None:
-        document = {
-            "format": "gem5-workbench",
-            "version": 1,
-            "nodes": [
-                {
-                    "id": node.id,
-                    "kind": node.kind,
-                    "position": [node.position.x, node.position.y],
-                }
-                for node in self.state.nodes
-            ],
-        }
         try:
-            PROJECT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            temporary_path = PROJECT_PATH.with_suffix(".g5proj.tmp")
-            temporary_path.write_text(
-                json.dumps(document, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary_path.replace(PROJECT_PATH)
-        except OSError as error:
+            save_project_document(PROJECT_PATH, self.state.document)
+        except ProjectFileError as error:
             self.state.status_message = f"Could not save project: {error}"
         else:
             self.state.status_message = f"Saved {PROJECT_PATH.name}"
 
-    @staticmethod
-    def _nodes_from_document(document: Any) -> list[CanvasNode]:
-        if not isinstance(document, dict) or document.get("format") != "gem5-workbench":
-            raise ValueError("not a gem5 Workbench project")
-        if document.get("version") != 1:
-            raise ValueError("unsupported project version")
-        raw_nodes = document.get("nodes")
-        if not isinstance(raw_nodes, list):
-            raise ValueError("project nodes must be a list")
-
-        nodes: list[CanvasNode] = []
-        node_ids: set[str] = set()
-        for raw_node in raw_nodes:
-            if not isinstance(raw_node, dict):
-                raise ValueError("each node must be an object")
-            kind = raw_node.get("kind")
-            node_id = raw_node.get("id")
-            position = raw_node.get("position")
-            if not isinstance(kind, str) or not kind.strip():
-                raise ValueError("node kind must be a non-empty string")
-            valid_position = (
-                isinstance(position, list)
-                and len(position) == 2
-                and all(
-                    not isinstance(value, bool)
-                    and isinstance(value, (int, float))
-                    for value in position
-                )
-            )
-            try:
-                valid_position = valid_position and all(
-                    math.isfinite(value) for value in position
-                )
-            except OverflowError:
-                valid_position = False
-            if not valid_position:
-                raise ValueError("node position must contain two finite numbers")
-            if node_id is not None and (
-                not isinstance(node_id, str) or not node_id.strip()
-            ):
-                raise ValueError("node id must be a non-empty string")
-            node = CanvasNode(kind.strip(), pygame.Vector2(*position))
-            if node_id is not None:
-                node.id = node_id.strip()
-            if node.id in node_ids:
-                raise ValueError("node ids must be unique")
-            node_ids.add(node.id)
-            nodes.append(node)
-        return nodes
-
     def load_project(self) -> None:
         try:
-            document = json.loads(PROJECT_PATH.read_text(encoding="utf-8"))
-            nodes = self._nodes_from_document(document)
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            self.state.status_message = f"Could not load project: {error}"
+            document = load_project_document(PROJECT_PATH)
+        except ProjectFileError as error:
+            detail = (
+                error.diagnostics[0].message
+                if error.diagnostics
+                else str(error)
+            )
+            self.state.status_message = f"Could not load project: {detail}"
             return
-        self.state.nodes = nodes
-        self.canvas.constrain_nodes(self.state)
-        self.state.selected_component = None
-        self.state.selected_node_id = None
-        self.state.status_message = f"Loaded {PROJECT_PATH.name}"
+        self.state.document = document
+        self.state.selected_type_id = None
+        self.state.selected_component_id = None
+        self.state.selected_connection_id = None
+        self.refresh_validation()
+        suffix = (
+            f" · {len(self.state.diagnostics)} validation issue(s)"
+            if self.state.diagnostics
+            else ""
+        )
+        self.state.status_message = f"Loaded {PROJECT_PATH.name}{suffix}"
 
     def _handle_shortcut(self, event: pygame.event.Event) -> bool:
         if event.type != pygame.KEYDOWN or not getattr(event, "mod", 0) & pygame.KMOD_CTRL:
@@ -186,12 +144,16 @@ class WorkbenchApp:
             return
         if self._handle_shortcut(event):
             return
+        consumed = False
         for panel in self.panels:
             if panel.handle_event(event, self.state):
+                consumed = True
                 break
+        if consumed and event.type in (pygame.KEYDOWN, pygame.MOUSEBUTTONDOWN):
+            self.refresh_validation()
 
     def _draw_status_bar(self) -> None:
-        rect = self.layout.status_bar
+        rect = self.window_layout.status_bar
         if rect.width <= 0 or rect.height <= 0:
             return
         pygame.draw.rect(self.surface, self.theme.panel_background, rect)

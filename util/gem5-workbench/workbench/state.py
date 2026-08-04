@@ -1,19 +1,17 @@
+"""Transient workbench state; persistent data lives in ProjectDocument."""
+
 from dataclasses import dataclass, field
-from uuid import uuid4
 
-import pygame
-
-
-@dataclass(slots=True)
-class CanvasNode:
-    kind: str
-    position: pygame.Vector2
-    id: str = field(default_factory=lambda: uuid4().hex)
+from workbench.document import ProjectDocument
+from workbench.model.identifiers import ComponentId, ConnectionId
+from workbench.validation import Diagnostic
 
 
 @dataclass(slots=True)
 class WorkbenchState:
-    selected_component: str | None = None
-    selected_node_id: str | None = None
-    nodes: list[CanvasNode] = field(default_factory=list)
+    document: ProjectDocument = field(default_factory=ProjectDocument)
+    selected_type_id: str | None = None
+    selected_component_id: ComponentId | None = None
+    selected_connection_id: ConnectionId | None = None
+    diagnostics: list[Diagnostic] = field(default_factory=list)
     status_message: str = "Ready"

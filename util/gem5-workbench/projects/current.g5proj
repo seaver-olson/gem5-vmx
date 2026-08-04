@@ -1,5 +1,18 @@
 {
   "format": "gem5-workbench",
-  "version": 1,
-  "nodes": []
+  "schema_version": 1,
+  "project": {
+    "components": [],
+    "connections": [],
+    "metadata": {}
+  },
+  "layout": {
+    "components": {},
+    "viewport": {
+      "offset_x": 0.0,
+      "offset_y": 0.0,
+      "zoom": 1.0
+    },
+    "metadata": {}
+  }
 }

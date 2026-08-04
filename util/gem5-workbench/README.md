@@ -33,6 +33,18 @@ util/gem5-workbench/projects/current.g5proj
 
 Use `Ctrl+N` for a new project, `Ctrl+S` to save, and `Ctrl+O` to load.
 
+## Project architecture
+
+A `.g5proj` file contains separate `project` and `layout` sections. The project
+section stores rendering-independent components, parameters, and explicit port
+connections. The layout section stores JSON-compatible component positions and
+viewport state. Component definitions and port schemas come from the runtime
+registry and are not embedded in the project file.
+
+Unknown component types are preserved when a document is loaded and saved, then
+reported by registry validation. Duplicate component or connection IDs make a
+document invalid.
+
 ## Design rule
 
 Users edit `.g5proj` files through the GUI. The workbench owns one permanent
