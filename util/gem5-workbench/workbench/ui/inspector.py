@@ -1,7 +1,8 @@
-"""Read-only properties panel for the current workbench selection."""
+"""Read-only properties panel for the current project selection."""
 
 import pygame
 
+from workbench.registry import ComponentRegistry, create_builtin_registry
 from workbench.state import WorkbenchState
 from workbench.ui.base import Panel
 from workbench.ui.theme import Theme
@@ -10,6 +11,15 @@ from workbench.ui.widgets import draw_panel, draw_text, ellipsize, get_font
 
 class Inspector(Panel):
     PADDING = 16
+
+    def __init__(
+        self,
+        rect: pygame.Rect,
+        theme: Theme,
+        registry: ComponentRegistry | None = None,
+    ) -> None:
+        super().__init__(rect, theme)
+        self.registry = registry or create_builtin_registry()
 
     def handle_event(
         self, event: pygame.event.Event, state: WorkbenchState
@@ -31,10 +41,9 @@ class Inspector(Panel):
             size=13,
         )
         font = get_font(15)
-        max_width = max(0, self.rect.width - self.PADDING * 2)
         draw_text(
             surface,
-            ellipsize(value, font, max_width),
+            ellipsize(value, font, max(0, self.rect.width - self.PADDING * 2)),
             (self.rect.x + self.PADDING, y + 20),
             color=self.theme.text,
             size=15,
@@ -57,19 +66,26 @@ class Inspector(Panel):
                 bold=True,
             )
             y = self.rect.y + 58
-            node = next(
-                (
-                    node
-                    for node in state.nodes
-                    if node.id == state.selected_node_id
-                ),
-                None,
+            component = state.document.project.components.get(
+                state.selected_component_id
             )
-            if node is not None:
-                y = self._row(surface, y, "Type", node.kind.replace("_", " ").title())
-                y = self._row(surface, y, "Component ID", node.id)
-                y = self._row(surface, y, "Canvas X", round(node.position.x))
-                self._row(surface, y, "Canvas Y", round(node.position.y))
+            if component is not None:
+                definition = self.registry.get(component.type_id)
+                display_name = (
+                    definition.display_name
+                    if definition
+                    else f"Unknown ({component.type_id})"
+                )
+                y = self._row(surface, y, "Type", display_name)
+                y = self._row(surface, y, "Component ID", component.id)
+                component_layout = state.document.layout.components.get(component.id)
+                if component_layout:
+                    y = self._row(
+                        surface, y, "Canvas X", round(component_layout.position.x)
+                    )
+                    self._row(
+                        surface, y, "Canvas Y", round(component_layout.position.y)
+                    )
                 draw_text(
                     surface,
                     "Drag to reposition · Delete to remove",
@@ -77,12 +93,13 @@ class Inspector(Panel):
                     color=self.theme.muted_text,
                     size=12,
                 )
-            elif state.selected_component:
+            elif state.selected_type_id:
+                definition = self.registry.get(state.selected_type_id)
                 self._row(
                     surface,
                     y,
                     "Component tool",
-                    state.selected_component.replace("_", " ").title(),
+                    definition.display_name if definition else state.selected_type_id,
                 )
                 draw_text(
                     surface,

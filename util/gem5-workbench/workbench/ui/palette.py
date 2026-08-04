@@ -1,29 +1,16 @@
-"""Component palette used to choose nodes for the canvas."""
-
-from dataclasses import dataclass
+"""Registry-backed component palette."""
 
 import pygame
 
+from workbench.registry import (
+    ComponentDefinition,
+    ComponentRegistry,
+    create_builtin_registry,
+)
 from workbench.state import WorkbenchState
 from workbench.ui.base import Panel
 from workbench.ui.theme import Theme
 from workbench.ui.widgets import draw_panel, draw_text, ellipsize, get_font
-
-
-@dataclass(frozen=True, slots=True)
-class PaletteItem:
-    kind: str
-    label: str
-    description: str
-
-
-COMPONENTS = (
-    PaletteItem("board", "Board", "System platform"),
-    PaletteItem("processor", "Processor", "CPU cores"),
-    PaletteItem("cache", "Cache hierarchy", "Memory-side caches"),
-    PaletteItem("memory", "Memory", "Physical memory"),
-    PaletteItem("workload", "Workload", "Program or resource"),
-)
 
 
 class Palette(Panel):
@@ -31,9 +18,23 @@ class Palette(Panel):
     ITEM_HEIGHT = 58
     PADDING = 12
 
-    def __init__(self, rect: pygame.Rect, theme: Theme) -> None:
+    def __init__(
+        self,
+        rect: pygame.Rect,
+        theme: Theme,
+        registry: ComponentRegistry | None = None,
+    ) -> None:
         super().__init__(rect, theme)
+        self.registry = registry or create_builtin_registry()
         self._scroll = 0
+
+    @property
+    def definitions(self) -> tuple[ComponentDefinition, ...]:
+        return self.registry.definitions()
+
+    def set_rect(self, rect: pygame.Rect) -> None:
+        super().set_rect(rect)
+        self._scroll = min(self._scroll, self._max_scroll())
 
     def _item_rect(self, index: int) -> pygame.Rect:
         return pygame.Rect(
@@ -47,27 +48,30 @@ class Palette(Panel):
         )
 
     def _max_scroll(self) -> int:
-        content_height = len(COMPONENTS) * self.ITEM_HEIGHT
+        content_height = len(self.definitions) * self.ITEM_HEIGHT
         return max(0, content_height - max(0, self.rect.height - self.HEADER_HEIGHT))
 
     def handle_event(
         self, event: pygame.event.Event, state: WorkbenchState
     ) -> bool:
-        if event.type == pygame.MOUSEWHEEL:
-            if self.rect.collidepoint(pygame.mouse.get_pos()):
-                self._scroll = max(
-                    0, min(self._max_scroll(), self._scroll - event.y * 30)
-                )
-                return True
+        if event.type == pygame.MOUSEWHEEL and self.rect.collidepoint(
+            pygame.mouse.get_pos()
+        ):
+            self._scroll = max(
+                0, min(self._max_scroll(), self._scroll - event.y * 30)
+            )
+            return True
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             if not self.rect.collidepoint(event.pos):
                 return False
-            for index, item in enumerate(COMPONENTS):
+            for index, definition in enumerate(self.definitions):
                 if self._item_rect(index).collidepoint(event.pos):
-                    state.selected_component = item.kind
-                    state.selected_node_id = None
+                    state.selected_type_id = definition.type_id
+                    state.selected_component_id = None
+                    state.selected_connection_id = None
                     state.status_message = (
-                        f"{item.label} selected — click the canvas to place it"
+                        f"{definition.display_name} selected — "
+                        "click the canvas to place it"
                     )
                     return True
             return True
@@ -77,7 +81,6 @@ class Palette(Panel):
         draw_panel(surface, self.rect, self.theme)
         if self.rect.width < 1 or self.rect.height < 1:
             return
-
         previous_clip = surface.get_clip()
         surface.set_clip(self.rect)
         try:
@@ -92,11 +95,11 @@ class Palette(Panel):
             mouse_position = pygame.mouse.get_pos()
             label_font = get_font(15, bold=True)
             description_font = get_font(12)
-            for index, item in enumerate(COMPONENTS):
+            for index, definition in enumerate(self.definitions):
                 item_rect = self._item_rect(index)
                 if not item_rect.colliderect(self.rect):
                     continue
-                selected = state.selected_component == item.kind
+                selected = state.selected_type_id == definition.type_id
                 hovered = item_rect.collidepoint(mouse_position)
                 fill = self.theme.button_hover if hovered else self.theme.button
                 if selected:
@@ -110,10 +113,10 @@ class Palette(Panel):
                         width=2,
                         border_radius=6,
                     )
-                max_text_width = max(0, item_rect.width - 20)
+                max_width = max(0, item_rect.width - 20)
                 draw_text(
                     surface,
-                    ellipsize(item.label, label_font, max_text_width),
+                    ellipsize(definition.display_name, label_font, max_width),
                     (item_rect.x + 10, item_rect.y + 7),
                     color=self.theme.text,
                     size=15,
@@ -121,7 +124,7 @@ class Palette(Panel):
                 )
                 draw_text(
                     surface,
-                    ellipsize(item.description, description_font, max_text_width),
+                    ellipsize(definition.description, description_font, max_width),
                     (item_rect.x + 10, item_rect.y + 28),
                     color=self.theme.muted_text,
                     size=12,
