@@ -664,6 +664,7 @@ BitUnion64(CR4)
     Bitfield<17> pcide; // PCID Enable
     Bitfield<16> fsgsbase; // Enable RDFSBASE, RDGSBASE, WRFSBASE,
                            // WRGSBASE instructions
+    Bitfield<14> smxe; // Safer Mode Extensions Enable
     Bitfield<13> vmxe;     // VMX Support 
     Bitfield<10> osxmmexcpt; // Operating System Unmasked
                              // Exception Support

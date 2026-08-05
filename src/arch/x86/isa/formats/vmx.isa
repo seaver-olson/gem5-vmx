@@ -1,16 +1,35 @@
 output header {{
-    class VmxUnconditionalExitInst : public X86ISA::X86StaticInst
+    class VmxPrecheckedExitInst : public X86ISA::X86StaticInst
     {
-      private:
-        const X86ISA::VmxExitReason exitReason;
+      protected:
+        VmxPrecheckedExitInst(const char *_mnemonic,
+                ExtMachInst machInst);
+        Fault finish(ExecContext *, X86ISA::VmxExitReason) const;
 
       public:
-        VmxUnconditionalExitInst(const char *_mnemonic,
-                ExtMachInst machInst, X86ISA::VmxExitReason reason);
-
-        Fault execute(ExecContext *, trace::InstRecord *) const override;
         std::string generateDisassembly(Addr pc,
                 const loader::SymbolTable *symtab) const override;
+    };
+
+    class VmxInvdInst : public VmxPrecheckedExitInst
+    {
+      public:
+        explicit VmxInvdInst(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+    };
+
+    class VmxXsetbvInst : public VmxPrecheckedExitInst
+    {
+      public:
+        explicit VmxXsetbvInst(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+    };
+
+    class VmxGetsecInst : public VmxPrecheckedExitInst
+    {
+      public:
+        explicit VmxGetsecInst(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
     };
 
     class VmxMemInst : public X86ISA::X86StaticInst
@@ -79,11 +98,9 @@ output header {{
 }};
 
 output decoder {{
-    VmxUnconditionalExitInst::VmxUnconditionalExitInst(
-            const char *_mnemonic, ExtMachInst machInst,
-            X86ISA::VmxExitReason reason)
-        : X86ISA::X86StaticInst(_mnemonic, machInst, No_OpClass),
-          exitReason(reason)
+    VmxPrecheckedExitInst::VmxPrecheckedExitInst(
+            const char *_mnemonic, ExtMachInst machInst)
+        : X86ISA::X86StaticInst(_mnemonic, machInst, No_OpClass)
     {
         flags[IsNonSpeculative] = true;
         flags[IsSerializing] = true;
@@ -91,12 +108,27 @@ output decoder {{
     }
 
     std::string
-    VmxUnconditionalExitInst::generateDisassembly(
+    VmxPrecheckedExitInst::generateDisassembly(
             Addr pc, const loader::SymbolTable *symtab) const
     {
         std::stringstream response;
         printMnemonic(response, mnemonic);
         return response.str();
+    }
+
+    VmxInvdInst::VmxInvdInst(ExtMachInst machInst)
+        : VmxPrecheckedExitInst("invd", machInst)
+    {
+    }
+
+    VmxXsetbvInst::VmxXsetbvInst(ExtMachInst machInst)
+        : VmxPrecheckedExitInst("xsetbv", machInst)
+    {
+    }
+
+    VmxGetsecInst::VmxGetsecInst(ExtMachInst machInst)
+        : VmxPrecheckedExitInst("getsec", machInst)
+    {
     }
 
     VmxMemInst::VmxMemInst(const char *_mnemonic, ExtMachInst machInst,
@@ -241,21 +273,86 @@ output decoder {{
 }};
 
 output exec {{
+    namespace
+    {
     Fault
-    VmxUnconditionalExitInst::execute(ExecContext *xc,
-            trace::InstRecord *traceData) const
+    architecturalFault(vmx::InstructionFault fault)
+    {
+        if (fault == vmx::InstructionFault::InvalidOpcode) {
+            return std::make_shared<InvalidOpcode>();
+        }
+        if (fault == vmx::InstructionFault::GeneralProtection) {
+            return std::make_shared<GeneralProtection>(0);
+        }
+        return NoFault;
+    }
+    } // namespace
+
+    Fault
+    VmxPrecheckedExitInst::finish(
+            ExecContext *xc, X86ISA::VmxExitReason reason) const
     {
         auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
         if (isa && isa->vmxState().nonRootActive()) {
-            isa->vmxState().vmexitInstruction(xc, exitReason, size());
+            isa->vmxState().vmexitInstruction(xc, reason, size());
             return NoFault;
         }
 
-        // These instructions were pre-existing WarnUnimplemented no-ops in
-        // gem5. Preserve that root-operation behavior while ensuring that
-        // VMX non-root operation observes Intel's unconditional VM exit.
+        // Preserve baseline gem5's warning/no-op behavior after all
+        // architecturally higher-priority faults have been checked.
         warn_once("%s is not implemented; treating as a no-op", mnemonic);
         return NoFault;
+    }
+
+    Fault
+    VmxInvdInst::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        auto *tc = xc->tcBase();
+        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+        if (Fault fault = architecturalFault(
+                    vmx::invdPreExitFault(m5reg.cpl)); fault != NoFault) {
+            return fault;
+        }
+        return finish(xc, VmxExitReason::Invd);
+    }
+
+    Fault
+    VmxXsetbvInst::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        auto *tc = xc->tcBase();
+        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+        CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        if (Fault fault = architecturalFault(
+                    vmx::xsetbvPreExitFault(m5reg.cpl, cr4.osxsave));
+                fault != NoFault) {
+            return fault;
+        }
+        return finish(xc, VmxExitReason::Xsetbv);
+    }
+
+    Fault
+    VmxGetsecInst::execute(ExecContext *xc,
+            trace::InstRecord *traceData) const
+    {
+        auto *tc = xc->tcBase();
+        CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        if (Fault fault = architecturalFault(
+                    vmx::getsecPreExitFault(cr4.smxe)); fault != NoFault) {
+            return fault;
+        }
+
+        auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+        if (isa && isa->vmxState().nonRootActive()) {
+            return finish(xc, VmxExitReason::Getsec);
+        }
+
+        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+        if (m5reg.cpl != 0) {
+            return std::make_shared<GeneralProtection>(0);
+        }
+        return finish(xc, VmxExitReason::Getsec);
     }
 }};
 
@@ -630,15 +727,23 @@ def format VmxRegMemInst() {{
     exec_output = VmxRegMemExecute.subst(iop)
 }};
 
-def format VmxUnconditionalExitInst(reason) {{
+def format VmxInvdInst() {{
     header_output = ''
     decoder_output = ''
     exec_output = ''
-    decode_block = '''
-        return new VmxUnconditionalExitInst(
-                "%(mnemonic)s", machInst, %(reason)s);
-    ''' % {
-        'mnemonic': Name.lower(),
-        'reason': str(reason),
-    }
+    decode_block = 'return new VmxInvdInst(machInst);'
+}};
+
+def format VmxXsetbvInst() {{
+    header_output = ''
+    decoder_output = ''
+    exec_output = ''
+    decode_block = 'return new VmxXsetbvInst(machInst);'
+}};
+
+def format VmxGetsecInst() {{
+    header_output = ''
+    decoder_output = ''
+    exec_output = ''
+    decode_block = 'return new VmxGetsecInst(machInst);'
 }};

@@ -124,8 +124,7 @@
                 0x2: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
                         0x0: xgetbv();
-                        0x1: VmxUnconditionalExitInst::XSETBV(
-                            {{VmxExitReason::Xsetbv}});
+                        0x1: VmxXsetbvInst::XSETBV();
                     }
                     default: decode MODE_SUBMODE {
                         0x0: Cpl0Inst::LGDT(M);
@@ -217,7 +216,7 @@
             }
         }
         0x01: decode OPCODE_OP_BOTTOM3 {
-            0x0: VmxUnconditionalExitInst::INVD({{VmxExitReason::Invd}});
+            0x0: VmxInvdInst::INVD();
             0x1: wbinvd(); // privileged
             0x2: Inst::UD2();
             0x3: Inst::UD2();
@@ -400,7 +399,7 @@
             }
             0x5: sysexit(); // privileged
             0x6: Inst::UD2();
-            0x7: VmxUnconditionalExitInst::GETSEC({{VmxExitReason::Getsec}});
+            0x7: VmxGetsecInst::GETSEC();
         }
         0x07: decode VEX_PRESENT {
             0x0: decode OPCODE_OP_BOTTOM3 {

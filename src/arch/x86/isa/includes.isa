@@ -118,6 +118,7 @@ output exec {{
 #include "arch/x86/pseudo_inst_abi.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/tlb.hh"
+#include "arch/x86/vmx_utils.hh"
 #include "base/compiler.hh"
 #include "base/condcodes.hh"
 #include "base/logging.hh"

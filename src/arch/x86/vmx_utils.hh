@@ -37,6 +37,39 @@ namespace X86ISA
 namespace vmx
 {
 
+enum class InstructionFault : uint8_t
+{
+    None,
+    InvalidOpcode,
+    GeneralProtection,
+};
+
+inline constexpr InstructionFault
+invdPreExitFault(uint8_t cpl)
+{
+    return cpl == 0 ? InstructionFault::None :
+        InstructionFault::GeneralProtection;
+}
+
+inline constexpr InstructionFault
+xsetbvPreExitFault(uint8_t cpl, bool osxsave)
+{
+    // CR4.OSXSAVE recognition precedes the privilege check.
+    if (!osxsave) {
+        return InstructionFault::InvalidOpcode;
+    }
+    return cpl == 0 ? InstructionFault::None :
+        InstructionFault::GeneralProtection;
+}
+
+inline constexpr InstructionFault
+getsecPreExitFault(bool smxe)
+{
+    // SMX recognition precedes the unconditional non-root VM exit.
+    return smxe ? InstructionFault::None :
+        InstructionFault::InvalidOpcode;
+}
+
 // CR0 bits loaded by VM entry and VM exit. ET, CD, NW, and reserved bits
 // retain their live values (Intel SDM Vol. 3C, 29.3.2.1 and 30.5.1).
 inline constexpr uint64_t LoadedCr0Bits =

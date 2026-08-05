@@ -117,6 +117,24 @@ TEST(VmxControlState, CltsAndLmswExitConditions)
     EXPECT_TRUE(vmx::lmswCausesExit(1u << 2, 0, 1u << 2));
 }
 
+// The SDM's unconditional VM exits occur only after higher-priority
+// instruction-recognition and privilege faults have been resolved.
+TEST(VmxInstructionPriority, PreExitFaultsWin)
+{
+    using Fault = vmx::InstructionFault;
+
+    EXPECT_EQ(vmx::invdPreExitFault(0), Fault::None);
+    EXPECT_EQ(vmx::invdPreExitFault(3), Fault::GeneralProtection);
+
+    EXPECT_EQ(vmx::xsetbvPreExitFault(0, true), Fault::None);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(3, true), Fault::GeneralProtection);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(0, false), Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(3, false), Fault::InvalidOpcode);
+
+    EXPECT_EQ(vmx::getsecPreExitFault(true), Fault::None);
+    EXPECT_EQ(vmx::getsecPreExitFault(false), Fault::InvalidOpcode);
+}
+
 } // namespace
 } // namespace X86ISA
 } // namespace gem5

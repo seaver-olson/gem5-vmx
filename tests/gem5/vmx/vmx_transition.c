@@ -87,6 +87,9 @@ extern void vmx_transition_cr0_vmcall(void);
 extern void vmx_transition_clts_exit_guest(void);
 extern void vmx_transition_pf_guest(void);
 extern void vmx_transition_pf_instruction(void);
+extern void vmx_transition_getsec_guest(void);
+extern void vmx_transition_xsetbv_guest(void);
+extern void vmx_transition_xsetbv_instruction(void);
 
 asm(
 ".pushsection .text\n"
@@ -142,6 +145,17 @@ asm(
 "    mov vmx_test_fault_va(%rip), %rax\n"
 "vmx_transition_pf_instruction:\n"
 "    mov (%rax), %rax\n"
+"    ud2\n"
+".global vmx_transition_getsec_guest\n"
+"vmx_transition_getsec_guest:\n"
+"    .byte 0x0f, 0x37\n"
+"    ud2\n"
+".global vmx_transition_xsetbv_guest\n"
+".global vmx_transition_xsetbv_instruction\n"
+"vmx_transition_xsetbv_guest:\n"
+"    xor %ecx, %ecx\n"
+"vmx_transition_xsetbv_instruction:\n"
+"    .byte 0x0f, 0x01, 0xd1\n"
 "    ud2\n"
 ".popsection\n");
 
@@ -338,14 +352,6 @@ read_gs(void)
 	return value;
 }
 
-static u16
-read_ldtr(void)
-{
-	u16 value;
-	asm volatile("sldt %0" : "=rm" (value));
-	return value;
-}
-
 static u32
 segment_access_rights(const struct desc_ptr *gdt, u16 selector)
 {
@@ -460,8 +466,14 @@ configure_vmcs(unsigned long host_rsp, unsigned long host_rip)
 	u16 es = read_es();
 	u16 fs = read_fs();
 	u16 gs = read_gs();
-	u16 ldtr = read_ldtr();
-	u16 tr;
+	/* Linux does not install an LDT here.  Keep the selector explicitly null:
+	 * baseline gem5 does not implement SLDT and therefore cannot be used to
+	 * discover the host value while constructing this VMCS. */
+	u16 ldtr = 0;
+	/* The kernel loads the per-CPU TSS from its fixed GDT slot.  Use that
+	 * architectural selector directly because baseline gem5 does not
+	 * implement STR while this test is constructing the VMCS. */
+	u16 tr = GDT_ENTRY_TSS * 8;
 	u64 efer;
 	u64 fs_base;
 	u64 gs_base;
@@ -478,7 +490,6 @@ configure_vmcs(unsigned long host_rsp, unsigned long host_rip)
 
 	native_store_gdt(&gdt);
 	store_idt(&idt);
-	store_tr(tr);
 	rdmsrl(MSR_EFER, efer);
 	rdmsrl(MSR_FS_BASE, fs_base);
 	rdmsrl(MSR_GS_BASE, gs_base);
@@ -932,6 +943,76 @@ vmexit_pf_handler:
 		goto fail;
 	}
 
+	/* GETSEC must recognize CR4.SMXE=0 before its unconditional VM exit.
+	 * Intercept the resulting guest #UD so the distinction is observable. */
+	if (vmwrite_checked(GUEST_RIP,
+			(unsigned long)vmx_transition_getsec_guest) != VMX_SUCCESS ||
+	    vmwrite_checked(HOST_RIP,
+			(unsigned long)&&vmexit_getsec_ud_handler) != VMX_SUCCESS ||
+	    vmwrite_checked(EXCEPTION_BITMAP, 1U << X86_TRAP_UD) != VMX_SUCCESS) {
+		ret = -EIO;
+		goto fail;
+	}
+	exit_phase = 7;
+	asm goto("" : : : "memory" : vmexit_getsec_ud_handler);
+	status = vmresume_checked(&flags);
+	pr_err("vmx_transition: GETSEC #UD VMRESUME returned status=%u flags=%#lx\n",
+	       status, flags);
+	ret = -EIO;
+	goto fail;
+
+vmexit_getsec_ud_handler:
+	if (exit_phase != 7 || read_field(VM_EXIT_REASON, &reason) ||
+	    read_field(VM_EXIT_INTR_INFO, &interruption_info) ||
+	    read_field(GUEST_RIP, &guest_rip)) {
+		ret = -EIO;
+		goto fail;
+	}
+	if ((reason & VMX_EXIT_REASON_MASK) != VMX_EXIT_EXCEPTION_OR_NMI ||
+	    (interruption_info & 0xff) != X86_TRAP_UD ||
+	    ((interruption_info >> 8) & 7) != 3 ||
+	    (interruption_info & (1U << 11)) ||
+	    !(interruption_info & (1U << 31)) ||
+	    guest_rip != (unsigned long)vmx_transition_getsec_guest) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
+	/* CR4.OSXSAVE=0 likewise makes XSETBV raise #UD before a VM exit. */
+	if (vmwrite_checked(GUEST_RIP,
+			(unsigned long)vmx_transition_xsetbv_guest) != VMX_SUCCESS ||
+	    vmwrite_checked(GUEST_CR4, __read_cr4() & ~(1UL << 18)) !=
+			VMX_SUCCESS ||
+	    vmwrite_checked(HOST_RIP,
+			(unsigned long)&&vmexit_xsetbv_ud_handler) != VMX_SUCCESS) {
+		ret = -EIO;
+		goto fail;
+	}
+	exit_phase = 8;
+	asm goto("" : : : "memory" : vmexit_xsetbv_ud_handler);
+	status = vmresume_checked(&flags);
+	pr_err("vmx_transition: XSETBV #UD VMRESUME returned status=%u flags=%#lx\n",
+	       status, flags);
+	ret = -EIO;
+	goto fail;
+
+vmexit_xsetbv_ud_handler:
+	if (exit_phase != 8 || read_field(VM_EXIT_REASON, &reason) ||
+	    read_field(VM_EXIT_INTR_INFO, &interruption_info) ||
+	    read_field(GUEST_RIP, &guest_rip)) {
+		ret = -EIO;
+		goto fail;
+	}
+	if ((reason & VMX_EXIT_REASON_MASK) != VMX_EXIT_EXCEPTION_OR_NMI ||
+	    (interruption_info & 0xff) != X86_TRAP_UD ||
+	    ((interruption_info >> 8) & 7) != 3 ||
+	    (interruption_info & (1U << 11)) ||
+	    !(interruption_info & (1U << 31)) ||
+	    guest_rip != (unsigned long)vmx_transition_xsetbv_instruction) {
+		ret = -EINVAL;
+		goto fail;
+	}
+
 	/* VMCLEAR removes the current VMCS. VMRESUME must first VMfailInvalid;
 	 * after VMPTRLD it must VMfailValid with error 5 because it is clear. */
 	if (vmclear_checked(vmcs_pa) != VMX_SUCCESS) {
@@ -979,7 +1060,7 @@ vmexit_pf_handler:
 		ret = -EIO;
 		goto fail;
 	}
-	exit_phase = 7;
+	exit_phase = 9;
 	asm goto("" : : : "memory" : vmentry_failure_handler);
 	status = vmlaunch_checked(&flags);
 	pr_err("vmx_transition: late-failure VMLAUNCH returned "
@@ -989,7 +1070,7 @@ vmexit_pf_handler:
 	goto fail;
 
 vmentry_failure_handler:
-	if (exit_phase != 7 || read_field(VM_EXIT_REASON, &reason) ||
+	if (exit_phase != 9 || read_field(VM_EXIT_REASON, &reason) ||
 	    read_field(EXIT_QUALIFICATION, &qualification) ||
 	    read_field(VM_EXIT_INTR_INFO, &interruption_info) ||
 	    read_field(VM_EXIT_INTR_ERROR_CODE, &interruption_error)) {
@@ -998,9 +1079,9 @@ vmentry_failure_handler:
 	}
 	if (reason != (VMX_EXIT_ENTRY_FAILURE |
 			VMX_EXIT_ENTRY_INVALID_GUEST_STATE) || qualification != 0 ||
-	    (interruption_info & 0xff) != X86_TRAP_PF ||
+	    (interruption_info & 0xff) != X86_TRAP_UD ||
 	    ((interruption_info >> 8) & 7) != 3 ||
-	    !(interruption_info & (1U << 11)) ||
+	    (interruption_info & (1U << 11)) ||
 	    !(interruption_info & (1U << 31)) || interruption_error != 0 ||
 	    __read_cr3() != host_cr3 ||
 	    *(volatile u64 *)host_mapping != HOST_VALUE) {
@@ -1049,6 +1130,7 @@ vmentry_failure_handler:
 	pr_info("vmx_transition: PASS: CR3-load exit reason and qualification\n");
 	pr_info("vmx_transition: PASS: direct #PF qualification and "
 		"CR2 preservation\n");
+	pr_info("vmx_transition: PASS: GETSEC/XSETBV pre-exit fault priority\n");
 	pr_info("vmx_transition: PASS: VMCALL/VMRESUME/RSP/host restoration\n");
 	pr_info("vmx_transition: PASS: VMCLEAR launch lifecycle and VMfail flags\n");
 	pr_info("vmx_transition: PASS: late VM-entry SYSENTER validation preserves "

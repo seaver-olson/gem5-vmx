@@ -83,8 +83,9 @@ address. It verifies real instruction/data translation after VMLAUNCH, a
 non-exiting guest CR3 write, a configured CR3-load exit, and immediate host
 address-space restoration. It also covers VMCALL/VMRESUME, guest RSP, CR0
 mask/read-shadow and CLTS behavior, direct #PF metadata and CR2 preservation,
-VMCLEAR launch lifecycle, late-entry-failure field/clear-state preservation,
-and pre-commit failure atomicity.
+GETSEC/XSETBV pre-exit #UD priority, VMCLEAR launch lifecycle,
+late-entry-failure field/clear-state preservation, and pre-commit failure
+atomicity.
 
 The normal/checkpoint modes remain deliberately fast root-operation tests.
 The transition mode is the maintained non-root regression for the supported
