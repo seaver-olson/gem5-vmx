@@ -46,8 +46,8 @@
         0x00: decode OPCODE_OP_BOTTOM3 {
             //0x00: group6();
             0x00: decode MODRM_REG {
-                0x0: Inst::SLDT(Ew);
-                0x1: Inst::STR(Ew);
+                0x0: sldt_Mw_or_Rv();
+                0x1: str_Mw_or_Rv();
                 0x2: decode MODE_SUBMODE {
                     0x0: Cpl0Inst::LLDT_64(Ew);
                     default: Cpl0Inst::LLDT(Ew);
@@ -83,7 +83,15 @@
                         }
                         default: Inst::UD2();
                     }
-                    default: Inst::SGDT(M);
+                    default: decode MODE_SUBMODE {
+                        0x0: Inst::SGDT(M);
+                        default: decode OPSIZE {
+                            // 16 bit operand sizes are special, but only
+                            // in legacy and compatibility modes.
+                            0x2: Inst::SGDT_16(M);
+                            default: Inst::SGDT(M);
+                        }
+                    }
                 }
                 0x1: decode MODRM_MOD {
                     0x3: decode MODRM_RM {
@@ -103,7 +111,15 @@
                         }});
                         default: Inst::UD2();
                     }
-                    default: Inst::SIDT(M);
+                    default: decode MODE_SUBMODE {
+                        0x0: Inst::SIDT(M);
+                        default: decode OPSIZE {
+                            // 16 bit operand sizes are special, but only
+                            // in legacy and compatibility modes.
+                            0x2: Inst::SIDT_16(M);
+                            default: Inst::SIDT(M);
+                        }
+                    }
                 }
                 0x2: decode MODRM_MOD {
                     0x3: decode MODRM_RM {

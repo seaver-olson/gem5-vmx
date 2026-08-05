@@ -37,9 +37,9 @@
 microcode = """
 def macroop SGDT_M
 {
-    .serialize_before
     .adjust_env maxOsz
 
+    # Store the limit followed by the base.
     rdlimit t1, tsg, dataSize=2
     rdbase t2, tsg
     st t1, seg, sib, disp, dataSize=2
@@ -48,7 +48,6 @@ def macroop SGDT_M
 
 def macroop SGDT_P
 {
-    .serialize_before
     .adjust_env maxOsz
 
     rdip t7
@@ -58,9 +57,32 @@ def macroop SGDT_P
     st t2, seg, riprel, 'adjustedDisp + 2'
 };
 
+def macroop SGDT_16_M
+{
+    .adjust_env maxOsz
+
+    # The base field is 32 bits, with bits 31:24 stored as zero.
+    rdlimit t1, tsg, dataSize=2
+    rdbase t2, tsg
+    zexti t2, t2, 23, dataSize=8
+    st t1, seg, sib, disp, dataSize=2
+    st t2, seg, sib, 'adjustedDisp + 2', dataSize=4
+};
+
+def macroop SGDT_16_P
+{
+    .adjust_env maxOsz
+
+    rdip t7
+    rdlimit t1, tsg, dataSize=2
+    rdbase t2, tsg
+    zexti t2, t2, 23, dataSize=8
+    st t1, seg, riprel, disp, dataSize=2
+    st t2, seg, riprel, 'adjustedDisp + 2', dataSize=4
+};
+
 def macroop SIDT_M
 {
-    .serialize_before
     .adjust_env maxOsz
 
     rdlimit t1, idtr, dataSize=2
@@ -71,7 +93,6 @@ def macroop SIDT_M
 
 def macroop SIDT_P
 {
-    .serialize_before
     .adjust_env maxOsz
 
     rdip t7
@@ -81,46 +102,28 @@ def macroop SIDT_P
     st t2, seg, riprel, 'adjustedDisp + 2'
 };
 
-def macroop SLDT_R
+def macroop SIDT_16_M
 {
-    .serialize_before
-    rdsel reg, tsl, dataSize=2
-};
+    .adjust_env maxOsz
 
-def macroop SLDT_M
-{
-    .serialize_before
-    rdsel t1, tsl, dataSize=2
+    # The base field is 32 bits, with bits 31:24 stored as zero.
+    rdlimit t1, idtr, dataSize=2
+    rdbase t2, idtr
+    zexti t2, t2, 23, dataSize=8
     st t1, seg, sib, disp, dataSize=2
+    st t2, seg, sib, 'adjustedDisp + 2', dataSize=4
 };
 
-def macroop SLDT_P
+def macroop SIDT_16_P
 {
-    .serialize_before
+    .adjust_env maxOsz
+
     rdip t7
-    rdsel t1, tsl, dataSize=2
+    rdlimit t1, idtr, dataSize=2
+    rdbase t2, idtr
+    zexti t2, t2, 23, dataSize=8
     st t1, seg, riprel, disp, dataSize=2
-};
-
-def macroop STR_R
-{
-    .serialize_before
-    rdsel reg, tr, dataSize=2
-};
-
-def macroop STR_M
-{
-    .serialize_before
-    rdsel t1, tr, dataSize=2
-    st t1, seg, sib, disp, dataSize=2
-};
-
-def macroop STR_P
-{
-    .serialize_before
-    rdip t7
-    rdsel t1, tr, dataSize=2
-    st t1, seg, riprel, disp, dataSize=2
+    st t2, seg, riprel, 'adjustedDisp + 2', dataSize=4
 };
 
 def macroop LGDT_M
