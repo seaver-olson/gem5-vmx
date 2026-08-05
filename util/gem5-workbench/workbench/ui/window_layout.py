@@ -3,7 +3,6 @@
 from dataclasses import dataclass
 
 import pygame
-
 from workbench.constants import (
     INSPECTOR_WIDTH,
     PALETTE_WIDTH,

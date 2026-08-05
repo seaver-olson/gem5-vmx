@@ -1,0 +1,159 @@
+{
+  "format": "gem5-workbench",
+  "layout": {
+    "components": {
+      "board-main": {
+        "collapsed": false,
+        "metadata": {},
+        "position": {
+          "x": 420,
+          "y": 180
+        }
+      },
+      "cache-main": {
+        "collapsed": false,
+        "metadata": {},
+        "position": {
+          "x": 80,
+          "y": 200
+        }
+      },
+      "memory-main": {
+        "collapsed": false,
+        "metadata": {},
+        "position": {
+          "x": 80,
+          "y": 120
+        }
+      },
+      "processor-main": {
+        "collapsed": false,
+        "metadata": {},
+        "position": {
+          "x": 80,
+          "y": 40
+        }
+      },
+      "workload-main": {
+        "collapsed": false,
+        "metadata": {},
+        "position": {
+          "x": 80,
+          "y": 280
+        }
+      }
+    },
+    "metadata": {},
+    "viewport": {
+      "offset_x": 0,
+      "offset_y": 0,
+      "zoom": 1
+    }
+  },
+  "project": {
+    "components": [
+      {
+        "id": "board-main",
+        "parameters": {
+          "clk_freq": "3GHz"
+        },
+        "type_id": "gem5.stdlib/gem5.components.boards.simple_board:SimpleBoard"
+      },
+      {
+        "id": "processor-main",
+        "parameters": {
+          "cpu_type": "atomic",
+          "isa": "x86",
+          "num_cores": 1
+        },
+        "type_id": "gem5.stdlib/gem5.components.processors.simple_processor:SimpleProcessor"
+      },
+      {
+        "id": "memory-main",
+        "parameters": {
+          "size": "32MiB"
+        },
+        "type_id": "gem5.stdlib/gem5.components.memory.single_channel:SingleChannelDDR3_1600"
+      },
+      {
+        "id": "cache-main",
+        "parameters": {},
+        "type_id": "gem5.stdlib/gem5.components.cachehierarchies.classic.no_cache:NoCache"
+      },
+      {
+        "id": "workload-main",
+        "parameters": {
+          "local_path": "tests/test-progs/hello/bin/x86/linux/hello",
+          "path_base": "gem5_root",
+          "resource_id": "x86-hello64-static",
+          "resource_version": "1.0.0",
+          "source_kind": "local"
+        },
+        "type_id": "workbench.adapter/se_binary_workload"
+      }
+    ],
+    "connections": [
+      {
+        "id": "processor-to-board",
+        "parameters": {},
+        "source": {
+          "component_id": "processor-main",
+          "port_id": "processor",
+          "slot": null
+        },
+        "target": {
+          "component_id": "board-main",
+          "port_id": "processor",
+          "slot": null
+        }
+      },
+      {
+        "id": "memory-to-board",
+        "parameters": {},
+        "source": {
+          "component_id": "memory-main",
+          "port_id": "memory",
+          "slot": null
+        },
+        "target": {
+          "component_id": "board-main",
+          "port_id": "memory",
+          "slot": null
+        }
+      },
+      {
+        "id": "cache-to-board",
+        "parameters": {},
+        "source": {
+          "component_id": "cache-main",
+          "port_id": "cache_hierarchy",
+          "slot": null
+        },
+        "target": {
+          "component_id": "board-main",
+          "port_id": "cache_hierarchy",
+          "slot": null
+        }
+      },
+      {
+        "id": "workload-to-board",
+        "parameters": {},
+        "source": {
+          "component_id": "workload-main",
+          "port_id": "workload",
+          "slot": null
+        },
+        "target": {
+          "component_id": "board-main",
+          "port_id": "workload",
+          "slot": null
+        }
+      }
+    ],
+    "metadata": {
+      "description": "Offline x86 hello-world Standard Library example",
+      "name": "x86 hello"
+    }
+  },
+  "schema_version": 1
+}

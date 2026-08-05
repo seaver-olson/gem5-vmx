@@ -2,8 +2,8 @@
 
 from collections import Counter
 
-from workbench.model.values import JsonValue
 from workbench.document import ProjectDocument
+from workbench.model.values import JsonValue
 from workbench.registry import (
     ComponentRegistry,
     ParameterType,
@@ -28,7 +28,10 @@ def _matches_parameter_type(value: JsonValue, expected: ParameterType) -> bool:
 
 
 def _allows_source(port: PortDefinition) -> bool:
-    return port.direction in (PortDirection.OUTPUT, PortDirection.BIDIRECTIONAL)
+    return port.direction in (
+        PortDirection.OUTPUT,
+        PortDirection.BIDIRECTIONAL,
+    )
 
 
 def _allows_target(port: PortDefinition) -> bool:
@@ -84,7 +87,10 @@ def validate_registry(
                         field=f"parameters.{parameter_id}",
                     )
                 )
-            elif not _matches_parameter_type(value, parameter.value_type):
+            elif not (
+                (value is None and parameter.nullable)
+                or _matches_parameter_type(value, parameter.value_type)
+            ):
                 diagnostics.append(
                     Diagnostic(
                         "registry.parameter_type",
@@ -95,8 +101,56 @@ def validate_registry(
                         field=f"parameters.{parameter_id}",
                     )
                 )
+            elif (
+                value is not None
+                and parameter.choices
+                and value not in parameter.choices
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        "registry.parameter_choice",
+                        f"Parameter {parameter_id} is not an allowed choice",
+                        DiagnosticSeverity.ERROR,
+                        DiagnosticLayer.REGISTRY,
+                        component_id=component_id,
+                        field=f"parameters.{parameter_id}",
+                    )
+                )
+            elif (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and parameter.minimum is not None
+                and value < parameter.minimum
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        "registry.parameter_minimum",
+                        f"Parameter {parameter_id} must be at least {parameter.minimum}",
+                        DiagnosticSeverity.ERROR,
+                        DiagnosticLayer.REGISTRY,
+                        component_id=component_id,
+                        field=f"parameters.{parameter_id}",
+                    )
+                )
+            elif (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and parameter.maximum is not None
+                and value > parameter.maximum
+            ):
+                diagnostics.append(
+                    Diagnostic(
+                        "registry.parameter_maximum",
+                        f"Parameter {parameter_id} must be at most {parameter.maximum}",
+                        DiagnosticSeverity.ERROR,
+                        DiagnosticLayer.REGISTRY,
+                        component_id=component_id,
+                        field=f"parameters.{parameter_id}",
+                    )
+                )
 
     port_usage: Counter[tuple[object, str]] = Counter()
+    slot_usage: Counter[tuple[object, str, int]] = Counter()
     for connection in project.connections.values():
         source_definition = definitions.get(connection.source.component_id)
         target_definition = definitions.get(connection.target.component_id)
@@ -114,7 +168,10 @@ def validate_registry(
             ("source", connection.source, source_port),
             ("target", connection.target, target_port),
         ):
-            if definitions.get(endpoint.component_id) is not None and port is None:
+            if (
+                definitions.get(endpoint.component_id) is not None
+                and port is None
+            ):
                 diagnostics.append(
                     Diagnostic(
                         "registry.unknown_port",
@@ -140,6 +197,42 @@ def validate_registry(
                             field=f"{field}.slot",
                         )
                     )
+                elif endpoint.slot is None and port.vector:
+                    diagnostics.append(
+                        Diagnostic(
+                            "registry.unresolved_vector_slot",
+                            "Vector-port connections require an explicit slot",
+                            DiagnosticSeverity.ERROR,
+                            DiagnosticLayer.REGISTRY,
+                            component_id=endpoint.component_id,
+                            connection_id=connection.id,
+                            field=f"{field}.slot",
+                        )
+                    )
+                elif endpoint.slot is not None:
+                    slot_usage[
+                        (
+                            endpoint.component_id,
+                            endpoint.port_id,
+                            endpoint.slot,
+                        )
+                    ] += 1
+                    if (
+                        port.maximum_connections is not None
+                        and endpoint.slot >= port.maximum_connections
+                    ):
+                        diagnostics.append(
+                            Diagnostic(
+                                "registry.vector_slot_range",
+                                "Vector-port slot must be below "
+                                f"{port.maximum_connections}",
+                                DiagnosticSeverity.ERROR,
+                                DiagnosticLayer.REGISTRY,
+                                component_id=endpoint.component_id,
+                                connection_id=connection.id,
+                                field=f"{field}.slot",
+                            )
+                        )
         if source_port and not _allows_source(source_port):
             diagnostics.append(
                 Diagnostic(
@@ -162,7 +255,11 @@ def validate_registry(
                     field="target.port_id",
                 )
             )
-        if source_port and target_port and source_port.interface != target_port.interface:
+        if (
+            source_port
+            and target_port
+            and source_port.interface != target_port.interface
+        ):
             diagnostics.append(
                 Diagnostic(
                     "registry.interface_mismatch",
@@ -178,7 +275,10 @@ def validate_registry(
             continue
         for port_id, port in definition.ports.items():
             count = port_usage[(component_id, port_id)]
-            if port.maximum_connections is not None and count > port.maximum_connections:
+            if (
+                port.maximum_connections is not None
+                and count > port.maximum_connections
+            ):
                 diagnostics.append(
                     Diagnostic(
                         "registry.port_cardinality",
@@ -189,4 +289,16 @@ def validate_registry(
                         field=f"ports.{port_id}",
                     )
                 )
+    for (component_id, port_id, slot), count in slot_usage.items():
+        if count > 1:
+            diagnostics.append(
+                Diagnostic(
+                    "registry.duplicate_vector_slot",
+                    f"Vector port {port_id} slot {slot} is used {count} times",
+                    DiagnosticSeverity.ERROR,
+                    DiagnosticLayer.REGISTRY,
+                    component_id=component_id,
+                    field=f"ports.{port_id}[{slot}]",
+                )
+            )
     return diagnostics

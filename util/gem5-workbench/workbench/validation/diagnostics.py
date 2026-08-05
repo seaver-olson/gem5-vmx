@@ -3,7 +3,10 @@
 from dataclasses import dataclass
 from enum import Enum
 
-from workbench.model.identifiers import ComponentId, ConnectionId
+from workbench.model.identifiers import (
+    ComponentId,
+    ConnectionId,
+)
 
 
 class DiagnosticSeverity(Enum):
@@ -17,6 +20,7 @@ class DiagnosticLayer(Enum):
     STRUCTURE = "structure"
     REGISTRY = "registry"
     READINESS = "readiness"
+    EXECUTION = "execution"
 
 
 @dataclass(frozen=True, slots=True)

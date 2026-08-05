@@ -2,7 +2,10 @@
 
 from typing import Any
 
-from workbench.document import FORMAT_ID, SCHEMA_VERSION
+from workbench.document import (
+    FORMAT_ID,
+    SCHEMA_VERSION,
+)
 from workbench.validation.diagnostics import (
     Diagnostic,
     DiagnosticLayer,
@@ -23,12 +26,19 @@ def _error(code: str, message: str, field: str) -> Diagnostic:
 def validate_document_shape(data: Any) -> list[Diagnostic]:
     diagnostics: list[Diagnostic] = []
     if not isinstance(data, dict):
-        return [_error("document.not_object", "Document must be an object", "$")]
+        return [
+            _error("document.not_object", "Document must be an object", "$")
+        ]
     if data.get("format") != FORMAT_ID:
         diagnostics.append(
             _error("document.format", "Unsupported document format", "format")
         )
-    if data.get("schema_version") != SCHEMA_VERSION:
+    schema_version = data.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != SCHEMA_VERSION
+    ):
         diagnostics.append(
             _error(
                 "document.schema_version",
@@ -40,7 +50,11 @@ def validate_document_shape(data: Any) -> list[Diagnostic]:
     layout = data.get("layout")
     if not isinstance(project, dict):
         diagnostics.append(
-            _error("document.project", "Project section must be an object", "project")
+            _error(
+                "document.project",
+                "Project section must be an object",
+                "project",
+            )
         )
     else:
         if not isinstance(project.get("components"), list):
@@ -61,7 +75,9 @@ def validate_document_shape(data: Any) -> list[Diagnostic]:
             )
     if not isinstance(layout, dict):
         diagnostics.append(
-            _error("document.layout", "Layout section must be an object", "layout")
+            _error(
+                "document.layout", "Layout section must be an object", "layout"
+            )
         )
     elif not isinstance(layout.get("components"), dict):
         diagnostics.append(

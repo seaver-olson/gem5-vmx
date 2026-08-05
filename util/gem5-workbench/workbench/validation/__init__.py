@@ -6,6 +6,7 @@ from workbench.validation.diagnostics import (
     DiagnosticSeverity,
 )
 from workbench.validation.document import validate_document_shape
+from workbench.validation.execution import validate_execution_readiness
 from workbench.validation.pipeline import validate_project
 from workbench.validation.readiness import validate_readiness
 from workbench.validation.registry import validate_registry
@@ -16,6 +17,7 @@ __all__ = [
     "DiagnosticLayer",
     "DiagnosticSeverity",
     "validate_document_shape",
+    "validate_execution_readiness",
     "validate_project",
     "validate_readiness",
     "validate_registry",

@@ -7,5 +7,7 @@ TARGET_FPS = 60
 
 TOOLBAR_HEIGHT = 56
 STATUS_BAR_HEIGHT = 28
-PALETTE_WIDTH = 230
-INSPECTOR_WIDTH = 300
+# The palette is a compact component browser; detailed metadata and editing
+# belong in the contextual inspector.
+PALETTE_WIDTH = 210
+INSPECTOR_WIDTH = 360

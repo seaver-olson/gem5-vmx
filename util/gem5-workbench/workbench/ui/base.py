@@ -1,8 +1,9 @@
-
-from abc import ABC, abstractmethod
+from abc import (
+    ABC,
+    abstractmethod,
+)
 
 import pygame
-
 from workbench.state import WorkbenchState
 from workbench.ui.theme import Theme
 
