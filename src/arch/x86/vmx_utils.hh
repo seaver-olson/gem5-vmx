@@ -52,10 +52,10 @@ invdPreExitFault(uint8_t cpl)
 }
 
 inline constexpr InstructionFault
-xsetbvPreExitFault(uint8_t cpl, bool osxsave)
+xsetbvPreExitFault(uint8_t cpl, bool xsave, bool osxsave)
 {
-    // CR4.OSXSAVE recognition precedes the privilege check.
-    if (!osxsave) {
+    // Instruction recognition precedes the privilege check.
+    if (!xsave || !osxsave) {
         return InstructionFault::InvalidOpcode;
     }
     return cpl == 0 ? InstructionFault::None :

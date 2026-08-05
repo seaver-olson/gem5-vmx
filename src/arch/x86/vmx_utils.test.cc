@@ -124,12 +124,25 @@ TEST(VmxInstructionPriority, PreExitFaultsWin)
     using Fault = vmx::InstructionFault;
 
     EXPECT_EQ(vmx::invdPreExitFault(0), Fault::None);
+    EXPECT_EQ(vmx::invdPreExitFault(1), Fault::GeneralProtection);
+    EXPECT_EQ(vmx::invdPreExitFault(2), Fault::GeneralProtection);
     EXPECT_EQ(vmx::invdPreExitFault(3), Fault::GeneralProtection);
 
-    EXPECT_EQ(vmx::xsetbvPreExitFault(0, true), Fault::None);
-    EXPECT_EQ(vmx::xsetbvPreExitFault(3, true), Fault::GeneralProtection);
-    EXPECT_EQ(vmx::xsetbvPreExitFault(0, false), Fault::InvalidOpcode);
-    EXPECT_EQ(vmx::xsetbvPreExitFault(3, false), Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(0, true, true), Fault::None);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(1, true, true),
+              Fault::GeneralProtection);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(2, true, true),
+              Fault::GeneralProtection);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(3, true, true),
+              Fault::GeneralProtection);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(0, false, true),
+              Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(3, false, true),
+              Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(0, true, false),
+              Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::xsetbvPreExitFault(3, true, false),
+              Fault::InvalidOpcode);
 
     EXPECT_EQ(vmx::getsecPreExitFault(true), Fault::None);
     EXPECT_EQ(vmx::getsecPreExitFault(false), Fault::InvalidOpcode);

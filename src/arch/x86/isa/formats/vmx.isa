@@ -324,8 +324,14 @@ output exec {{
         auto *tc = xc->tcBase();
         HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
         CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+        CpuidResult features;
+        const bool xsave = isa && isa->cpuid->doCpuid(
+                tc, FamilyModelStepping, 0, features) &&
+            bits(features.rcx, 26);
         if (Fault fault = architecturalFault(
-                    vmx::xsetbvPreExitFault(m5reg.cpl, cr4.osxsave));
+                    vmx::xsetbvPreExitFault(
+                        m5reg.cpl, xsave, cr4.osxsave));
                 fault != NoFault) {
             return fault;
         }
