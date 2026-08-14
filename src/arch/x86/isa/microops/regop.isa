@@ -1515,17 +1515,17 @@ let {{
                 "0, newVal, StaticInst::size()")
 
     class WrcrLmsw(RegOp):
-        operand_types = (CrDestOp, FoldedSrc1Op, FoldedSrc2Op)
-        def __init__(self, dest, src1, src2, flags=None,
+        operand_types = (CrDestOp, FoldedSrc1Op, FoldedSrc2Op, Imm8Op)
+        def __init__(self, dest, src1, src2, imm=0, flags=None,
                 dataSize="env.dataSize"):
-            super().__init__(dest, src1, src2, flags=flags,
+            super().__init__(dest, src1, src2, imm, flags=flags,
                     dataSize=dataSize)
         code = Wrcr.code.replace(
                 "VmxCrAccessType::MovToCr", "VmxCrAccessType::Lmsw").replace(
                 "dest, VmxCrAccessType::Lmsw, newVal",
                 "dest, VmxCrAccessType::Lmsw, PSrcReg2").replace(
                 "src1, newVal, StaticInst::size()",
-                "0, PSrcReg2, StaticInst::size()")
+                "0, PSrcReg2, StaticInst::size(), imm8 != 0")
 
     # Microops for manipulating segmentation registers
     class SegOp(RegOp):

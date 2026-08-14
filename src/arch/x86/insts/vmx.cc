@@ -579,13 +579,14 @@ ioQualification(bool read, uint16_t port, size_t size)
 
 uint64_t
 crQualification(uint8_t cr, VmxCrAccessType type, uint8_t gpr,
-        uint64_t value)
+        uint64_t value, bool lmswMemoryOperand)
 {
     uint64_t qualification = cr & 0xf;
     qualification |= (static_cast<uint64_t>(type) & 0x3) << 4;
     qualification |= (static_cast<uint64_t>(gpr) & 0xf) << 8;
     if (type == VmxCrAccessType::Lmsw) {
-        qualification |= (value & 0xffff) << 16;
+        qualification |= vmx::lmswQualificationFields(
+                value, lmswMemoryOperand);
     }
     return qualification;
 }
@@ -1311,10 +1312,11 @@ VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
 VmxResult
 VmxState::controlRegisterExit(ExecContext *xc, uint8_t cr,
         VmxCrAccessType type, uint8_t gpr, uint64_t value,
-        uint8_t instructionSize)
+        uint8_t instructionSize, bool lmswMemoryOperand)
 {
     return vmexitInstruction(xc, VmxExitReason::ControlRegisterAccess,
-            instructionSize, crQualification(cr, type, gpr, value));
+            instructionSize, crQualification(
+                cr, type, gpr, value, lmswMemoryOperand));
 }
 
 VmxResult

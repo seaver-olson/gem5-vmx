@@ -2,11 +2,9 @@
 
 ## Scope, status, and conclusion
 
-This audit was refreshed against `c9a1a2efcc` on 2026-07-26.  The only commit
-after the original VMX hardening change (`8f48cd2035`) deletes root-level
-workspace notes; it does not change VMX source, tests, or this audit.  The
-source review below therefore applies to the current branch, including the
-narrow repair recorded in the findings table.
+This audit was rechecked on 2026-08-14 against branch head `1a8d8f5506` plus
+the LMSW qualification repair recorded in the findings table.  The source
+review below therefore applies to the current working tree.
 
 The primary architectural reference is the Intel 64 and IA-32 Architectures
 Software Developer's Manual, Volume 3C, June 2026, order number
@@ -79,7 +77,7 @@ access fails architecturally.  A typed enum or dormant helper is not support.
 | Guest-state save / host-state load | Implemented for accepted state | Includes CR0/3/4, DR7, segments, tables, SYSENTER, EFER when selected, RIP/RSP/RFLAGS, and mode/MMU updates. Transition test proves guest save and immediate host mapping restoration. |
 | VM-instruction errors and CF/ZF | Implemented for the instruction subset | Success clears CF/ZF, VMfailInvalid sets CF, VMfailValid sets ZF and updates error state without changing other RFLAGS. Unit/smoke/transition tests cover representative outcomes and errors 5, 7, and 11. |
 | Exit reason, qualification, and length | Partially implemented | VMCALL, CR access, and directly intercepted #PF are integration-tested. Shared structures support other existing hooks, but every Intel exit form is not claimed. |
-| CR0/CR4 virtualization | Implemented foundational subset | Guest/host masks and read shadows are writable and consulted by MOV-CR, CLTS, and LMSW. Non-exiting writes merge owned bits and use normal CR writes. Transition test covers CR0 shadow reads and CLTS qualification. |
+| CR0/CR4 virtualization | Implemented foundational subset | Guest/host masks and read shadows are writable and consulted by MOV-CR, CLTS, and LMSW. Non-exiting writes merge owned bits and use normal CR writes. Transition tests cover CR0 shadow reads plus CLTS and register/memory LMSW qualifications. |
 | CR3 virtualization | Implemented foundational subset | CR3-load exiting is the only optional primary control. CR3 targets are unavailable (count must be zero). Mode/reserved/physical checks and normal gem5 CR3/MMU side effects are used. Transition test proves non-exiting switch and fault-like exiting switch. |
 | CR8 virtualization | Recognized, not advertised | Existing hooks do not constitute support; CR8 load/store exit controls cannot be enabled. |
 | Exception bitmap | Partially implemented | Writable bitmap and #PF mask/match are consumed by the common fault path. Direct #PF metadata and CR2 preservation are tested. Async/abort-class coverage is limited as described below. |
@@ -137,7 +135,7 @@ excluded by the capability contract.
 | A-07 | Incomplete feature / capability mismatch | SDM Appendix A and 28.1 | Broad pin, I/O, bitmap, HLT, INVLPG, MOV-DR, and CR8 controls were advertised without complete end-to-end behavior or exit metadata. | Reduce allowed controls to CR3-load exiting, required 64-bit modes, and optional EFER save/load; unmap optional capability MSRs. Smoke asserts exact masks after CPU switching. | **Restricted safely** |
 | A-08 | Major correctness error | SDM 33 VMX instruction reference; gem5 decoder and memory request flags | Prefix matching was permissive; address-size override could be mistaken for RIP-relative addressing; VMX memory operands dropped segment flags and checked only their first byte for canonicality. | Require exact mandatory prefixes, use decoded address size, propagate segment/address flags, and check the full operand range for `#SS`/`#GP`. Build-generated decoder and instruction smoke verify accepted encodings; explicit byte/fault differential coverage remains a test limitation. | **Closed in code; differential test pending** |
 | A-09 | Major correctness error | SDM 27, 33 VMCLEAR/VMPTRLD/VMXOFF | VMCLEAR incorrectly inspected revision data and destroyed typed fields; launch/active transitions and VMXOFF cleanup were incomplete. | VMCLEAR preserves fields and clears launch/active state without reading the revision; VMPTRLD performs the revision check; VMXOFF clears active state. Unit, smoke, and transition lifecycle tests cover this. | **Closed for one CPU** |
-| A-10 | Simulator-integration error | SDM 26.8 and 28.1.3; shared gem5 CR micro-ops | Root MOV-to-CR could violate VMX fixed bits; non-root CR0/4 masks were not merged consistently; CLTS/LMSW were conflated. | Enforce root fixed bits in the shared CR write path; add CR read-shadow/write-mask merging and separate CLTS/LMSW exit rules. Seven utility unit cases and transition CLTS coverage protect this. | **Closed** |
+| A-10 | Simulator-integration error | SDM 26.8 and 28.1.3; shared gem5 CR micro-ops | Root MOV-to-CR could violate VMX fixed bits; non-root CR0/4 masks were not merged consistently; CLTS/LMSW were conflated. | Enforce root fixed bits in the shared CR write path; add CR read-shadow/write-mask merging and separate CLTS/LMSW exit rules. Utility tests and transition CLTS/LMSW coverage protect this. | **Closed** |
 | A-11 | Simulator-integration error | gem5 CPU takeover and serialization | VMX state was omitted during CPU-model switching, while KVM host capability MSRs could overwrite the destination CPU's advertised model. Restored VMCS state accepted inconsistent current/active combinations. | Copy dynamic `VmxState`, preserve destination model capability MSRs, and validate serialized lifecycle/field state. Smoke after KVM switch and active-root checkpoint/restore cover both paths. | **Closed for root-mode checkpoint** |
 | A-12 | Major correctness error | SDM 29.8 and 33 VMLAUNCH/VMRESUME | Late VM-entry failure cleared or synthesized exit-information fields beyond exit reason/qualification and marked a VMLAUNCH VMCS launched before guest-state/MSR loading had succeeded. | Separate pre-commit and post-commit failures; late failure loads host state, leaves the VMCS clear, and changes only reason/qualification. Transition preserves the prior event record and immediately verifies VMRESUME error 5. | **Closed** |
 | A-13 | Test weakness | Foundational VMX sections | Earlier tests proved only root lifecycle and a field round trip; kernel modules also depended on mismatched `CONFIG_MODVERSIONS` CRCs and raw CR4 writes. | Add unit, capability, instruction-status, real-translation, entry/exit, negative, and checkpoint layers. Patch every module symbol CRC from the supplied kernel and use Linux CR4-shadow helpers. | **Closed for automated layers; real-hardware differential pending** |
@@ -145,6 +143,7 @@ excluded by the capability contract.
 | A-15 | Incomplete feature | SDM 26.5/26.10 | Active VMCS ownership cannot be checked across logical processors. | Configuration and documentation restrict the verified contract to one logical processor. No capability implies multiprocessor correctness; a future ownership registry is required before widening the contract. | **Restricted** |
 | A-16 | Incomplete feature | SDM 33 VMLAUNCH/VMRESUME; gem5 interrupt-shadow state | VM entry must fail if the logical processor is blocking events because of `MOV SS`, but baseline gem5 has no reusable architectural shadow that the VMX instruction can query. | Do not claim this instruction sequence: document it as outside the verified contract. A shared x86 interrupt-shadow model is required before this precondition can be implemented and differentially tested. | **Restricted** |
 | A-17 | Major fault-priority error | SDM instruction descriptions and VM-exit priority rules; baseline gem5 instruction semantics | The first interception repair sent every non-root INVD, GETSEC, and XSETBV directly to the VMM. It bypassed higher-priority guest #GP/#UD faults, including the guaranteed GETSEC #UD under this model's CR4 fixed-bit contract. | Give each instruction its own pre-exit stage: INVD checks CPL; XSETBV checks CPUID.XSAVE and CR4.OSXSAVE before CPL; GETSEC checks CR4.SMXE before testing non-root state. Unit tests cover the pre-exit decisions. Retain and explicitly exclude post-check root operation semantics. | **Closed for non-root; root restricted** |
+| A-18 | Exit-metadata correctness error | SDM Table 30-3; LMSW macro/micro-op data flow | LMSW reused the low-four-bit CR0 merge value as its VM-exit source, truncating qualification bits 31:16, and never distinguished memory operands in bit 6. | Carry the original operand and an explicit memory-form flag independently of the CR0 merge value. Unit tests cover qualification fields; transition tests prove exact register/memory qualifications, instruction lengths, unchanged CR0, and rejection of upper-GPR garbage. | **Closed** |
 
 ## CR3/MMU correctness assessment
 
@@ -214,17 +213,16 @@ python3 util/style.py src/arch/x86/vmcs.test.cc \
     src/arch/x86/vmx_utils.hh src/arch/x86/vmx_utils.test.cc
 ```
 
-The recorded VMCS unit binary ran 9 tests and the validation/helper binary ran
-7.  The transition integration reported 10 PASS markers (nine architectural
-groups plus completion). The new fault-priority regression adds another group
-when the current suite is run. Normal smoke, active-root checkpoint creation, and
-restore each passed every instruction/state check.  The optimized and fast X86
-gem5 targets built successfully.  The recorded build emitted existing or
-environmental warnings: GCC 14.3 was just beyond gem5's declared 14.2 support
-ceiling, and the cached configuration did not enable optional Capstone, PNG,
-or HDF5 support.  Linux 5.4 module preparation also warned that stack
-validation was disabled; the modules were deliberately built with the
-frame-pointer unwinder.  No VMX test failed in that recorded run.
+The current VMCS unit binary runs 9 tests and the validation/helper binary runs
+9.  The transition integration reports 12 PASS markers (11 architectural
+groups plus completion), including register and memory LMSW qualification.
+Normal smoke, active-root checkpoint creation, and restore have also passed
+every instruction/state check.  The optimized and fast X86 gem5 targets have
+built successfully.  The recorded builds emitted only existing or
+environmental warnings for optional Capstone, PNG, and HDF5 support.  Linux
+5.4 module preparation also warned that stack validation was disabled; the
+modules were deliberately built with the frame-pointer unwinder.  No VMX test
+failed in the recorded runs.
 
 Real-hardware differential tests were not run because a dedicated Intel bare
 metal host was not available.  Non-root checkpoint/restore, compatibility

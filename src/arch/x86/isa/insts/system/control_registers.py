@@ -31,6 +31,8 @@ def macroop CLTS {
     wrcrclts cr0, t1, dataSize=8
 };
 
+# wrcrlmsw takes the merged CR0 value separately from the original 16-bit
+# source and operand-form flag used by VMX exit qualification.
 def macroop LMSW_R {
     rdcr t1, cr0, dataSize=8
     # This logic sets MP, EM, and TS to whatever is in the operand. It will
@@ -39,7 +41,7 @@ def macroop LMSW_R {
     and t1, t1, t2, dataSize=8
     andi t2, reg, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcrlmsw cr0, t1, t2, dataSize=8
+    wrcrlmsw cr0, t1, reg, 0, dataSize=8
 };
 
 def macroop LMSW_M {
@@ -51,7 +53,7 @@ def macroop LMSW_M {
     and t1, t1, t2, dataSize=8
     andi t2, t3, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcrlmsw cr0, t1, t2, dataSize=8
+    wrcrlmsw cr0, t1, t3, 1, dataSize=8
 };
 
 def macroop LMSW_P {
@@ -64,7 +66,7 @@ def macroop LMSW_P {
     and t1, t1, t2, dataSize=8
     andi t2, t3, 0xf, dataSize=8
     or t1, t1, t2, dataSize=8
-    wrcrlmsw cr0, t1, t2, dataSize=8
+    wrcrlmsw cr0, t1, t3, 1, dataSize=8
 };
 
 def macroop SMSW_R {

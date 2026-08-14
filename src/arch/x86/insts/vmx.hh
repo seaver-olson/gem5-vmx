@@ -318,7 +318,7 @@ class VmxState
             uint32_t instructionInfo = 0);
     VmxResult controlRegisterExit(ExecContext *xc, uint8_t cr,
             VmxCrAccessType type, uint8_t gpr, uint64_t value,
-            uint8_t instructionSize);
+            uint8_t instructionSize, bool lmswMemoryOperand = false);
     VmxResult debugRegisterExit(ExecContext *xc, uint8_t dr, bool fromDr,
             uint8_t gpr, uint8_t instructionSize);
     bool vmexitEvent(ThreadContext *tc, const VmxExitInfo &exitInfo);

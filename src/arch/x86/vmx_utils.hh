@@ -160,6 +160,15 @@ lmswCausesExit(uint64_t guestHostMask, uint64_t readShadow,
     return peExit || otherExit;
 }
 
+inline constexpr uint64_t
+lmswQualificationFields(uint64_t source, bool memoryOperand)
+{
+    // Intel SDM Table 30-3: bit 6 identifies a memory operand and bits
+    // 31:16 contain the complete 16-bit LMSW source.
+    return ((source & 0xffff) << 16) |
+        (memoryOperand ? (1ull << 6) : 0);
+}
+
 } // namespace vmx
 } // namespace X86ISA
 } // namespace gem5
