@@ -289,15 +289,27 @@ vmxCr4Enabled(ThreadContext *tc)
     return cr4.vmxe;
 }
 
+// RFLAGS.VM and EFER.LMA-without-CS.L, without CR0.PE. Every VMX instruction
+// except VMCALL folds all three conditions into one #UD check ahead of the
+// non-root VM-exit test (SDM 33, e.g. VMXOFF/VMPTRLD/VMLAUNCH operation
+// sections). VMCALL's own operation section checks "not in VMX operation"
+// alone first, lets a non-root VM exit take priority, and only then applies
+// this narrower mode check.
+bool
+vmxModeRecognized(ThreadContext *tc)
+{
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    Efer efer = isa->readMiscRegNoEffect(misc_reg::Efer);
+    SegAttr cs = isa->readMiscRegNoEffect(misc_reg::CsAttr);
+    return !(getRFlags(tc) & VMBit) && !(efer.lma && !cs.longMode);
+}
+
 bool
 vmxInstructionRecognized(ThreadContext *tc)
 {
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     CR0 cr0 = isa->readMiscRegNoEffect(misc_reg::Cr0);
-    Efer efer = isa->readMiscRegNoEffect(misc_reg::Efer);
-    SegAttr cs = isa->readMiscRegNoEffect(misc_reg::CsAttr);
-    return cr0.pe && !(getRFlags(tc) & VMBit) &&
-        !(efer.lma && !cs.longMode);
+    return cr0.pe && vmxModeRecognized(tc);
 }
 
 bool
@@ -412,7 +424,8 @@ validSegmentLimit(uint32_t limit, SegAttr attr)
 
 bool
 validGuestSegment(int index, uint16_t selector, uint64_t base,
-        uint32_t limit, uint32_t accessRights, bool ia32e, uint8_t cpl)
+        uint32_t limit, uint32_t accessRights, bool ia32e, uint8_t cpl,
+        uint8_t ssDpl)
 {
     const SegAttr attr = vmcsAccessRightsToSegAttr(accessRights);
     if ((index == segment_idx::Cs || index == segment_idx::Tr) &&
@@ -456,9 +469,10 @@ validGuestSegment(int index, uint16_t selector, uint64_t base,
                 (!ia32e && attr.longMode)) {
             return false;
         }
-        // Conforming code may have a lower DPL; nonconforming code must
-        // match the guest CPL exactly.
-        return (type & 0x4) ? attr.dpl <= rpl : attr.dpl == rpl;
+        // SDM 29.3.1.2: conforming code's DPL cannot exceed SS.DPL;
+        // nonconforming code's DPL must equal SS.DPL exactly. This is a
+        // check against SS's access-rights field, not CS's own RPL.
+        return (type & 0x4) ? attr.dpl <= ssDpl : attr.dpl == ssDpl;
 
       case segment_idx::Ss:
         return attr.system && !(type & 0x8) && (type & 0x3) == 0x3 &&
@@ -873,6 +887,17 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
         return failEntry(VmxExitReason::VmEntryInvalidGuestState);
     }
 
+    // CS's own DPL check (below) validates against SS's DPL, not CS's RPL
+    // (SDM 29.3.1.2), so SS's access rights must be available before CS is
+    // reached; GuestSegments processes Es, Cs, Ss in that order.
+    uint64_t guestSsAccessRights = 0;
+    if (!readRequired(vmcs, VmcsField::GuestSsAccessRights,
+                guestSsAccessRights)) {
+        return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+    const uint8_t guestSsDpl = vmcsAccessRightsToSegAttr(
+            bits(guestSsAccessRights, 31, 0)).dpl;
+
     for (const auto &segment : GuestSegments) {
         uint64_t selector = 0;
         uint64_t base = 0;
@@ -887,7 +912,7 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
 
         if (!validGuestSegment(segment.index, bits(selector, 15, 0), base,
                     bits(limit, 31, 0), bits(attrValue, 31, 0), guestIa32e,
-                    bits(guestCsSelector, 1, 0))) {
+                    bits(guestCsSelector, 1, 0), guestSsDpl)) {
             return failEntry(VmxExitReason::VmEntryInvalidGuestState);
         }
     }
@@ -1889,11 +1914,18 @@ VmxState::vmcall(ExecContext *xc, uint8_t instructionSize)
             currentRip(xc->tcBase()), vmxActive, inVmxNonRoot,
             currentVmcsPtr);
 
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+    // VMCALL's fault priority differs from every other VMX instruction: "not
+    // in VMX operation" is checked alone (CR0.PE is not retested here), a
+    // non-root VM exit takes priority over the RFLAGS.VM/EFER.LMA-and-CS.L
+    // #UD check, and only then is CPL checked.
+    if (!vmxActive) {
         return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
     }
     if (inVmxNonRoot) {
         return vmexitInstruction(xc, VmxExitReason::Vmcall, instructionSize);
+    }
+    if (!vmxModeRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
     }
     if (!atCpl0(tc)) {
         return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
