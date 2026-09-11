@@ -1,0 +1,159 @@
+---
+# VMX (Intel VT-x) test suite for the vmx-ext branch.
+#
+# This is independent of gem5 upstream's own CI (ci-tests.yaml,
+# daily-tests.yaml, weekly-tests.yaml), which requires gem5-project-owned
+# self-hosted runners. Everything here runs on ordinary GitHub-hosted
+# runners so it works on a personal fork with no extra setup.
+
+name: VMX Tests
+
+on:
+    push:
+        branches: [vmx-ext]
+        paths:
+            - 'src/arch/x86/**'
+            - 'tests/gem5/vmx/**'
+            - '.github/workflows/vmx-tests.yaml'
+    pull_request:
+        branches: [vmx-ext]
+        paths:
+            - 'src/arch/x86/**'
+            - 'tests/gem5/vmx/**'
+            - '.github/workflows/vmx-tests.yaml'
+    schedule:
+        # Weekly, Monday 06:17 UTC. Off-the-hour to avoid the top-of-hour
+        # scheduling stampede on GitHub's cron infrastructure.
+        - cron: '17 6 * * 1'
+    workflow_dispatch: {}
+
+concurrency:
+    group: vmx-tests-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    # Fast, reliable tier: pure-logic unit tests for the VMX helper
+    # functions (vmx_utils.hh) and VMCS field metadata (vmcs.hh). No guest
+    # kernel, no KVM, no network resources -- this always runs, on every
+    # push/PR that touches VMX code, plus the weekly/manual schedule.
+    vmx-unit-tests:
+        name: VMX unit tests (gtest)
+        runs-on: ubuntu-24.04
+        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
+        timeout-minutes: 30
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Build VMX unit tests
+              run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt -j "$(nproc)"
+
+            - name: Run vmx_utils.test
+              run: build/X86/arch/x86/vmx_utils.test.opt --gtest_output=xml:vmx_utils.test.xml
+
+            - name: Run vmcs.test
+              run: build/X86/arch/x86/vmcs.test.opt --gtest_output=xml:vmcs.test.xml
+
+            - name: Upload gtest results
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: vmx-unit-test-results-${{ github.run_id }}
+                  path: |
+                      vmx_utils.test.xml
+                      vmcs.test.xml
+
+    # Best-effort tier: the full-system kernel-module regression
+    # (tests/gem5/vmx/run.sh transition), which boots a real Linux 5.4.49
+    # guest under gem5 and runs VMX instructions from CPL0. This only runs
+    # on the weekly schedule and on manual dispatch, not on every PR: it
+    # rebuilds a full Linux kernel from source and is slow. `continue-on-error`
+    # keeps resource or host-environment issues in this best-effort tier from
+    # blocking the reliable unit-test tier above.
+    vmx-full-system:
+        name: VMX full-system regression (best effort)
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        runs-on: ubuntu-24.04
+        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
+        timeout-minutes: 90
+        continue-on-error: true
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Install Linux-kernel build dependencies
+              # ubuntu-24.04_all-dependencies has gem5's own deps
+              # (build-essential -> gcc-13, libelf-dev, ...) but not these
+              # kernel-build-specific ones.
+              run: |
+                  apt-get update
+                  apt-get install -y bison flex libssl-dev bc cpio
+
+            - name: Build gem5.opt (X86)
+              run: scons build/X86/gem5.opt -j "$(nproc)"
+
+            - name: Fetch Linux 5.4.49 kernel source
+              run: |
+                  mkdir -p resources
+                  curl -sL -o /tmp/linux-5.4.49.tar.xz \
+                      https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-5.4.49.tar.xz
+                  tar -xf /tmp/linux-5.4.49.tar.xz -C resources/
+
+            - name: Fetch gem5 kernel/disk-image resources
+              run: ./build/X86/gem5.opt tests/gem5/vmx/fetch_resources.py
+
+            - name: Configure the kernel source tree for module builds
+              # A vanilla defconfig defaults to CONFIG_MODULES=n, which
+              # cannot build our .ko at all, and Module.symvers only gets
+              # populated (with every EXPORT_SYMBOL's CRC) by a full build
+              # done *with* CONFIG_MODULES/CONFIG_MODVERSIONS already on --
+              # so both must be set before the first build, not patched in
+              # after. RANDOMIZE_MEMORY/NUMA are trimmed because the
+              # published x86-linux-kernel-5.4.49-1.0.0 image was not built
+              # with them, so a module built against them references
+              # symbols (page_offset_base, vmemmap_base,
+              # alloc_pages_current) that don't exist in that image at all.
+              run: |
+                  KDIR=resources/linux-5.4.49
+                  make -C "$KDIR" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= \
+                      SKIP_STACK_VALIDATION=1 defconfig
+                  "$KDIR"/scripts/config --file "$KDIR"/.config \
+                      --enable MODULES --enable MODVERSIONS \
+                      --enable MODULE_SRCVERSION_ALL \
+                      --disable MODULE_SIG \
+                      --disable RANDOMIZE_BASE --disable RANDOMIZE_MEMORY \
+                      --disable NUMA \
+                      --disable UNWINDER_ORC --enable UNWINDER_FRAME_POINTER
+                  make -C "$KDIR" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= \
+                      SKIP_STACK_VALIDATION=1 olddefconfig
+
+            - name: Build the full kernel once (populates Module.symvers)
+              env:
+                  # Linux 5.4's bundled tools/objtool pulls in
+                  # tools/lib/subcmd, which fails -Werror=use-after-free
+                  # under GCC 13+ (a GCC/kernel-vintage mismatch, not a
+                  # gem5-vmx bug). WERROR=0 is tools/lib/subcmd's own
+                  # opt-out for exactly this.
+                  WERROR: '0'
+              run: |
+                  KDIR=resources/linux-5.4.49
+                  make -C "$KDIR" CC=gcc-13 HOSTCC=gcc-13 LOCALVERSION= \
+                      SKIP_STACK_VALIDATION=1 -j "$(nproc)"
+
+            - name: Build VMX test kernel modules
+              env:
+                  WERROR: '0'
+              run: make -C tests/gem5/vmx
+
+            - name: Run VMX transition regression
+              # No nested-virtualization assumption: GitHub-hosted runners
+              # don't reliably expose /dev/kvm, so this always uses the
+              # slower all-Atomic boot path.
+              run: VMX_NO_KVM=1 tests/gem5/vmx/run.sh transition
+
+            - name: Upload full-system logs
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: vmx-full-system-logs-${{ github.run_id }}
+                  path: |
+                      m5out-vmx-transition/
+                      resources/linux-5.4.49/.config
