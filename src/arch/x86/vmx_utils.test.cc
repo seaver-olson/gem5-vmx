@@ -144,8 +144,12 @@ TEST(VmxInstructionPriority, PreExitFaultsWin)
     EXPECT_EQ(vmx::xsetbvPreExitFault(3, true, false),
               Fault::InvalidOpcode);
 
-    EXPECT_EQ(vmx::getsecPreExitFault(true), Fault::None);
-    EXPECT_EQ(vmx::getsecPreExitFault(false), Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::getsecPreExitFault(0, true), Fault::None);
+    EXPECT_EQ(vmx::getsecPreExitFault(1, true), Fault::GeneralProtection);
+    EXPECT_EQ(vmx::getsecPreExitFault(2, true), Fault::GeneralProtection);
+    EXPECT_EQ(vmx::getsecPreExitFault(3, true), Fault::GeneralProtection);
+    EXPECT_EQ(vmx::getsecPreExitFault(0, false), Fault::InvalidOpcode);
+    EXPECT_EQ(vmx::getsecPreExitFault(3, false), Fault::InvalidOpcode);
 }
 
 } // namespace

@@ -344,20 +344,13 @@ output exec {{
     {
         auto *tc = xc->tcBase();
         CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
         if (Fault fault = architecturalFault(
-                    vmx::getsecPreExitFault(cr4.smxe)); fault != NoFault) {
+                    vmx::getsecPreExitFault(m5reg.cpl, cr4.smxe));
+                fault != NoFault) {
             return fault;
         }
 
-        auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
-        if (isa && isa->vmxState().nonRootActive()) {
-            return finish(xc, VmxExitReason::Getsec);
-        }
-
-        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
-        if (m5reg.cpl != 0) {
-            return std::make_shared<GeneralProtection>(0);
-        }
         return finish(xc, VmxExitReason::Getsec);
     }
 }};

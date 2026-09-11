@@ -245,6 +245,13 @@ InvalidOpcode::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 void
 PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    if (FullSystem) {
+        // Invalidate any matching TLB entries before handling the page
+        // fault, whether it is delivered to the guest directly or
+        // intercepted as a VM exit by the VMX exception bitmap.
+        tc->getMMUPtr()->demapPage(addr, 0);
+    }
+
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
     if (isa && isa->vmxState().nonRootActive()) {
         const uint64_t checkedErrorCode =
@@ -269,8 +276,6 @@ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
     }
 
     if (FullSystem) {
-        // Invalidate any matching TLB entries before handling the page fault.
-        tc->getMMUPtr()->demapPage(addr, 0);
         HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
         X86FaultBase::invoke(tc);
         // If something bad happens while trying to enter the page fault

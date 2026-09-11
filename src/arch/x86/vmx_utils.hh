@@ -63,11 +63,15 @@ xsetbvPreExitFault(uint8_t cpl, bool xsave, bool osxsave)
 }
 
 inline constexpr InstructionFault
-getsecPreExitFault(bool smxe)
+getsecPreExitFault(uint8_t cpl, bool smxe)
 {
-    // SMX recognition precedes the unconditional non-root VM exit.
-    return smxe ? InstructionFault::None :
-        InstructionFault::InvalidOpcode;
+    // SMX recognition precedes the privilege check, which in turn precedes
+    // the unconditional non-root VM exit.
+    if (!smxe) {
+        return InstructionFault::InvalidOpcode;
+    }
+    return cpl == 0 ? InstructionFault::None :
+        InstructionFault::GeneralProtection;
 }
 
 // CR0 bits loaded by VM entry and VM exit. ET, CD, NW, and reserved bits

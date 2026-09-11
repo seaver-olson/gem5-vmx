@@ -1339,14 +1339,16 @@ let {{
             DR7 dr7 = DR7Op;
             if ((cr4.de == 1 && (src1 == 4 || src1 == 5)) || src1 >= 8) {
                 fault = std::make_shared<InvalidOpcode>();
-            } else if (dr7.gd) {
-                fault = std::make_shared<DebugException>();
             } else if (auto *isa =
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                     isa && isa->vmxState().movDrCausesExit()) {
+                // A MOV-DR VM exit takes priority over the DR7.GD-induced
+                // #DB (Intel SDM Vol. 3C 25.1.1/25.1.3).
                 isa->vmxState().debugRegisterExit(
                         xc, src1, true, dest, StaticInst::size());
                 return NoFault;
+            } else if (dr7.gd) {
+                fault = std::make_shared<DebugException>();
             } else {
                 %s
             }
@@ -1366,14 +1368,16 @@ let {{
             } else if ((dest == 6 || dest == 7) && bits(PSrcReg1, 63, 32) &&
                     machInst.mode.mode == LongMode) {
                 fault = std::make_shared<GeneralProtection>(0);
-            } else if (dr7.gd) {
-                fault = std::make_shared<DebugException>();
             } else if (auto *isa =
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                     isa && isa->vmxState().movDrCausesExit()) {
+                // A MOV-DR VM exit takes priority over the DR7.GD-induced
+                // #DB (Intel SDM Vol. 3C 25.1.1/25.1.3).
                 isa->vmxState().debugRegisterExit(
                         xc, dest, false, src1, StaticInst::size());
                 return NoFault;
+            } else if (dr7.gd) {
+                fault = std::make_shared<DebugException>();
             } else {
                 DebugDest = PSrcReg1;
             }
@@ -1421,30 +1425,28 @@ let {{
 
                 auto *vmxIsa =
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
-                if (vmxIsa &&
-                        vmxIsa->vmxState().controlRegisterAccessCausesExit(
-                            dest, VmxCrAccessType::MovToCr, newVal)) {
-                    vmxIsa->vmxState().controlRegisterExit(
-                            xc, dest, VmxCrAccessType::MovToCr,
-                            src1, newVal, StaticInst::size());
-                    return NoFault;
-                } else {
+                RegVal effectiveVal = newVal;
                 if (vmxIsa) {
-                    newVal = vmxIsa->vmxState().controlRegisterWriteValue(
+                    effectiveVal =
+                        vmxIsa->vmxState().controlRegisterWriteValue(
                             dest, newVal, ControlDest);
                     if (!vmxIsa->vmxState().controlRegisterWriteAllowed(
-                                xc->tcBase(), dest, newVal)) {
+                                xc->tcBase(), dest, effectiveVal)) {
                         fault = std::make_shared<GeneralProtection>(0);
                     }
                 }
-                // Check for any modifications that would cause a fault.
+                // Architectural consistency checks are faults, and a fault
+                // takes priority over a VMX control-register VM exit: an
+                // instruction whose written value would be illegal never
+                // reaches the exit (Intel SDM Vol. 3C 25.1.1).
+                if (fault == NoFault) {
                 switch(dest) {
                   case 0:
                     {
                         Efer efer = EferOp;
-                        CR0 cr0 = newVal;
+                        CR0 cr0 = effectiveVal;
                         CR4 oldCr4 = CR4Op;
-                        if (bits(newVal, 63, 32) ||
+                        if (bits(effectiveVal, 63, 32) ||
                                 (!cr0.pe && cr0.pg) ||
                                 (!cr0.cd && cr0.nw) ||
                                 (cr0.pg && efer.lme && !oldCr4.pae))
@@ -1475,15 +1477,15 @@ let {{
                             (1ULL << 16) | // FSGSBASE
                             (1ULL << 17) | // PCIDE
                             (1ULL << 18);  // OSXSAVE
-                        if ((newVal & ~legalCr4Mask) ||
+                        if ((effectiveVal & ~legalCr4Mask) ||
                                 (machInst.mode.mode == LongMode &&
-                                 !bits(newVal, 5)))
+                                 !bits(effectiveVal, 5)))
                             fault = std::make_shared<GeneralProtection>(0);
                     }
                     break;
                   case 8:
                     {
-                        if (bits(newVal, 63, 4))
+                        if (bits(effectiveVal, 63, 4))
                             fault = std::make_shared<GeneralProtection>(0);
                     }
                     break;
@@ -1491,13 +1493,23 @@ let {{
                     fault = std::make_shared<GenericISA::M5PanicFault>(
                             "Unrecognized control register %d.\\n", dest);
                 }
+                }
+
+                if (fault == NoFault && vmxIsa &&
+                        vmxIsa->vmxState().controlRegisterAccessCausesExit(
+                            dest, VmxCrAccessType::MovToCr, newVal)) {
+                    vmxIsa->vmxState().controlRegisterExit(
+                            xc, dest, VmxCrAccessType::MovToCr,
+                            src1, newVal, StaticInst::size());
+                    return NoFault;
+                }
+
                 // Fault-like control-register writes leave architectural
                 // state unchanged.  In particular, do not let a VMX
                 // fixed-bit #GP install a new CR value or trigger its MMU
                 // side effects before the fault is delivered.
                 if (fault == NoFault)
-                    ControlDest = newVal;
-                }
+                    ControlDest = effectiveVal;
             }
             '''
 
