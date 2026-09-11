@@ -712,11 +712,16 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
     if (cr3TargetCount != 0 ||
             readOrZero(vmcs, VmcsVmExitMsrStoreCount) != 0 ||
             readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0 ||
-            readOrZero(vmcs, VmcsVmEntryMsrLoadCount) != 0 ||
             readOrZero(vmcs, VmcsVmEntryIntrInfoField) != 0) {
         return failInstruction(
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
+    // Unlike the counts above, an unsupported nonzero VM-entry MSR-load
+    // count is deliberately not rejected here: SDM Vol. 3C 26.4 places MSR
+    // loading after guest-state loading, so on real hardware this is a late
+    // failure, not an invalid-control-field VM fail. vmEntry() checks it at
+    // the correct point and fails with the dedicated VmEntryMsrLoad exit
+    // reason instead.
 
     if ((procControls & CpuBasedUseIoBitmaps) &&
             (!validAlignedPhysicalAddress(readOrZero(vmcs, VmcsIoBitmapA),
@@ -1152,16 +1157,18 @@ VmxState::loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const
 
 VmxResult
 VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
-        VmxExitReason reason)
+        VmxExitReason reason, uint64_t qualification)
 {
     const uint32_t encodedReason =
         toInt(reason) | VmExitReasonVmEntryFailure;
     vmcs.writeUnchecked(VmcsVmExitReason, encodedReason);
-    vmcs.writeUnchecked(VmcsExitQualification, 0);
+    vmcs.writeUnchecked(VmcsExitQualification, qualification);
     // SDM 29.8 updates only the exit reason and qualification for an
     // invalid-guest-state VM-entry failure. Other VM-exit information fields
     // retain their previous values; clearing them here loses architecturally
-    // visible diagnostic state.
+    // visible diagnostic state. For a VM-entry failure due to MSR loading,
+    // the qualification instead reports the 1-based index of the
+    // VM-entry MSR-load-area entry that caused the failure (SDM 26.4).
 
     Addr hostRip = 0;
     panic_if(!loadHostState(tc, vmcs, hostRip),
@@ -1235,6 +1242,14 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     if (!loadGuestState(tc, *vmcs, guestRip)) {
         return failVmEntry(tc, *vmcs,
                 VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    // SDM Vol. 3C 26.4: VM-entry MSR loading happens after guest-state
+    // loading. MSR-load-area processing itself is not implemented, so a
+    // nonzero count fails entry here, as a late failure reporting the first
+    // MSR-load-area entry (SDM 26.7).
+    if (readOrZero(*vmcs, VmcsVmEntryMsrLoadCount) != 0) {
+        return failVmEntry(tc, *vmcs, VmxExitReason::VmEntryMsrLoad, 1);
     }
 
     inVmxNonRoot = true;

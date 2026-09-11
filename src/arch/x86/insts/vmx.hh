@@ -267,7 +267,7 @@ class VmxState
     bool loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const;
     void saveGuestState(ThreadContext *tc, Vmcs &vmcs) const;
     VmxResult failVmEntry(ThreadContext *tc, Vmcs &vmcs,
-            VmxExitReason reason);
+            VmxExitReason reason, uint64_t qualification = 0);
     VmxResult vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize);
 
   public:
