@@ -1,19 +1,21 @@
 MODULES := vmx_smoke vmx_transition
 obj-m := $(addsuffix .o,$(MODULES))
+SHELL := /bin/bash
 
 REPO_ROOT := $(abspath ../../..)
 KDIR ?= $(REPO_ROOT)/resources/linux-5.4.49
 RESOURCE_KERNEL ?= $(REPO_ROOT)/resources/x86-linux-kernel-5.4.49-1.0.0
 KERNEL_CC ?= gcc-13
 KERNEL_JOBS ?= $(shell nproc)
+KERNEL_WERROR ?= 0
 
 .PHONY: all clean prepare
 
 all: prepare
 	$(MAKE) -C $(KDIR) M=$(CURDIR) CC=$(KERNEL_CC) \
 		HOSTCC=$(KERNEL_CC) LOCALVERSION= CONFIG_UNWINDER_ORC= \
-		SKIP_STACK_VALIDATION=1 modules
-	@set -eu; \
+		SKIP_STACK_VALIDATION=1 WERROR=$(KERNEL_WERROR) modules
+	@set -euo pipefail; \
 	test -f $(RESOURCE_KERNEL); \
 	for module in $(MODULES); do \
 		sed -n 's/^[[:space:]]*{ 0x[0-9a-fA-F]*, "\([A-Za-z0-9_]*\)" },$$/\1/p' \
@@ -22,7 +24,15 @@ all: prepare
 				-v target="__crc_$$symbol" \
 				'$$3 == target { printf "0x%s", \
 				substr($$1, length($$1) - 7) }'); \
-			test -n "$$crc"; \
+			if [ -z "$$crc" ]; then \
+				echo "ERROR: $(RESOURCE_KERNEL) has no" \
+					"__crc_$$symbol; '$$symbol' is not an" \
+					"exported symbol of that exact kernel" \
+					"build (e.g. a KASLR-dependent symbol" \
+					"that only exists as a variable, not an" \
+					"EXPORT_SYMBOL, in some configs)." >&2; \
+				exit 1; \
+			fi; \
 			sed -i -E \
 				"s/\\{ 0x[0-9a-fA-F]+, \"$$symbol\" \\}/\\{ $$crc, \"$$symbol\" \\}/" \
 				$(CURDIR)/$$module.mod.c; \
@@ -42,21 +52,23 @@ all: prepare
 
 prepare:
 	@if [ ! -f $(KDIR)/Module.symvers ]; then \
-		$(KDIR)/scripts/config --file $(KDIR)/.config \
-			--disable UNWINDER_ORC --enable UNWINDER_FRAME_POINTER; \
-		$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
-			LOCALVERSION= SKIP_STACK_VALIDATION=1 olddefconfig; \
-		$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
-			LOCALVERSION= SKIP_STACK_VALIDATION=1 -j$(KERNEL_JOBS); \
-	fi
+			$(KDIR)/scripts/config --file $(KDIR)/.config \
+				--disable UNWINDER_ORC --enable UNWINDER_FRAME_POINTER; \
+			$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
+				LOCALVERSION= SKIP_STACK_VALIDATION=1 \
+				WERROR=$(KERNEL_WERROR) olddefconfig; \
+			$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
+				LOCALVERSION= SKIP_STACK_VALIDATION=1 \
+				WERROR=$(KERNEL_WERROR) -j$(KERNEL_JOBS); \
+		fi
 	@$(KDIR)/scripts/config --file $(KDIR)/.config \
 		--enable UNWINDER_ORC --disable UNWINDER_FRAME_POINTER
 	@$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
 		LOCALVERSION= CONFIG_UNWINDER_ORC= SKIP_STACK_VALIDATION=1 \
-		olddefconfig
+		WERROR=$(KERNEL_WERROR) olddefconfig
 	$(MAKE) -C $(KDIR) CC=$(KERNEL_CC) HOSTCC=$(KERNEL_CC) \
 		LOCALVERSION= CONFIG_UNWINDER_ORC= SKIP_STACK_VALIDATION=1 \
-		modules_prepare
+		WERROR=$(KERNEL_WERROR) modules_prepare
 	@set -eu; \
 	test -f $(RESOURCE_KERNEL); \
 	crc=$$(nm -n $(RESOURCE_KERNEL) | awk \

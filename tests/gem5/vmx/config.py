@@ -16,7 +16,11 @@ from gem5.components.processors.simple_switchable_processor import (
     SimpleSwitchableProcessor,
 )
 from gem5.isas import ISA
-from gem5.resources.resource import obtain_resource
+from gem5.resources.resource import (
+    DiskImageResource,
+    KernelResource,
+    obtain_resource,
+)
 from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.utils.requires import requires
@@ -40,6 +44,8 @@ parser.add_argument(
 checkpoint_group = parser.add_mutually_exclusive_group()
 checkpoint_group.add_argument("--take-checkpoint", type=Path)
 checkpoint_group.add_argument("--restore", type=Path)
+checkpoint_group.add_argument("--take-boot-checkpoint", type=Path)
+checkpoint_group.add_argument("--restore-boot", type=Path)
 args = parser.parse_args()
 module_name = args.module.stem
 guest_module_path = f"/root/{args.module.name}"
@@ -48,6 +54,10 @@ if not args.module.is_file():
     parser.error(f"module not found: {args.module}; run `make -C {TEST_DIR}`")
 if args.restore and not (args.restore / "m5.cpt").is_file():
     parser.error(f"not a gem5 checkpoint directory: {args.restore}")
+if args.restore_boot and not (args.restore_boot / "m5.cpt").is_file():
+    parser.error(f"not a gem5 checkpoint directory: {args.restore_boot}")
+if (args.take_boot_checkpoint or args.restore_boot) and not args.no_kvm:
+    parser.error("boot checkpoints require --no-kvm")
 
 requires(isa_required=ISA.X86, kvm_required=not args.no_kvm)
 
@@ -96,7 +106,12 @@ def guest_script(include_checkpoint: bool, switch_from_kvm: bool) -> str:
         "fi\n"
         + checkpoint_command
         + 'echo "vmx-smoke-harness: unloading module"\n'
-        f"rmmod {module_name} || true\n"
+        f"if ! rmmod {module_name}; then\n"
+        f'    echo "{module_name}: FAIL: rmmod"\n'
+        "    dmesg | tail -n 100\n"
+        "    /sbin/m5 exit\n"
+        "    exit 1\n"
+        "fi\n"
         "dmesg | tail -n 100\n"
         'echo "vmx-smoke-harness: done"\n'
         "/sbin/m5 exit\n"
@@ -140,33 +155,54 @@ board = X86Board(
     ),
 )
 
+kernel_path = args.resource_directory / "x86-linux-kernel-5.4.49-1.0.0"
+disk_path = args.resource_directory / "x86-ubuntu-18.04-img-1.0.0"
 workload = {
-    "kernel": obtain_resource(
-        "x86-linux-kernel-5.4.49",
-        resource_directory=str(args.resource_directory),
-        resource_version="1.0.0",
+    "kernel": (
+        KernelResource(local_path=str(kernel_path))
+        if kernel_path.is_file()
+        else obtain_resource(
+            "x86-linux-kernel-5.4.49",
+            resource_directory=str(args.resource_directory),
+            resource_version="1.0.0",
+        )
     ),
-    "disk_image": obtain_resource(
-        "x86-ubuntu-18.04-img",
-        resource_directory=str(args.resource_directory),
-        resource_version="1.0.0",
+    "disk_image": (
+        DiskImageResource(local_path=str(disk_path), root_partition="1")
+        if disk_path.is_file()
+        else obtain_resource(
+            "x86-ubuntu-18.04-img",
+            resource_directory=str(args.resource_directory),
+            resource_version="1.0.0",
+        )
     ),
     "readfile_contents": guest_script(
         include_checkpoint=bool(args.take_checkpoint or args.restore),
         switch_from_kvm=not args.no_kvm,
     ),
 }
+if args.take_boot_checkpoint:
+    # Resume before reading the payload so a restored boot can test a newly
+    # built module. No module or VMX state is captured in this checkpoint.
+    workload["readfile_contents"] = (
+        "#!/bin/sh\n"
+        "/sbin/m5 checkpoint\n"
+        "/sbin/m5 readfile > /root/vmx-run.sh\n"
+        "exec /bin/sh /root/vmx-run.sh\n"
+    )
 if args.restore:
     workload["checkpoint"] = args.restore
+elif args.restore_boot:
+    workload["checkpoint"] = args.restore_boot
 board.set_kernel_disk_workload(**workload)
 
 
 def checkpoint_handler():
-    destination = args.take_checkpoint.resolve()
+    destination = (args.take_boot_checkpoint or args.take_checkpoint).resolve()
     print(f"vmx-smoke-harness: saving checkpoint to {destination}")
     simulator.save_checkpoint(destination)
     print("vmx-smoke-harness: checkpoint saved")
-    yield False
+    yield bool(args.take_boot_checkpoint)
 
 
 def exit_handler():
@@ -178,11 +214,17 @@ def exit_handler():
 
 
 on_exit_event = {ExitEvent.EXIT: exit_handler()}
-if args.take_checkpoint:
+if args.take_checkpoint or args.take_boot_checkpoint:
     on_exit_event[ExitEvent.CHECKPOINT] = checkpoint_handler()
 
 simulator = Simulator(board=board, on_exit_event=on_exit_event)
-mode = "restore" if args.restore else "checkpoint" if args.take_checkpoint else "normal"
+mode = (
+    "boot-checkpoint" if args.take_boot_checkpoint
+    else "restore-boot" if args.restore_boot
+    else "restore" if args.restore
+    else "checkpoint" if args.take_checkpoint
+    else "normal"
+)
 print(f"vmx-smoke-harness: starting {mode} run")
 simulator.run()
 print(

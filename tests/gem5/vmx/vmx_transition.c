@@ -557,7 +557,9 @@ configure_vmcs(unsigned long host_rsp, unsigned long host_rip)
 	WRITE_FIELD(GUEST_FS_AR_BYTES, segment_access_rights(&gdt, fs));
 	WRITE_FIELD(GUEST_GS_AR_BYTES, segment_access_rights(&gdt, gs));
 	WRITE_FIELD(GUEST_LDTR_AR_BYTES, segment_access_rights(&gdt, ldtr));
-	WRITE_FIELD(GUEST_TR_AR_BYTES, segment_access_rights(&gdt, tr));
+	/* Construct the loaded TR state, not an available TSS descriptor.
+	 * Atomic boot can leave the GDT's busy bit clear after LTR. */
+	WRITE_FIELD(GUEST_TR_AR_BYTES, segment_access_rights(&gdt, tr) | 2U);
 	WRITE_FIELD(GUEST_GDTR_BASE, gdt.address);
 	WRITE_FIELD(GUEST_GDTR_LIMIT, gdt.size);
 	WRITE_FIELD(GUEST_IDTR_BASE, idt.address);

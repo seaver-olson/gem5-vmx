@@ -1,5 +1,5 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+set -euo pipefail
 
 TEST_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "${TEST_DIR}/../../.." && pwd)
@@ -46,6 +46,14 @@ transition)
     ;;
 esac
 
+if [ -n "${VMX_BOOT_CHECKPOINT:-}" ]; then
+    if [ "${VMX_NO_KVM:-0}" != 1 ] || [ "${MODE}" != transition ]; then
+        echo "VMX_BOOT_CHECKPOINT requires VMX_NO_KVM=1 and transition mode"
+        exit 2
+    fi
+    EXTRA_ARGS="${EXTRA_ARGS} --restore-boot ${VMX_BOOT_CHECKPOINT}"
+fi
+
 mkdir -p "${OUTDIR}"
 LOG="${OUTDIR}/console.log"
 SERIAL_LOG="${OUTDIR}/board.pc.com_1.device"
@@ -75,7 +83,7 @@ echo "VMX instruction results:"
 sed -n "s/^.*${RESULT_PREFIX}: PASS: /  [PASS] /p" "${SERIAL_LOG}" |
     tr -d '\r' |
     awk '!seen[$0]++'
-echo "VMX smoke: PASS (${MODE})"
+echo "VMX ${RESULT_PREFIX#vmx_}: PASS (${MODE})"
 if [ "${MODE}" = checkpoint ]; then
     echo "Restore it with: $0 restore"
 fi
