@@ -1,6 +1,7 @@
 #ifndef __ARCH_X86_VMCS_HH__
 #define __ARCH_X86_VMCS_HH__
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -423,6 +424,19 @@ class Vmcs
     LaunchState launchState = LaunchState::Clear;
     FieldMap fields;
 
+    template <size_t NumFields>
+    static constexpr bool
+    fieldInfoTableSorted(const FieldInfo (&fields)[NumFields])
+    {
+        for (size_t i = 1; i < NumFields; ++i) {
+            if (fields[i - 1].encoding() >= fields[i].encoding()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
   public:
     static const FieldInfo *
     lookupField(Field field_id)
@@ -462,8 +476,8 @@ class Vmcs
 
             VMCS_FIELD(GuestPhysicalAddress, VmExitInformation, false),
 
-            VMCS_FIELD(GuestIa32Efer, GuestState, true),
             VMCS_FIELD(VmcsLinkPointer, GuestState, true),
+            VMCS_FIELD(GuestIa32Efer, GuestState, true),
 
             VMCS_FIELD(HostIa32Efer, HostState, true),
 
@@ -561,13 +575,19 @@ class Vmcs
 
 #undef VMCS_FIELD
 
-        for (const auto &field : supportedFields) {
-            if (field.field == field_id) {
-                return &field;
-            }
-        }
+        static_assert(fieldInfoTableSorted(supportedFields),
+                "VMCS field table must be sorted by encoding");
 
-        return nullptr;
+        const auto encoding = encodingOf(field_id);
+        const auto *begin = supportedFields;
+        const auto *end = supportedFields +
+            sizeof(supportedFields) / sizeof(supportedFields[0]);
+        const auto *field = std::lower_bound(begin, end, encoding,
+                [](const FieldInfo &info, Encoding encoding) {
+                    return info.encoding() < encoding;
+                });
+
+        return field != end && field->encoding() == encoding ? field : nullptr;
     }
 
     static const FieldInfo *
@@ -763,18 +783,24 @@ class Vmcs
         return true;
     }
 
+    // Sanitizes against an already-resolved field, avoiding a second
+    // lookupField scan when the caller has already resolved one.
+    static uint64_t
+    sanitizeValue(const FieldInfo *info, uint64_t value)
+    {
+        return info ? (value & widthMask(info->width())) : value;
+    }
+
     static uint64_t
     sanitizeValue(Field field, uint64_t value)
     {
-        const auto *info = lookupField(field);
-        return info ? (value & widthMask(info->width())) : value;
+        return sanitizeValue(lookupField(field), value);
     }
 
     static uint64_t
     sanitizeValue(Encoding encoding, uint64_t value)
     {
-        const auto *field = lookupField(encoding);
-        return field ? sanitizeValue(field->field, value) : value;
+        return sanitizeValue(lookupField(encoding), value);
     }
 
     bool
@@ -796,13 +822,13 @@ class Vmcs
     bool
     read(const FieldEncoding &encoding, uint64_t &value) const
     {
-        if (!lookupField(encoding)) {
+        const auto *field = lookupField(encoding);
+        if (!field) {
             return false;
         }
 
         auto it = fields.find(encoding.fullEncoding());
-        value = it == fields.end() ? 0 :
-            sanitizeValue(encoding.field(), it->second);
+        value = it == fields.end() ? 0 : sanitizeValue(field, it->second);
         if (encoding.highAccess()) {
             value = bits(value, 63, 32);
         }
@@ -834,45 +860,46 @@ class Vmcs
         }
 
         if (encoding.highAccess()) {
-            uint64_t current = 0;
-            read(encoding.field(), current);
+            auto it = fields.find(encoding.fullEncoding());
+            uint64_t current = it == fields.end() ? 0 :
+                sanitizeValue(field, it->second);
             replaceBits(current, 63, 32, bits(value, 31, 0));
-            fields[encoding.fullEncoding()] =
-                sanitizeValue(encoding.field(), current);
+            fields[encoding.fullEncoding()] = sanitizeValue(field, current);
             return true;
         }
 
-        fields[encoding.fullEncoding()] =
-            sanitizeValue(encoding.field(), value);
+        fields[encoding.fullEncoding()] = sanitizeValue(field, value);
         return true;
     }
 
     void
     writeUnchecked(Field field, uint64_t value)
     {
-        panic_if(!fieldSupported(field),
-                "Unsupported VMCS field %#x for unchecked write",
+        const auto *info = lookupField(field);
+        panic_if(!info, "Unsupported VMCS field %#x for unchecked write",
                 encodingOf(field));
-        fields[encodingOf(field)] = sanitizeValue(field, value);
+        fields[encodingOf(field)] = sanitizeValue(info, value);
     }
 
     void
     writeUnchecked(Encoding encoding, uint64_t value)
     {
         FieldEncoding decoded;
-        panic_if(!decodeEncoding(encoding, decoded) || !lookupField(decoded),
-                "Unsupported VMCS field %#x for unchecked write", encoding);
+        const bool validEncoding = decodeEncoding(encoding, decoded);
+        const auto *info = validEncoding ? lookupField(decoded) : nullptr;
+        panic_if(!info, "Unsupported VMCS field %#x for unchecked write",
+                encoding);
 
         if (decoded.highAccess()) {
-            uint64_t current = 0;
-            read(decoded.field(), current);
+            auto it = fields.find(decoded.fullEncoding());
+            uint64_t current = it == fields.end() ? 0 :
+                sanitizeValue(info, it->second);
             replaceBits(current, 63, 32, bits(value, 31, 0));
-            fields[decoded.fullEncoding()] =
-                sanitizeValue(decoded.field(), current);
+            fields[decoded.fullEncoding()] = sanitizeValue(info, current);
             return;
         }
 
-        writeUnchecked(decoded.field(), value);
+        fields[decoded.fullEncoding()] = sanitizeValue(info, value);
     }
 
     void
