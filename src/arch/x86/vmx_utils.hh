@@ -173,6 +173,50 @@ lmswQualificationFields(uint64_t source, bool memoryOperand)
         (memoryOperand ? (1ull << 6) : 0);
 }
 
+// SDM Vol. 3C 26.2.1.3: the processor itself only pushes an error code for
+// these hardware-exception vectors (#DF, #TS, #NP, #SS, #GP, #PF, #AC).
+inline constexpr bool
+hardwareExceptionRequiresErrorCode(uint8_t vector)
+{
+    switch (vector) {
+      case 8:  // #DF
+      case 10: // #TS
+      case 11: // #NP
+      case 12: // #SS
+      case 13: // #GP
+      case 14: // #PF
+      case 17: // #AC
+        return true;
+      default:
+        return false;
+    }
+}
+
+// SDM Vol. 3C 26.2.1.3: the VM-entry interruption-information field's
+// deliver-error-code bit must be set if and only if the injected event is a
+// hardware exception whose vector pushes one. (The SDM also OR's in
+// "unrestricted guest is 0 or guest CR0.PE is 1"; this model never
+// advertises unrestricted guest, so that half of the condition is always
+// true and is omitted here.)
+inline constexpr bool
+eventInjectionErrorCodeValid(bool isHardwareException, uint8_t vector,
+        bool deliverErrorCode)
+{
+    return deliverErrorCode ==
+        (isHardwareException && hardwareExceptionRequiresErrorCode(vector));
+}
+
+// SDM Vol. 3C 26.2.1.3: a software-class injection's VM-entry
+// instruction-length field must be in [0, 15], and a value of 0 is valid
+// only if IA32_VMX_MISC[30] is read as 1.
+inline constexpr bool
+softwareClassInstructionLengthValid(uint64_t instructionLen,
+        bool zeroLengthAllowed)
+{
+    return instructionLen <= 15 &&
+        (instructionLen != 0 || zeroLengthAllowed);
+}
+
 } // namespace vmx
 } // namespace X86ISA
 } // namespace gem5

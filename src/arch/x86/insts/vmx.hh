@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 
 #include "arch/x86/regs/segment.hh"
 #include "arch/x86/vmcs.hh"
@@ -192,6 +193,12 @@ struct VmxResult
     uint32_t instructionError = 0;
     bool redirectsNextPc = false;
     Addr nextPc = 0;
+    // Set when the callee has already pointed the CPU's PCState at a
+    // microcode ROM entry point (VM-entry event injection) rather than a
+    // plain fetch address. The caller must not touch RFLAGS or PCState
+    // again in this case; doing so would clobber the in-flight microcode
+    // dispatch before it runs.
+    bool pcAlreadyRedirected = false;
 
     bool
     succeeded() const
@@ -209,6 +216,13 @@ struct VmxResult
         VmxResult result;
         result.redirectsNextPc = true;
         result.nextPc = next_pc;
+        return result;
+    }
+
+    static VmxResult successPcAlreadySet()
+    {
+        VmxResult result;
+        result.pcAlreadyRedirected = true;
         return result;
     }
 
@@ -246,6 +260,32 @@ class VmxState
     Addr vmxonRegion = 0;
     Addr currentVmcsPtr = InvalidVmcsPointer;
     VmcsMap vmcsRegions;
+    // Tracks "blocking by NMI" (SDM Vol. 3C 24.4.2) across VM entry/exit
+    // for the current VMCS's guest. This model does not implement the
+    // "virtual NMIs" control, "NMI-window exiting", or IRET-triggered
+    // unblocking, so this bit is set only as a direct effect of VM-entry
+    // NMI injection and is otherwise carried through unchanged; it exists
+    // so that a guest hypervisor's VMREAD of the guest-interruptibility-
+    // state field after a VM exit reflects an NMI it asked to inject.
+    bool guestNmiBlocked = false;
+
+    // Tracks the one-instruction "interrupt shadow" the guest hypervisor
+    // requested via the STI-blocking / MOV-SS-blocking bits of the guest-
+    // interruptibility-state field at the most recent VM entry (SDM Vol.
+    // 3C 24.4.2, 26.3.1.5, 6.8.3). gem5 has no general instruction-
+    // boundary hook to model this for native execution, so the shadow is
+    // instead tied to a specific guest RIP: the shadowed instruction is
+    // the one the guest was entered at (or, on a real STI/MOV SS, would
+    // be the one immediately after it, but this model only needs to
+    // reconstruct the shadow as loaded from the VMCS at VM entry), and it
+    // is considered to have retired as soon as the thread's committed PC
+    // is observed to differ from that RIP. This is consulted only while
+    // inVmxNonRoot.
+    mutable bool guestStiShadow = false;
+    mutable bool guestMovSsShadow = false;
+    mutable Addr guestShadowRip = 0;
+
+    void refreshInterruptShadow(ThreadContext *tc) const;
 
     struct VmEntryValidationResult
     {
@@ -269,6 +309,17 @@ class VmxState
     VmxResult failVmEntry(ThreadContext *tc, Vmcs &vmcs,
             VmxExitReason reason, uint64_t qualification = 0);
     VmxResult vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize);
+
+    // Shared "not in VMX operation" #UD / non-root VM-exit / CPL0 #GP
+    // precondition sequence common to most VMX instructions (Intel SDM
+    // Vol. 3C operation sections for VMCLEAR/VMPTRLD/VMPTRST/VMREAD/
+    // VMWRITE/VMXOFF/VMLAUNCH/VMRESUME). Returns a terminal VmxResult if
+    // one of these checks stops the instruction, or std::nullopt if the
+    // caller should continue with its own instruction-specific checks.
+    // VMXON and VMCALL have their own distinct precondition sequences and
+    // do not use this helper.
+    std::optional<VmxResult> commonInstructionEntryCheck(ExecContext *xc,
+            VmxExitReason exitReason, uint8_t instructionSize);
 
   public:
     bool active() const { return vmxActive; }
@@ -298,6 +349,13 @@ class VmxState
     bool shouldExitOnException(uint8_t vector, uint64_t errorCode) const;
     bool shouldExitOnExternalInterrupt() const;
     bool shouldExitOnNmi() const;
+    // Consult and, as a side effect, age out the VM-entry interrupt
+    // shadow armed by the STI-blocking / MOV-SS-blocking interruptibility
+    // bits (see guestStiShadow/guestMovSsShadow above). Intended to be
+    // called once per interrupt-delivery poll of a VMX guest, e.g. from
+    // X86ISA::Interrupts::checkInterrupts().
+    bool interruptShadowBlocksMaskable(ThreadContext *tc) const;
+    bool interruptShadowBlocksNmi(ThreadContext *tc) const;
     bool hltCausesExit() const;
     bool invlpgCausesExit() const;
     bool movDrCausesExit() const;

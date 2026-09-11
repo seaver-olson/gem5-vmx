@@ -53,6 +53,7 @@
 #include <memory>
 
 #include "arch/x86/intmessage.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/regs/apic.hh"
 #include "arch/x86/regs/misc.hh"
 #include "cpu/base.hh"
@@ -665,12 +666,30 @@ X86ISA::Interrupts::Interrupts(const Params &p)
 bool
 X86ISA::Interrupts::checkInterrupts() const
 {
+    // A VMX guest's most recent VM entry may have armed a one-instruction
+    // STI-shadow/MOV-SS-shadow (SDM Vol. 3C 24.4.2, 6.8.3); while it is
+    // still in effect it withholds maskable interrupts (both shadows) and
+    // NMI (MOV-SS-shadow only) from delivery, though not from otherwise
+    // being reported/queued.
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    const bool inVmxGuest = isa && isa->vmxState().nonRootActive();
+    const bool nmiBlocked = inVmxGuest &&
+        isa->vmxState().interruptShadowBlocksNmi(tc);
+    const bool maskableBlocked = inVmxGuest &&
+        isa->vmxState().interruptShadowBlocksMaskable(tc);
+
     RFLAGS rflags = tc->readMiscRegNoEffect(misc_reg::Rflags);
     if (pendingUnmaskableInt) {
-        DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
-        return true;
+        if (pendingSmi || pendingInit || pendingStartup) {
+            DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
+            return true;
+        }
+        if (pendingNmi && !nmiBlocked) {
+            DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
+            return true;
+        }
     }
-    if (rflags.intf) {
+    if (rflags.intf && !maskableBlocked) {
         if (pendingExtInt) {
             DPRINTF(LocalApic, "Reported pending external interrupt.\n");
             return true;

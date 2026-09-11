@@ -52,6 +52,17 @@ namespace gem5
 namespace X86ISA
 {
 
+// Delivers an interrupt or exception through the current (guest or host)
+// IDT using the same microcode gate-dispatch routine as native fault/trap
+// delivery (see X86FaultBase::invoke). This is also used for VMX VM-entry
+// event injection (Intel SDM Vol. 3C 26.5.1), which must push the
+// requested event onto the newly loaded guest context unconditionally,
+// bypassing the exception-bitmap interception that applies to exceptions
+// that arise during normal guest execution. An errorCode of (uint64_t)-1
+// means no error code is pushed.
+void deliverInterruptOrException(ThreadContext *tc, Addr returnRip,
+        uint8_t vector, uint64_t errorCode = (uint64_t)-1);
+
 // Base class for all x86 "faults" where faults is in the m5 sense
 class X86FaultBase : public FaultBase
 {

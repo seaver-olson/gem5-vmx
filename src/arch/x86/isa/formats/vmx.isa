@@ -390,9 +390,13 @@ output exec {{
     {
         if (result.redirectsNextPc) {
             redirectNextPc(tc, result.nextPc);
-        } else {
+        } else if (!result.pcAlreadyRedirected) {
             setVmxResult(tc, result);
         }
+        // If pcAlreadyRedirected is set, the callee (VM-entry event
+        // injection) has already pointed the CPU's PCState at a microcode
+        // ROM entry; touching RFLAGS or PCState again here would clobber
+        // that in-flight dispatch before it runs.
     }
 
     } // namespace
@@ -657,7 +661,7 @@ def template VmxRegMemExecute {{
                 return result.fault;
             }
 
-            if (result.succeeded()) {
+            if (result.succeeded() && !result.redirectsNextPc) {
                 fault = writeRmOperand(xc, value);
                 if (fault != NoFault) {
                     return fault;

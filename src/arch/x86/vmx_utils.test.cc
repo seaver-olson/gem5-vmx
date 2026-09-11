@@ -152,6 +152,56 @@ TEST(VmxInstructionPriority, PreExitFaultsWin)
     EXPECT_EQ(vmx::getsecPreExitFault(3, false), Fault::InvalidOpcode);
 }
 
+// Only #DF/#TS/#NP/#SS/#GP/#PF/#AC push an error code on real hardware; every
+// other vector, including ones adjacent to this set, must not.
+TEST(VmxEventInjection, HardwareExceptionRequiresErrorCode)
+{
+    for (uint8_t vector : {8, 10, 11, 12, 13, 14, 17}) {
+        EXPECT_TRUE(vmx::hardwareExceptionRequiresErrorCode(vector))
+            << "vector " << static_cast<int>(vector);
+    }
+    for (uint8_t vector : {0, 1, 2, 3, 4, 5, 6, 7, 9, 15, 16, 18, 31}) {
+        EXPECT_FALSE(vmx::hardwareExceptionRequiresErrorCode(vector))
+            << "vector " << static_cast<int>(vector);
+    }
+}
+
+// SDM Vol. 3C 26.2.1.3: deliver-error-code must track the vector/type
+// exactly, in both directions, and only for the hardware-exception class.
+TEST(VmxEventInjection, ErrorCodeBitMustMatchVectorAndType)
+{
+    // #GP (13) is a hardware exception that requires an error code.
+    EXPECT_TRUE(vmx::eventInjectionErrorCodeValid(
+            /*isHardwareException=*/true, /*vector=*/13,
+            /*deliverErrorCode=*/true));
+    EXPECT_FALSE(vmx::eventInjectionErrorCodeValid(
+            true, 13, /*deliverErrorCode=*/false));
+
+    // #DE (0) is a hardware exception that never carries an error code.
+    EXPECT_TRUE(vmx::eventInjectionErrorCodeValid(true, 0, false));
+    EXPECT_FALSE(vmx::eventInjectionErrorCodeValid(true, 0, true));
+
+    // The deliver-error-code bit is only meaningful for the hardware-
+    // exception class; any other class must never set it, even for a
+    // vector that would require one as a hardware exception.
+    EXPECT_FALSE(vmx::eventInjectionErrorCodeValid(
+            /*isHardwareException=*/false, /*vector=*/13,
+            /*deliverErrorCode=*/true));
+    EXPECT_TRUE(vmx::eventInjectionErrorCodeValid(false, 13, false));
+}
+
+// SDM Vol. 3C 26.2.1.3: 0-15 is always in range, but 0 needs
+// IA32_VMX_MISC[30].
+TEST(VmxEventInjection, SoftwareClassInstructionLengthValid)
+{
+    EXPECT_TRUE(vmx::softwareClassInstructionLengthValid(1, false));
+    EXPECT_TRUE(vmx::softwareClassInstructionLengthValid(15, false));
+    EXPECT_FALSE(vmx::softwareClassInstructionLengthValid(16, false));
+    EXPECT_FALSE(vmx::softwareClassInstructionLengthValid(0, false));
+    EXPECT_TRUE(vmx::softwareClassInstructionLengthValid(0, true));
+    EXPECT_FALSE(vmx::softwareClassInstructionLengthValid(16, true));
+}
+
 } // namespace
 } // namespace X86ISA
 } // namespace gem5

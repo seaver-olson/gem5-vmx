@@ -78,6 +78,39 @@ vmxInterruptionInfo(uint8_t vector, VmxInterruptionType type,
 } // namespace
 
 void
+deliverInterruptOrException(ThreadContext *tc, Addr returnRip,
+        uint8_t vector, uint64_t errorCode)
+{
+    using namespace X86ISAInst::rom_labels;
+    PCState pc = tc->pcState().as<PCState>();
+    HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+    MicroPC entry;
+    if (m5reg.mode == LongMode) {
+        entry = extern_label_longModeInterrupt;
+    } else {
+        if (m5reg.submode == RealMode)
+            entry = extern_label_realModeInterrupt;
+        else
+            entry = extern_label_legacyModeInterrupt;
+    }
+    tc->setReg(intRegMicro(1), vector);
+    Addr cs_base = tc->readMiscRegNoEffect(misc_reg::CsEffBase);
+    tc->setReg(intRegMicro(7), returnRip - cs_base);
+    if (errorCode != (uint64_t)(-1)) {
+        if (m5reg.mode == LongMode) {
+            entry = extern_label_longModeInterruptWithError;
+        } else {
+            panic("Legacy mode interrupts with error codes "
+                    "aren't implemented.");
+        }
+        tc->setReg(intRegMicro(15), errorCode);
+    }
+    pc.upc(romMicroPC(entry));
+    pc.nupc(romMicroPC(entry) + 1);
+    tc->pcState(pc);
+}
+
+void
 X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
@@ -154,32 +187,7 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 
     PCState pc = tc->pcState().as<PCState>();
     DPRINTF(Faults, "RIP %#x: vector %d: %s\n", pc.pc(), vector, describe());
-    using namespace X86ISAInst::rom_labels;
-    HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
-    MicroPC entry;
-    if (m5reg.mode == LongMode) {
-        entry = extern_label_longModeInterrupt;
-    } else {
-        if (m5reg.submode == RealMode)
-            entry = extern_label_realModeInterrupt;
-        else
-            entry = extern_label_legacyModeInterrupt;
-    }
-    tc->setReg(intRegMicro(1), vector);
-    Addr cs_base = tc->readMiscRegNoEffect(misc_reg::CsEffBase);
-    tc->setReg(intRegMicro(7), pc.pc() - cs_base);
-    if (errorCode != (uint64_t)(-1)) {
-        if (m5reg.mode == LongMode) {
-            entry = extern_label_longModeInterruptWithError;
-        } else {
-            panic("Legacy mode interrupts with error codes "
-                    "aren't implemented.");
-        }
-        tc->setReg(intRegMicro(15), errorCode);
-    }
-    pc.upc(romMicroPC(entry));
-    pc.nupc(romMicroPC(entry) + 1);
-    tc->pcState(pc);
+    deliverInterruptOrException(tc, pc.pc(), vector, errorCode);
 }
 
 std::string

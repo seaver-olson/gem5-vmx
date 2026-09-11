@@ -2,6 +2,7 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 #include <string> // for std::to_string
 #include <utility> // for std::pair and std::move
 #include <vector>
@@ -27,19 +28,21 @@ namespace gem5
 namespace X86ISA
 {
 
+namespace
+{
+// Defined below, alongside the rest of the file's VMX helpers.
+bool canonicalAddress(Addr addr);
+} // namespace
+
 Fault
 vmxMemoryOperandFault(ThreadContext *tc, Addr linear,
         size_t size, Request::Flags operandFlags)
 {
     HandyM5Reg mode = tc->readMiscRegNoEffect(misc_reg::M5Reg);
     if (mode.mode == LongMode) {
-        const auto canonical = [](Addr address) {
-            const uint64_t high = bits(address, 63, 48);
-            return high == (bits(address, 47) ? mask(16) : 0);
-        };
         const bool wraps = size && linear > MaxAddr - (size - 1);
         const Addr last = size ? linear + size - 1 : linear;
-        if (wraps || !canonical(linear) || !canonical(last)) {
+        if (wraps || !canonicalAddress(linear) || !canonicalAddress(last)) {
             const int segment = operandFlags & SegmentFlagMask;
             return segment == segment_idx::Ss ?
                 Fault(std::make_shared<StackFault>(0)) :
@@ -711,17 +714,105 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
     const uint64_t cr3TargetCount = readOrZero(vmcs, VmcsCr3TargetCount);
     if (cr3TargetCount != 0 ||
             readOrZero(vmcs, VmcsVmExitMsrStoreCount) != 0 ||
-            readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0 ||
-            readOrZero(vmcs, VmcsVmEntryIntrInfoField) != 0) {
+            readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0) {
         return failInstruction(
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
     // Unlike the counts above, an unsupported nonzero VM-entry MSR-load
     // count is deliberately not rejected here: SDM Vol. 3C 26.4 places MSR
-    // loading after guest-state loading, so on real hardware this is a late
-    // failure, not an invalid-control-field VM fail. vmEntry() checks it at
-    // the correct point and fails with the dedicated VmEntryMsrLoad exit
-    // reason instead.
+    // loading after guest-state loading and before event injection, so on
+    // real hardware this is a late failure, not an invalid-control-field
+    // VM fail. vmEntry() checks it at the correct point and fails with the
+    // dedicated VmEntryMsrLoad exit reason instead.
+
+    {
+        // SDM Vol. 3C 26.2.1.3: validate the VM-entry event-injection
+        // descriptor. If the valid bit is clear, the rest of the field is
+        // ignored and no event is injected on this entry.
+        const uint32_t entryIntrInfo =
+            bits(readOrZero(vmcs, VmcsVmEntryIntrInfoField), 31, 0);
+        if (bits(entryIntrInfo, 31)) {
+            if (bits(entryIntrInfo, 30, 12) != 0) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
+            const uint8_t vector = bits(entryIntrInfo, 7, 0);
+            const uint8_t type = bits(entryIntrInfo, 10, 8);
+            const bool deliverErrorCode = bits(entryIntrInfo, 11);
+            bool vectorValid = true;
+            bool isSoftwareClass = false;
+            switch (type) {
+              case static_cast<uint8_t>(VmxInterruptionType::
+                      ExternalInterrupt):
+                break;
+              case static_cast<uint8_t>(VmxInterruptionType::Nmi):
+                vectorValid = vector == 2;
+                break;
+              case static_cast<uint8_t>(VmxInterruptionType::
+                      HardwareException):
+                vectorValid = vector <= 31;
+                break;
+              case static_cast<uint8_t>(VmxInterruptionType::
+                      SoftwareInterrupt):
+                isSoftwareClass = true;
+                break;
+              case static_cast<uint8_t>(VmxInterruptionType::
+                      PrivilegedSoftwareException):
+                vectorValid = vector == 1;
+                isSoftwareClass = true;
+                break;
+              case static_cast<uint8_t>(VmxInterruptionType::
+                      SoftwareException):
+                vectorValid = vector == 3 || vector == 4;
+                isSoftwareClass = true;
+                break;
+              default:
+                // Type 1 is reserved on all processors. Type 7 ("other
+                // event") is used only to queue a pending
+                // monitor-trap-flag VM exit; MTF is not modeled here, so
+                // it is rejected rather than silently accepted as a
+                // no-op.
+                vectorValid = false;
+                break;
+            }
+            if (!vectorValid) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
+            const bool isHardwareException = type == static_cast<uint8_t>(
+                        VmxInterruptionType::HardwareException);
+            if (!vmx::eventInjectionErrorCodeValid(isHardwareException,
+                        vector, deliverErrorCode)) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
+            if (deliverErrorCode && bits(readOrZero(vmcs,
+                            VmcsField::VmEntryExceptionErrorCode),
+                        63, 16) != 0) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
+            if (isSoftwareClass) {
+                const uint64_t instructionLen = readOrZero(vmcs,
+                        VmcsField::VmEntryInstructionLen);
+                const bool zeroLengthAllowed = bits(
+                        isa->readMiscRegNoEffect(misc_reg::VmxMisc), 30);
+                if (!vmx::softwareClassInstructionLengthValid(instructionLen,
+                            zeroLengthAllowed)) {
+                    return failInstruction(
+                            VmxInstructionError::VmEntryInvalidControlFields);
+                }
+            }
+            // SDM Vol. 3C 26.2.1.3: injecting any event while the guest is
+            // currently blocked by MOV SS fails VM entry outright, before
+            // any guest state is touched.
+            if (bits(readOrZero(vmcs, VmcsField::GuestInterruptibilityState),
+                        1)) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryEventsBlockedByMovSs);
+            }
+        }
+    }
 
     if ((procControls & CpuBasedUseIoBitmaps) &&
             (!validAlignedPhysicalAddress(readOrZero(vmcs, VmcsIoBitmapA),
@@ -851,10 +942,37 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
             (guestRflags & ReservedRflagsMask) ||
             (guestRflags & VMBit) ||
             readOrZero(vmcs, VmcsGuestActivityState) != 0 ||
-            readOrZero(vmcs, VmcsField::GuestInterruptibilityState) != 0 ||
             readOrZero(vmcs, VmcsField::VmcsLinkPointer) != mask(64) ||
             (guestIa32e && (!guestCr0Bits.pg || !guestCr4Bits.pae))) {
         return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+    }
+
+    // SDM Vol. 3C 26.2.1.1 (interruptibility-state field): validate the
+    // individual bits actually defined by this model rather than
+    // requiring the whole field to be zero. STI-shadow and MOV-SS-shadow
+    // (bits 0/1) are honored for one guest instruction after VM entry (see
+    // guestStiShadow/guestMovSsShadow), so only their internal consistency
+    // is checked here; SMI blocking is not modeled, so its bit must be
+    // zero; blocking-by-NMI (bit 3) is a carry-through value that VM-entry
+    // event injection can set (see vmEntry()), so it is allowed to be
+    // either 0 or 1 here.
+    {
+        constexpr uint64_t StiBlocking = 1ull << 0;
+        constexpr uint64_t MovSsBlocking = 1ull << 1;
+        constexpr uint64_t SmiBlocking = 1ull << 2;
+        constexpr uint64_t NmiBlocking = 1ull << 3;
+        constexpr uint64_t DefinedInterruptibilityBits =
+            StiBlocking | MovSsBlocking | SmiBlocking | NmiBlocking;
+        const uint64_t interruptibility =
+            readOrZero(vmcs, VmcsField::GuestInterruptibilityState);
+        if ((interruptibility & ~DefinedInterruptibilityBits) != 0 ||
+                ((interruptibility & StiBlocking) &&
+                 (interruptibility & MovSsBlocking)) ||
+                ((interruptibility & StiBlocking) &&
+                 !(guestRflags & IFBit)) ||
+                (interruptibility & SmiBlocking)) {
+            return failEntry(VmxExitReason::VmEntryInvalidGuestState);
+        }
     }
 
     if (entryControls & VmEntryLoadIa32Efer) {
@@ -1061,6 +1179,17 @@ VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs) const
     vmcs.writeUnchecked(VmcsGuestIa32SysenterEip,
             tc->readMiscRegNoEffect(misc_reg::SysenterEip));
 
+    // SMI blocking is not modeled, so it always saves back clear;
+    // blocking-by-NMI reflects the effect of the most recent VM-entry NMI
+    // injection (see vmEntry()); STI-shadow/MOV-SS-shadow reflect whether
+    // the guest instruction that armed them has retired yet.
+    refreshInterruptShadow(tc);
+    uint64_t interruptibility = guestNmiBlocked ? (1ull << 3) : 0;
+    interruptibility |= guestStiShadow ? (1ull << 0) : 0;
+    interruptibility |= guestMovSsShadow ? (1ull << 1) : 0;
+    vmcs.writeUnchecked(VmcsField::GuestInterruptibilityState,
+            interruptibility);
+
     DPRINTF(VMX, "VM-exit saved guest state: RIP %#x RSP %#x RFLAGS %#x\n",
             readOrZero(vmcs, VmcsGuestRip), readOrZero(vmcs, VmcsGuestRsp),
             readOrZero(vmcs, VmcsGuestRflags));
@@ -1181,6 +1310,24 @@ VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
     return VmxResult::successRedirect(hostRip);
 }
 
+std::optional<VmxResult>
+VmxState::commonInstructionEntryCheck(ExecContext *xc,
+        VmxExitReason exitReason, uint8_t instructionSize)
+{
+    auto *tc = xc->tcBase();
+    if (!vmxActive || !vmxInstructionRecognized(tc)) {
+        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+    }
+    if (inVmxNonRoot) {
+        return vmexitInstruction(xc, exitReason, instructionSize);
+    }
+    if (!atCpl0(tc)) {
+        return VmxResult::propagateFault(
+                std::make_shared<GeneralProtection>(0));
+    }
+    return std::nullopt;
+}
+
 VmxResult
 VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
 {
@@ -1190,17 +1337,10 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     DPRINTF(VMX, "%s start VMCS %#x\n",
             launch ? "VMLAUNCH" : "VMRESUME", currentVmcsPtr);
 
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc,
+    if (auto result = commonInstructionEntryCheck(xc,
                 launch ? VmxExitReason::Vmlaunch : VmxExitReason::Vmresume,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+                instructionSize)) {
+        return *result;
     }
     if (!vmcs) {
         return VmxResult::failInvalid();
@@ -1245,11 +1385,60 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     }
 
     // SDM Vol. 3C 26.4: VM-entry MSR loading happens after guest-state
-    // loading. MSR-load-area processing itself is not implemented, so a
-    // nonzero count fails entry here, as a late failure reporting the first
-    // MSR-load-area entry (SDM 26.7).
+    // loading and before event injection. MSR-load-area processing itself
+    // is not implemented, so a nonzero count fails entry here, as a late
+    // failure reporting the first MSR-load-area entry (SDM 26.7), rather
+    // than proceeding to inject the requested event.
     if (readOrZero(*vmcs, VmcsVmEntryMsrLoadCount) != 0) {
         return failVmEntry(tc, *vmcs, VmxExitReason::VmEntryMsrLoad, 1);
+    }
+
+    const uint32_t entryIntrInfo =
+        bits(readOrZero(*vmcs, VmcsVmEntryIntrInfoField), 31, 0);
+    const bool injectingEvent = bits(entryIntrInfo, 31);
+    const uint8_t injectionType = bits(entryIntrInfo, 10, 8);
+    const bool injectingNmi = injectingEvent && injectionType ==
+        static_cast<uint8_t>(VmxInterruptionType::Nmi);
+    const uint64_t guestInterruptibility = readOrZero(*vmcs,
+                VmcsField::GuestInterruptibilityState);
+    // SDM Vol. 3C 24.4.2 / 26.5.1.1: blocking-by-NMI carries through from
+    // the guest-interruptibility-state field, and is additionally forced
+    // on whenever this entry injects an NMI, regardless of that field's
+    // incoming value.
+    guestNmiBlocked = injectingNmi || bits(guestInterruptibility, 3);
+    // STI-shadow/MOV-SS-shadow (bits 0/1) carry through unchanged; they
+    // are consumed as soon as the guest's first post-entry instruction
+    // (at guestRip) is observed to have retired (see
+    // refreshInterruptShadow()).
+    guestStiShadow = bits(guestInterruptibility, 0);
+    guestMovSsShadow = bits(guestInterruptibility, 1);
+    guestShadowRip = guestRip;
+
+    if (injectingEvent) {
+        const uint8_t vector = bits(entryIntrInfo, 7, 0);
+        const bool deliverErrorCode = bits(entryIntrInfo, 11);
+        const bool isSoftwareClass = injectionType == static_cast<uint8_t>(
+                    VmxInterruptionType::SoftwareInterrupt) ||
+                injectionType == static_cast<uint8_t>(
+                    VmxInterruptionType::PrivilegedSoftwareException) ||
+                injectionType == static_cast<uint8_t>(
+                    VmxInterruptionType::SoftwareException);
+        const uint64_t instructionLen = isSoftwareClass ?
+            readOrZero(*vmcs, VmcsField::VmEntryInstructionLen) : 0;
+        const uint64_t errorCode = deliverErrorCode ?
+            readOrZero(*vmcs, VmcsField::VmEntryExceptionErrorCode) :
+            (uint64_t)(-1);
+        // Software-class events (software interrupt, privileged software
+        // exception, software exception) push a return RIP as though a
+        // phantom instruction of the given length had just executed at
+        // guestRip; every other class pushes guestRip unchanged, exactly
+        // like a fault that has not yet executed.
+        const Addr pushedRip = guestRip +
+            (isSoftwareClass ? instructionLen : 0);
+        DPRINTF(VMX, "VM-entry injecting event: vector %d type %d "
+                "errorCode %#x return RIP %#x\n", vector, injectionType,
+                deliverErrorCode ? errorCode : 0, pushedRip);
+        deliverInterruptOrException(tc, pushedRip, vector, errorCode);
     }
 
     inVmxNonRoot = true;
@@ -1259,7 +1448,12 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
 
     DPRINTF(VMX, "%s entered VMX non-root at %#x using VMCS %#x\n",
             launch ? "VMLAUNCH" : "VMRESUME", guestRip, currentVmcsPtr);
-    return VmxResult::successRedirect(guestRip);
+    // When an event was injected, the CPU's PCState now points at the
+    // microcode ROM entry that will deliver it (see
+    // deliverInterruptOrException); the caller must redirect fetch to
+    // guestRip only in the ordinary, non-injecting case.
+    return injectingEvent ? VmxResult::successPcAlreadySet() :
+        VmxResult::successRedirect(guestRip);
 }
 
 bool
@@ -1415,6 +1609,40 @@ VmxState::shouldExitOnNmi() const
     uint64_t controls = 0;
     vmcs->read(VmcsPinBasedVmExecControl, controls);
     return controls & PinBasedNmiExiting;
+}
+
+void
+VmxState::refreshInterruptShadow(ThreadContext *tc) const
+{
+    if (!inVmxNonRoot || !(guestStiShadow || guestMovSsShadow)) {
+        return;
+    }
+    // The instruction that was at guestShadowRip when the shadow was
+    // armed retires as soon as the thread's committed PC moves off of it;
+    // real hardware instead counts exactly one instruction boundary, but
+    // since the shadow is only (re-)armed at VM entry, "PC has moved off
+    // the entry RIP" is equivalent and needs no extra per-instruction
+    // hook.
+    if (tc->pcState().instAddr() != guestShadowRip) {
+        guestStiShadow = false;
+        guestMovSsShadow = false;
+    }
+}
+
+bool
+VmxState::interruptShadowBlocksMaskable(ThreadContext *tc) const
+{
+    refreshInterruptShadow(tc);
+    return guestStiShadow || guestMovSsShadow;
+}
+
+bool
+VmxState::interruptShadowBlocksNmi(ThreadContext *tc) const
+{
+    // SDM Vol. 3C 6.8.3: unlike STI-shadow, the shadow after MOV SS/POP SS
+    // also blocks NMI delivery for the one instruction it covers.
+    refreshInterruptShadow(tc);
+    return guestMovSsShadow;
 }
 
 bool
@@ -1750,17 +1978,9 @@ VmxState::vmxon(ExecContext *xc, Addr operandEA,
 VmxResult
 VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
 {
-    auto *tc = xc->tcBase();
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmxoff,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmxoff,
+                instructionSize)) {
+        return *result;
     }
 
     for (auto &entry : vmcsRegions) {
@@ -1781,16 +2001,9 @@ VmxState::vmclear(ExecContext *xc, Addr operandEA,
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
 
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmclear,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmclear,
+                instructionSize)) {
+        return *result;
     }
 
     auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
@@ -1830,16 +2043,9 @@ VmxState::vmptrld(ExecContext *xc, Addr operandEA,
     auto *tc = xc->tcBase();
     uint64_t regionPtr = 0;
 
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmptrld,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmptrld,
+                instructionSize)) {
+        return *result;
     }
 
     auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
@@ -1879,16 +2085,9 @@ VmxState::vmptrst(ExecContext *xc, Addr operandEA,
     const std::vector<bool> byteEnable(sizeof(regionPtr), true);
 
     auto *tc = xc->tcBase();
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmptrst,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmptrst,
+                instructionSize)) {
+        return *result;
     }
 
     auto fault = vmxMemoryOperandFault(
@@ -1957,17 +2156,9 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         uint64_t &value, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
-    auto *tc = xc->tcBase();
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmread,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmread,
+                instructionSize)) {
+        return *result;
     }
     if (!vmcs) {
         return VmxResult::failInvalid();
@@ -1978,10 +2169,8 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    if (!Vmcs::fieldSupported(encoding)) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::UnsupportedVmcsComponent));
-    }
+    // vmcs->read() itself resolves and rejects an unsupported field, so a
+    // separate fieldSupported() pre-check would only repeat that lookup.
     if (!vmcs->read(encoding, value)) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
@@ -1994,18 +2183,10 @@ VmxResult
 VmxState::vmwritePrecheck(ExecContext *xc, uint8_t instructionSize)
 {
     Vmcs *vmcs = currentVmcs();
-    auto *tc = xc->tcBase();
 
-    if (!vmxActive || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-    if (inVmxNonRoot) {
-        return vmexitInstruction(xc, VmxExitReason::Vmwrite,
-                instructionSize);
-    }
-    if (!atCpl0(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmwrite,
+                instructionSize)) {
+        return *result;
     }
     if (!vmcs) {
         return VmxResult::failInvalid();
@@ -2029,11 +2210,15 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    if (!Vmcs::fieldSupported(encoding)) {
+    // A single lookup distinguishes "unsupported" from "read-only" so
+    // vmcs->write() below does not need to repeat it just to report
+    // failure; fieldSupported()+fieldWritable() would each redo the scan.
+    const auto *field = Vmcs::lookupField(encoding);
+    if (!field) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    if (!Vmcs::fieldWritable(encoding)) {
+    if (!field->writable) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::VmwriteReadOnlyVmcsComponent));
     }
@@ -2055,6 +2240,10 @@ VmxState::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
     SERIALIZE_SCALAR(numVmcsRegions);
+    SERIALIZE_SCALAR(guestNmiBlocked);
+    SERIALIZE_SCALAR(guestStiShadow);
+    SERIALIZE_SCALAR(guestMovSsShadow);
+    SERIALIZE_SCALAR(guestShadowRip);
     // Serialize each VMCS region with a unique section name.
     size_t index = 0;
     for (const auto &[regionPtr, vmcs] : vmcsRegions) {
@@ -2084,6 +2273,18 @@ VmxState::unserialize(CheckpointIn &cp)
     UNSERIALIZE_SCALAR(vmxonRegion);
     UNSERIALIZE_SCALAR(currentVmcsPtr);
     UNSERIALIZE_SCALAR(numVmcsRegions);
+    if (!UNSERIALIZE_OPT_SCALAR(guestNmiBlocked)) {
+        guestNmiBlocked = false;
+    }
+    if (!UNSERIALIZE_OPT_SCALAR(guestStiShadow)) {
+        guestStiShadow = false;
+    }
+    if (!UNSERIALIZE_OPT_SCALAR(guestMovSsShadow)) {
+        guestMovSsShadow = false;
+    }
+    if (!UNSERIALIZE_OPT_SCALAR(guestShadowRip)) {
+        guestShadowRip = 0;
+    }
 
     vmcsRegions.clear();
     for (size_t index = 0; index < numVmcsRegions; ++index) {
