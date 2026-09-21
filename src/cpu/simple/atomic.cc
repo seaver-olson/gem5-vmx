@@ -450,7 +450,7 @@ AtomicSimpleCPU::writeMem(uint8_t *data, unsigned size, Addr addr,
     }
 
     // use the CPU's statically allocated write request and packet objects
-    const RequestPtr &req = data_write_req;
+    RequestPtr req = data_write_req;
 
     if (traceData)
         traceData->setMem(addr, size, flags);
@@ -466,14 +466,52 @@ AtomicSimpleCPU::writeMem(uint8_t *data, unsigned size, Addr addr,
     bool predicate;
     Fault fault = NoFault;
 
-    while (1) {
-        predicate = genMemFragmentRequest(req, frag_addr, size, flags,
-                                          byte_enable, frag_size, size_left);
+    // A split store must discover every translation fault before publishing
+    // any data. TimingSimple/O3 already translate their fragments before
+    // issuing stores. Retain each translated Request (including its physical
+    // address, attributes, byte mask and local accessor) without a second
+    // translation or any functional-memory shortcut.
+    struct StoreFragment
+    {
+        RequestPtr request;
+        int size;
+        int remaining;
+        bool active;
+    };
+    std::vector<StoreFragment> fragments;
+    if (size > cacheLineSize() - addrBlockOffset(addr, cacheLineSize())) {
+        Addr next = addr;
+        int remaining = size;
+        while (remaining) {
+            auto fragment = std::make_shared<Request>(*req);
+            int bytes;
+            const bool active = genMemFragmentRequest(fragment, next, size,
+                flags, byte_enable, bytes, remaining);
+            if (active) {
+                fault = thread->mmu->translateAtomic(fragment, thread->getTC(),
+                                                     BaseMMU::Write);
+                if (fault != NoFault)
+                    return fragment->isPrefetch() ? NoFault : fault;
+            }
+            fragments.push_back({std::move(fragment), bytes, remaining, active});
+            next += bytes;
+        }
+    }
 
-        // translate to physical address
-        if (predicate)
-            fault = thread->mmu->translateAtomic(req, thread->getTC(),
-                                                 BaseMMU::Write);
+    while (1) {
+        if (fragments.empty()) {
+            predicate = genMemFragmentRequest(req, frag_addr, size, flags,
+                                              byte_enable, frag_size, size_left);
+            if (predicate)
+                fault = thread->mmu->translateAtomic(req, thread->getTC(),
+                                                     BaseMMU::Write);
+        } else {
+            const auto &fragment = fragments.at(curr_frag_id);
+            req = fragment.request;
+            frag_size = fragment.size;
+            size_left = fragment.remaining;
+            predicate = fragment.active;
+        }
 
         // Now do the access.
         if (predicate && fault == NoFault) {

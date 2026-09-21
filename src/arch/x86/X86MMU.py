@@ -37,12 +37,15 @@
 
 from m5.objects.BaseMMU import BaseMMU
 from m5.objects.X86TLB import X86TLB
+from m5.params import Param
+from m5.proxy import Parent
 
 
 class X86MMU(BaseMMU):
     type = "X86MMU"
     cxx_class = "gem5::X86ISA::MMU"
     cxx_header = "arch/x86/mmu.hh"
+    system = Param.System(Parent.any, "System owning physical address spaces")
     itb = X86TLB(entry_type="instruction")
     dtb = X86TLB(entry_type="data")
 

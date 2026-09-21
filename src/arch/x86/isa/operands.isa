@@ -111,6 +111,10 @@ let {{
                               'IsNonSpeculative']),
                 id)
 
+    class PagingTemp(IntRegOp):
+        def __init__(self, idx, id):
+            super().__init__('uqw', idx, ['IsNonSpeculative', 'IsSerializing'], id)
+
     class SquashCheckReg(ControlRegOp):
         def __init__(self, idx, id, check, ctype='uqw'):
             super().__init__(ctype, idx,
@@ -127,9 +131,10 @@ let {{
         def __init__(self, idx, id, ctype='uqw'):
             super().__init__(idx, id, 'dest == X86ISA::segment_idx::Cs', ctype)
 
-    class SquashCR0Reg(SquashCheckReg):
+    class SquashPagingReg(SquashCheckReg):
         def __init__(self, idx, id, ctype='uqw'):
-            super().__init__(idx, id, 'dest == 0', ctype)
+            # Paging changes must discard instructions fetched in the old context.
+            super().__init__(idx, id, 'dest == 0 || dest == 3 || dest == 4', ctype)
 }};
 
 def operands {{
@@ -232,7 +237,7 @@ def operands {{
 
         # Operands to get and set registers indexed by the operands of the
         # original instruction.
-        'ControlDest':   SquashCR0Reg('X86ISA::misc_reg::cr(dest)', 100),
+        'ControlDest':   SquashPagingReg('X86ISA::misc_reg::cr(dest)', 100),
         'ControlSrc1':   ControlReg('X86ISA::misc_reg::cr(src1)', 101),
         'DebugDest':     ControlReg('X86ISA::misc_reg::dr(dest)', 102),
         'DebugSrc1':     ControlReg('X86ISA::misc_reg::dr(src1)', 103),
@@ -248,6 +253,16 @@ def operands {{
         # Operands to access specific control registers directly.
         'EferOp':        SquashCReg('X86ISA::misc_reg::Efer', 200),
         'CR4Op':         ControlReg('X86ISA::misc_reg::Cr4', 201),
+        'CR3Op':         ControlReg('X86ISA::misc_reg::Cr3', 202),
+        'CR0Op':         ControlReg('X86ISA::misc_reg::Cr0', 220),
+        'VmxValue':      IntReg('X86ISA::intRegMicro(2)', 227),
+        'VmxHeader':     IntReg('X86ISA::intRegMicro(3)', 228),
+        'PdpteBase':     PagingTemp('X86ISA::intRegMicro(1)', 221),
+        'PdpteTemp0':    IntReg('X86ISA::intRegMicro(2)', 222),
+        'PdpteTemp1':    IntReg('X86ISA::intRegMicro(3)', 223),
+        'PdpteTemp2':    IntReg('X86ISA::intRegMicro(4)', 224),
+        'PdpteTemp3':    IntReg('X86ISA::intRegMicro(5)', 225),
+        'PdpteControl':  IntReg('X86ISA::intRegMicro(6)', 226),
         'DR7Op':         ControlReg('X86ISA::misc_reg::Dr7', 202),
         'LDTRBase':      ControlReg('X86ISA::misc_reg::TslBase', 203),
         'LDTRLimit':     ControlReg('X86ISA::misc_reg::TslLimit', 204),

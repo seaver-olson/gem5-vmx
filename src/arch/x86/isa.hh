@@ -29,6 +29,7 @@
 #ifndef __ARCH_X86_ISA_HH__
 #define __ARCH_X86_ISA_HH__
 
+#include <array>
 #include <iostream>
 #include <string>
 
@@ -61,9 +62,12 @@ class ISA : public BaseISA
 
     std::string vendorString;
     VmxState vmx;
+    std::array<RegVal, 4> paePdpteRegs{};
 
   public:
     void clear() override;
+    const std::array<RegVal, 4> &paePdpte() const { return paePdpteRegs; }
+    Fault loadPaePdpte(const std::array<RegVal, 4> &values);
 
     PCStateBase *
     newPCState(Addr new_inst_addr=0) const override

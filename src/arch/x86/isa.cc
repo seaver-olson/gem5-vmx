@@ -29,7 +29,9 @@
 #include "arch/x86/isa.hh"
 
 #include "arch/x86/decoder.hh"
+#include "arch/x86/faults.hh"
 #include "arch/x86/mmu.hh"
+#include "arch/x86/paging.hh"
 #include "arch/x86/regs/ccr.hh"
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
@@ -136,6 +138,7 @@ ISA::clear()
     // architectural state.  Keeping a stale current VMCS across reset would
     // allow VMREAD/VMWRITE after the processor has left VMX operation.
     vmx = VmxState{};
+    paePdpteRegs.fill(0);
 
     // Blank everything. 0 might not be an appropriate value for some things,
     // but it is for most.
@@ -321,6 +324,7 @@ ISA::copyRegsFrom(ThreadContext *src)
     auto *src_isa = dynamic_cast<ISA *>(src->getIsaPtr());
     panic_if(!src_isa, "Cannot copy x86 VMX state from a non-x86 ISA");
     vmx = src_isa->vmxState();
+    paePdpteRegs = src_isa->paePdpte();
     tc->pcState(src->pcState());
 }
 
@@ -440,6 +444,10 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
                              regVal[misc_reg::Rflags]);
         }
         break;
+      case misc_reg::Efer:
+        if (Efer(regVal[idx] ^ val).nxe)
+            tc->getMMUPtr()->flushAll();
+        break;
       case misc_reg::Cr2:
         break;
       case misc_reg::Cr3:
@@ -448,7 +456,7 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
       case misc_reg::Cr4:
         {
             CR4 toggled = regVal[idx] ^ val;
-            if (toggled.pae || toggled.pse || toggled.pge) {
+            if (toggled.pae || toggled.pse || toggled.pge || toggled.pcide) {
                 tc->getMMUPtr()->flushAll();
             }
         }
@@ -613,6 +621,8 @@ ISA::serialize(CheckpointOut &cp) const
     BaseISA::serialize(cp);
 
     SERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
+    for (unsigned i = 0; i < 4; ++i)
+        paramOut(cp, csprintf("paePdpte%u", i), paePdpteRegs[i]);
 
     {
         Serializable::ScopedCheckpointSection sec(cp, "vmx");
@@ -624,6 +634,15 @@ void
 ISA::unserialize(CheckpointIn &cp)
 {
     UNSERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
+    bool complete = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        paePdpteRegs[i] = 0;
+        complete &= optParamIn(cp, csprintf("paePdpte%u", i),
+                               paePdpteRegs[i], false);
+    }
+    fatal_if(!complete && CR0(regVal[misc_reg::Cr0]).pg &&
+             CR4(regVal[misc_reg::Cr4]).pae && !Efer(regVal[misc_reg::Efer]).lme,
+             "Active legacy PAE checkpoint lacks retained PDPTE registers");
     updateHandyM5Reg(regVal[misc_reg::Efer],
                      regVal[misc_reg::Cr0],
                      regVal[misc_reg::CsAttr],
@@ -641,6 +660,23 @@ ISA::setThreadContext(ThreadContext *_tc)
 {
     BaseISA::setThreadContext(_tc);
     tc->getDecoderPtr()->as<Decoder>().setM5Reg(regVal[misc_reg::M5Reg]);
+}
+
+Fault
+ISA::loadPaePdpte(const std::array<RegVal, 4> &values)
+{
+    CpuidResult addressSize;
+    fatal_if(!cpuid->doCpuid(tc, 0x80000008, 0, addressSize),
+             "Missing physical address width CPUID");
+    const unsigned width = bits(addressSize.rax, 7, 0);
+    fatal_if(width < 32 || width > 52, "Unsupported physical address width");
+    for (auto value : values) {
+        if (!paging::validPaePdpte(value, width))
+            return std::make_shared<GeneralProtection>(0);
+    }
+    paePdpteRegs = values;
+    tc->getMMUPtr()->flushAll();
+    return NoFault;
 }
 
 std::string

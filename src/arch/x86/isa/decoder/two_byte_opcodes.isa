@@ -645,10 +645,10 @@
                 // no prefix
                 0x0: decode OPCODE_OP_BOTTOM3 {
                     0x0: decode MODRM_MOD {
-                        default: VmxRegMemInst::VMREAD();
+                        default: Inst::VMREAD(Ev,Gv);
                     }
                     0x1: decode MODRM_MOD {
-                        default: VmxRegMemInst::VMWRITE();
+                        default: Inst::VMWRITE(Gv,Ev);
                     }
                     0x6: MOVD(Edp,Pdp);
                     0x7: MOVQ(Qq,Pq);
@@ -871,55 +871,24 @@
                     //Also CMPXCHG16B
                     0x1: CMPXCHG8B(Mdp);
                     0x6: decode LEGACY_DECODEVAL {
-                        // VMCLEAR requires exactly the 66H mandatory prefix.
                         0x1: decode MODRM_MOD {
-                            0x0: decode MODE_SUBMODE {
-                                0x4: decode MODRM_RM {
-                                    0x5: VmxMemInst::VMCLEAR_P_0(true);
-                                    default: VmxMemInst::VMCLEAR_M_0(false);
-                                }
-                                default: VmxMemInst::VMCLEAR_M_1(false);
-                            }
                             0x3: UD2();
-                            default: VmxMemInst::VMCLEAR_M_2(false);
+                            default: Inst::VMCLEAR(Mq);
                         }
-                        // VMXON requires exactly the F3H mandatory prefix.
                         0x4: decode MODRM_MOD {
-                            0x0: decode MODE_SUBMODE {
-                                0x4: decode MODRM_RM {
-                                    0x5: VmxMemInst::VMXON_P_0(true);
-                                    default: VmxMemInst::VMXON_M_0(false);
-                                }
-                                default: VmxMemInst::VMXON_M_1(false);
-                            }
                             0x3: UD2();
-                            default: VmxMemInst::VMXON_M_2(false);
+                            default: Inst::VMXON(Mq);
                         }
-                        // VMPTRLD has no mandatory prefix.
                         0x0: decode MODRM_MOD {
-                            0x0: decode MODE_SUBMODE {
-                                0x4: decode MODRM_RM {
-                                    0x5: VmxMemInst::VMPTRLD_P_0(true);
-                                    default: VmxMemInst::VMPTRLD_M0(false);
-                                }
-                                default: VmxMemInst::VMPTRLD_M_1(false);
-                            }
                             0x3: UD2();
-                            default: VmxMemInst::VMPTRLD_M_2(false);
+                            default: Inst::VMPTRLD(Mq);
                         }
                         default: UD2();
                     }
                     0x7: decode LEGACY_DECODEVAL {
                         0x0: decode MODRM_MOD {
-                            0x0: decode MODE_SUBMODE {
-                                0x4: decode MODRM_RM {
-                                    0x5: VmxMemInst::VMPTRST_P_0(true);
-                                    default: VmxMemInst::VMPTRST_M_0(false);
-                                }
-                                default: VmxMemInst::VMPTRST_M_1(false);
-                            }
                             0x3: UD2();
-                            default: VmxMemInst::VMPTRST_M_2(false);
+                            default: Inst::VMPTRST(Mq);
                         }
                         default: UD2();
                     }

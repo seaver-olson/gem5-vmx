@@ -621,10 +621,9 @@ X86_64Process::initState()
             tc->setMiscReg(misc_reg::Ftw, 0xffff);
             tc->setMiscReg(misc_reg::Fcw, 0x037f);
 
-            // Setting CR3 to the process pid so that concatinated
-            // page addr with lower 12 bits of CR3 can be used in SE
-            // mode as well to avoid conflicts between tlb entries with
-            // same virtual addresses belonging to different processes
+            // Retain the SE process identifier in CR3 for compatibility.
+            // TLB tags use the full page-table PID directly; an emulated
+            // process identifier is not limited to the 12-bit PCID field.
             tc->setMiscReg(misc_reg::Cr3, pTable->pid());
 
             // Setting pcide bit in CR4

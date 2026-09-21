@@ -257,7 +257,7 @@ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
         // Invalidate any matching TLB entries before handling the page
         // fault, whether it is delivered to the guest directly or
         // intercepted as a VM exit by the VMX exception bitmap.
-        tc->getMMUPtr()->demapPage(addr, 0);
+        static_cast<MMU *>(tc->getMMUPtr())->invalidateLinear(addr, tc);
     }
 
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());

@@ -454,7 +454,7 @@ let {{
 
     def defineMicroLoadOp(mnemonic, code, bigCode='',
                           mem_flags="0", big=True, nonSpec=False,
-                          is_float=False):
+                          is_float=False, ea_code=calculateEA):
         global header_output
         global decoder_output
         global exec_output
@@ -470,12 +470,12 @@ let {{
         # Build up the all register version of this micro op
         iops = [InstObjParams(name, Name, base,
                               { "code": code,
-                                "ea_code": calculateEA,
+                                "ea_code": ea_code,
                                 "memDataSize": "dataSize" })]
         if big:
             iops += [InstObjParams(name, Name + "Big", base,
                                    { "code": bigCode,
-                                     "ea_code": calculateEA,
+                                     "ea_code": ea_code,
                                      "memDataSize": "dataSize" })]
         for iop in iops:
             header_output += MicroLdStOpDeclare.subst(iop)
@@ -502,6 +502,18 @@ let {{
 
     defineMicroLoadOp('Ld', 'Data = merge(Data, data, Mem, dataSize);',
                             'Data = Mem & mask(dataSize * 8);')
+    defineMicroLoadOp('Ldvmx', 'Data = Mem;', big=False, nonSpec=True)
+    defineMicroLoadOp('Ldvmxheader', 'Data = Mem;',
+        mem_flags='Request::PHYSICAL', big=False, nonSpec=True,
+        ea_code='EA = Base;')
+
+    defineMicroLoadOp('Ldpdpte', 'Data = Mem;',
+        mem_flags='Request::PHYSICAL', big=False, nonSpec=True,
+        ea_code='''EA = Base + disp;
+            auto memFlags = this->memFlags;
+            if (bits(PdpteControl, 30))
+                memFlags |= Request::UNCACHEABLE | Request::STRICT_ORDER;
+        ''')
     defineMicroLoadOp('Ldst', 'Data = merge(Data, data, Mem, dataSize);',
                               'Data = Mem & mask(dataSize * 8);',
                       'Request::READ_MODIFY_WRITE')
@@ -749,7 +761,8 @@ let {{
             return NoFault;
         }
 
-        xc->demapPage(EA, 0);
+        static_cast<MMU *>(xc->tcBase()->getMMUPtr())->
+            invalidateLinear(EA, xc->tcBase());
 ''',
                           "ea_code": calculateEA,
                           "memDataSize": "dataSize" })
@@ -759,5 +772,12 @@ let {{
     class TiaOp(MemNoDataOp):
         className = "Tia"
         mnemonic = "tia"
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            # Invalidation follows older stores and discards instructions
+            # fetched using the old translation, including on O3.
+            for flag in ("IsNonSpeculative", "IsSerializing", "IsSquashAfter"):
+                self.instFlags += f" | (1ULL << StaticInst::{flag})"
     microopClasses["tia"] = TiaOp
 }};

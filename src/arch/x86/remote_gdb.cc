@@ -45,6 +45,7 @@
 #include <string>
 
 #include "arch/x86/mmu.hh"
+#include "arch/x86/ldstflags.hh"
 #include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/process.hh"
 #include "arch/x86/regs/int.hh"
@@ -74,25 +75,19 @@ RemoteGDB::RemoteGDB(System *_system, ListenSocketConfig _listen_config) :
 bool
 RemoteGDB::acc(Addr va, size_t len)
 {
-    if (FullSystem) {
-        Walker *walker = dynamic_cast<MMU *>(
-            context()->getMMUPtr())->getDataWalker();
-        unsigned logBytes;
-        Fault fault = walker->startFunctional(context(), va, logBytes,
-                                              BaseMMU::Read);
-        if (fault != NoFault)
+    if (len == 0)
+        return true;
+    if (va + len - 1 < va)
+        return false;
+    const Request::Flags flags = segment_idx::Ds |
+        (3 << AddrSizeFlagShift);
+    auto translations = context()->getMMUPtr()->translateFunctional(
+        va, len, context(), BaseMMU::Read, flags);
+    for (const auto &range : *translations) {
+        if (range.fault != NoFault)
             return false;
-
-        Addr endVa = va + len - 1;
-        if ((va & ~mask(logBytes)) == (endVa & ~mask(logBytes)))
-            return true;
-
-        fault = walker->startFunctional(context(), endVa, logBytes,
-                                        BaseMMU::Read);
-        return fault == NoFault;
-    } else {
-        return context()->getProcessPtr()->pTable->lookup(va) != nullptr;
     }
+    return true;
 }
 
 BaseGdbRegCache*

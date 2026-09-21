@@ -327,15 +327,15 @@ class VmxState
     Addr vmxonPtr() const { return vmxonRegion; }
     Addr currentVmcsPointer() const { return currentVmcsPtr; }
 
-    VmxResult vmxon(ExecContext *xc, Addr operandEA,
-            Request::Flags operandFlags, uint8_t instructionSize);
+    // Native micro-ops separate architectural prechecks, operand transport,
+    // region validation and commit. Helpers never access linear operands.
+    VmxResult prepareOperand(ExecContext *xc, VmxExitReason operation,
+            uint64_t field, uint64_t &value, bool &access);
+    VmxResult checkRegionOperand(ExecContext *xc, VmxExitReason operation,
+            uint64_t pointer, bool &readHeader);
+    VmxResult completeOperand(ExecContext *xc, VmxExitReason operation,
+            uint64_t field, uint64_t value, uint32_t header);
     VmxResult vmxoff(ExecContext *xc, uint8_t instructionSize);
-    VmxResult vmclear(ExecContext *xc, Addr operandEA,
-            Request::Flags operandFlags, uint8_t instructionSize);
-    VmxResult vmptrld(ExecContext *xc, Addr operandEA,
-            Request::Flags operandFlags, uint8_t instructionSize);
-    VmxResult vmptrst(ExecContext *xc, Addr operandEA,
-            Request::Flags operandFlags, uint8_t instructionSize);
     VmxResult vmlaunch(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmresume(ExecContext *xc, uint8_t instructionSize);
     VmxResult vmcall(ExecContext *xc, uint8_t instructionSize);

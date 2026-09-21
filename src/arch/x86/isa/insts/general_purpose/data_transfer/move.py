@@ -174,7 +174,16 @@ def macroop MOVZX_W_R_P {
 def macroop MOV_C_R {
     .serialize_after
     .adjust_env maxOsz
-    wrcr cr, regm
+    prepcr cr, regm
+    limm t7, "~0ULL", dataSize=8
+    sub t0, t1, t7, flags=(EZF,), dataSize=8
+    br label("writeCr"), flags=(CEZF,)
+    ldpdpte t2, ds, [1, t0, t1], 0, dataSize=8, addressSize=8
+    ldpdpte t3, ds, [1, t0, t1], 8, dataSize=8, addressSize=8
+    ldpdpte t4, ds, [1, t0, t1], 16, dataSize=8, addressSize=8
+    ldpdpte t5, ds, [1, t0, t1], 24, dataSize=8, addressSize=8
+writeCr:
+    wrcrpae cr, regm
 };
 
 def macroop MOV_R_C {

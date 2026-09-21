@@ -40,6 +40,7 @@
 #define __ARCH_X86_PAGETABLE_HH__
 
 #include <cstdint>
+#include <tuple>
 
 #include "arch/x86/page_size.hh"
 #include "base/bitunion.hh"
@@ -62,6 +63,20 @@ typedef Trie<Addr, X86ISA::TlbEntry> TlbEntryTrie;
 
 namespace X86ISA
 {
+    // Keep logical-thread identity separate from the address prefix. In FS,
+    // addressSpace is a PCID; SE uses the complete emulated process ID.
+    struct TlbContext
+    {
+        ContextID thread = 0;
+        uint64_t addressSpace = 0;
+
+        bool operator<(const TlbContext &other) const
+        {
+            return std::tie(thread, addressSpace) <
+                   std::tie(other.thread, other.addressSpace);
+        }
+    };
+
     struct TlbEntry : public Serializable
     {
         // The base of the physical page.
@@ -77,9 +92,9 @@ namespace X86ISA
         bool writable;
         // Whether this page is accesible without being in supervisor mode.
         bool user;
-        // Whether to use write through or write back. M5 ignores this and
-        // lets the caches handle the writeback policy.
-        //bool pwt;
+        // Raw leaf PWT; retained independently of conservative cache flags.
+        bool pwt;
+        bool pcd;
         // Whether the page is cacheable or not.
         bool uncacheable;
         // Whether or not to kick this page out on a write to CR3.
@@ -88,6 +103,9 @@ namespace X86ISA
         bool patBit;
         // Whether or not memory on this page can be executed.
         bool noExec;
+        // A cached read with D clear must rewalk before its first write.
+        bool dirty;
+        TlbContext context;
         // A sequence number to keep track of LRU.
         uint64_t lruSeq;
 
@@ -96,6 +114,9 @@ namespace X86ISA
         TlbEntry(Addr asn, Addr _vaddr, Addr _paddr,
                  bool uncacheable, bool read_only);
         TlbEntry();
+
+        uint8_t patIndex() const
+        { return (uint8_t(patBit) << 2) | (uint8_t(pcd) << 1) | pwt; }
 
         void
         updateVaddr(Addr new_vaddr)

@@ -176,14 +176,19 @@ BaseMMU::takeOverFrom(BaseMMU *old_mmu)
     Port *new_itb_port = itb->getTableWalkerPort();
     Port *new_dtb_port = dtb->getTableWalkerPort();
 
+    panic_if((old_itb_port == old_dtb_port) !=
+             (new_itb_port == new_dtb_port),
+             "CPU takeover requires matching shared walker-port topology");
+
     // Move over any table walker ports if they exist
     if (new_itb_port)
         new_itb_port->takeOverFrom(old_itb_port);
-    if (new_dtb_port)
+    if (new_dtb_port && new_dtb_port != new_itb_port)
         new_dtb_port->takeOverFrom(old_dtb_port);
 
     itb->takeOverFrom(old_mmu->itb);
-    dtb->takeOverFrom(old_mmu->dtb);
+    if (dtb != itb)
+        dtb->takeOverFrom(old_mmu->dtb);
 }
 
 } // namespace gem5

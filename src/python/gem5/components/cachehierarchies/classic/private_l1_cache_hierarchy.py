@@ -43,12 +43,13 @@ from .abstract_classic_cache_hierarchy import AbstractClassicCacheHierarchy
 from .caches.l1dcache import L1DCache
 from .caches.l1icache import L1ICache
 
+from .walker_ports import connect_x86_walker_caches
 
 class PrivateL1CacheHierarchy(AbstractClassicCacheHierarchy):
     """
     A cache setup where each core has a private L1 data and instruction Cache.
-    Table walker ports connect directly to the membus by default so walk caches
-    are only instantiated via subclasses such as PrivateL1WalkCacheHierarchy.
+    X86 walker ports use MMU caches to provide coherent atomic descriptor
+    updates. Other ISAs connect directly unless a walk-cache subclass is used.
     """
 
     def _get_default_membus(self) -> SystemXBar:
@@ -139,6 +140,9 @@ class PrivateL1CacheHierarchy(AbstractClassicCacheHierarchy):
             )
 
         if len(walker_ports) == 0:
+            return
+
+        if connect_x86_walker_caches(self, cpu_id, cpu, self.membus.cpu_side_ports):
             return
 
         cpu.connect_walker_ports(

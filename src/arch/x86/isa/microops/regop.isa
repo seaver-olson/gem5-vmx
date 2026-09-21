@@ -1413,6 +1413,51 @@ let {{
         big_code = rdcrCode % \
                 "DestReg = controlValue & mask(dataSize * 8);"
 
+    class VmxOperandOp(RegOp):
+        abstract = True
+        operand_types = (IntDestOp, IntSrc1Op, Imm8Op)
+        def getAllocator(self, microFlags):
+            return super().getAllocator(microFlags + ["IsNonSpeculative"])
+
+    class Vmxprep(VmxOperandOp):
+        code = '''
+            auto &vmx = static_cast<ISA *>(xc->tcBase()->getIsaPtr())->vmxState();
+            uint64_t value = 0;
+            bool access = false;
+            const auto result = vmx.prepareOperand(xc,
+                static_cast<VmxExitReason>(imm8), SrcReg1, value, access);
+            fault = result.fault;
+            DestReg = uint64_t(result.status) | (access ? 0x100 : 0);
+            VmxValue = value;
+        '''
+
+    class Vmxregion(VmxOperandOp):
+        code = '''
+            auto &vmx = static_cast<ISA *>(xc->tcBase()->getIsaPtr())->vmxState();
+            bool access = false;
+            const auto result = vmx.checkRegionOperand(xc,
+                static_cast<VmxExitReason>(imm8), SrcReg1, access);
+            fault = result.fault;
+            DestReg = uint64_t(result.status) | (access ? 0x100 : 0);
+        '''
+
+    class Vmxcommit(VmxOperandOp):
+        code = '''
+            auto &vmx = static_cast<ISA *>(xc->tcBase()->getIsaPtr())->vmxState();
+            const auto result = vmx.completeOperand(xc,
+                static_cast<VmxExitReason>(imm8), SrcReg1, VmxValue, VmxHeader);
+            fault = result.fault;
+            DestReg = uint64_t(result.status);
+        '''
+
+    class Vmxflags(RegOp):
+        operand_types = (IntSrc1Op,)
+        code = '''
+            const auto status = static_cast<VmxStatus>(bits(SrcReg1, 7, 0));
+            ccFlagBits = status == VmxStatus::VmFailValid ? ZFBit : 0;
+            cfofBits = status == VmxStatus::VmFailInvalid ? CFBit : 0;
+        '''
+
     class Wrcr(RegOp):
         operand_types = (CrDestOp, FoldedSrc1Op)
         def __init__(self, dest, src1, flags=None, dataSize="env.dataSize"):
@@ -1449,6 +1494,8 @@ let {{
                         if (bits(effectiveVal, 63, 32) ||
                                 (!cr0.pe && cr0.pg) ||
                                 (!cr0.cd && cr0.nw) ||
+                                (!cr0.pg && (oldCr4.pcide ||
+                                    machInst.mode.submode == SixtyFourBitMode)) ||
                                 (cr0.pg && efer.lme && !oldCr4.pae))
                             fault = std::make_shared<GeneralProtection>(0);
                     }
@@ -1456,6 +1503,24 @@ let {{
                   case 2:
                     break;
                   case 3:
+                    {
+                        CpuidResult addressSize;
+                        auto *isa = static_cast<ISA *>(
+                                xc->tcBase()->getIsaPtr());
+                        fatal_if(!isa->cpuid->doCpuid(xc->tcBase(),
+                                    0x80000008, 0, addressSize),
+                                 "Missing physical address width CPUID");
+                        unsigned physicalBits = bits(addressSize.rax, 7, 0);
+                        fatal_if(physicalBits < 32 || physicalBits > 52,
+                                 "Unsupported x86 physical address width");
+                        CR4 cr4 = CR4Op;
+                        // The no-flush hint is an operand bit, never CR3
+                        // state. Conservative invalidation remains legal.
+                        if (cr4.pcide)
+                            effectiveVal &= ~(1ULL << 63);
+                        if (effectiveVal & ~mask(physicalBits))
+                            fault = std::make_shared<GeneralProtection>(0);
+                    }
                     break;
                   case 4:
                     {
@@ -1481,6 +1546,20 @@ let {{
                                 (machInst.mode.mode == LongMode &&
                                  !bits(effectiveVal, 5)))
                             fault = std::make_shared<GeneralProtection>(0);
+                        CR4 cr4 = effectiveVal;
+                        CR4 oldCr4 = ControlDest;
+                        Efer efer = EferOp;
+                        if (cr4.pcide) {
+                            CpuidResult features;
+                            auto *isa = static_cast<ISA *>(
+                                    xc->tcBase()->getIsaPtr());
+                            bool supported = isa->cpuid->doCpuid(
+                                    xc->tcBase(), 1, 0, features) &&
+                                    bits(features.rcx, 17);
+                            if (!supported || !efer.lma ||
+                                    (!oldCr4.pcide && bits(CR3Op, 11, 0)))
+                                fault = std::make_shared<GeneralProtection>(0);
+                        }
                     }
                     break;
                   case 8:
@@ -1512,6 +1591,37 @@ let {{
                     ControlDest = effectiveVal;
             }
             '''
+
+    class Prepcr(Wrcr):
+        # Validate before any physical loads. Defer a VM exit to the final
+        # control operation, skipping loads when the instruction exits.
+        code = 'PdpteBase = ~0ULL; PdpteControl = CR0Op;\n' + \
+            Wrcr.code.split('                if (fault == NoFault && vmxIsa')[0] + '''
+                if (fault == NoFault &&
+                    !(vmxIsa && vmxIsa->vmxState().controlRegisterAccessCausesExit(
+                        dest, VmxCrAccessType::MovToCr, newVal)) &&
+                    paging::reloadPaePdpte(dest, CR0Op, CR4Op, EferOp,
+                                          effectiveVal)) {
+                    PdpteBase = mbits(dest == 3 ? effectiveVal : CR3Op, 31, 5);
+                    PdpteControl = dest == 0 ? effectiveVal : CR0Op;
+                }
+            }
+        '''
+
+    class Wrcrpae(Wrcr):
+        code = Wrcr.code.replace(
+            '                if (fault == NoFault)\n                    ControlDest = effectiveVal;',
+            '''
+                if (fault == NoFault && PdpteBase != ~0ULL) {
+                    auto *isa = static_cast<ISA *>(xc->tcBase()->getIsaPtr());
+                    // No partial register installation on a fault. This
+                    // non-speculative final micro-op runs at the ROB head.
+                    fault = isa->loadPaePdpte({PdpteTemp0, PdpteTemp1,
+                                             PdpteTemp2, PdpteTemp3});
+                }
+                if (fault == NoFault)
+                    ControlDest = effectiveVal;
+            ''')
 
     # CLTS and LMSW use the same architectural CR write machinery as MOV to
     # CR0, but Intel assigns distinct VM-exit qualification access types.

@@ -38,6 +38,7 @@
 
 categories = [
     "control_registers",
+    "vmx",
     "halt",
     "invlpg",
     "undefined_operation",

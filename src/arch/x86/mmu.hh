@@ -41,6 +41,10 @@
 #include "arch/generic/mmu.hh"
 #include "arch/x86/page_size.hh"
 #include "arch/x86/tlb.hh"
+#include "arch/x86/translation.hh"
+#include "arch/x86/regs/misc.hh"
+#include "base/addr_range.hh"
+#include "cpu/thread_context.hh"
 
 #include "params/X86MMU.hh"
 
@@ -51,17 +55,57 @@ namespace X86ISA {
 
 class MMU : public BaseMMU
 {
+  private:
+    AddrRange m5opRange;
+    unsigned pendingWalks = 0;
+    class WalkContinuation;
+
+    Fault translateInt(bool read, RequestPtr req, ThreadContext *tc);
+    Fault translate(const RequestPtr &req, ThreadContext *tc,
+                    Translation *translation, Mode mode,
+                    bool &delayedResponse, bool timing, bool functional,
+                    TLB &cache);
+    TranslationContextPtr captureContext(const RequestPtr &req,
+        ThreadContext *tc, TLB &cache, Mode access, Mode original,
+        Addr linear, Addr faultAddress) const;
+    Fault finishWalk(const RequestPtr &req, const TranslationContext &context,
+                     const TlbEntry &entry);
+    Fault finalizePhysical(const RequestPtr &req, Mode mode,
+                           LocalApicBase apicBase, ContextID thread) const;
+
   public:
-    MMU(const X86MMUParams &p)
-      : BaseMMU(p)
-    {}
+    MMU(const X86MMUParams &p);
+
+    DrainState drain() override;
+    Fault translateAtomic(const RequestPtr &req, ThreadContext *tc,
+                          Mode mode) override;
+    void translateTiming(const RequestPtr &req, ThreadContext *tc,
+                         Translation *translation, Mode mode) override;
+    Fault translateFunctional(const RequestPtr &req, ThreadContext *tc,
+                              Mode mode) override;
+    Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
+                           Mode mode) const override;
 
     void
     flushNonGlobal()
     {
         static_cast<TLB*>(itb)->flushNonGlobal();
-        static_cast<TLB*>(dtb)->flushNonGlobal();
+        if (dtb != itb)
+            static_cast<TLB*>(dtb)->flushNonGlobal();
     }
+
+    void
+    invalidateLinear(Addr address, ThreadContext *tc)
+    {
+        CR4 cr4 = tc->readMiscRegNoEffect(misc_reg::Cr4);
+        CR3 cr3 = tc->readMiscRegNoEffect(misc_reg::Cr3);
+        TlbContext context{tc->contextId(), cr4.pcide ? uint64_t(cr3.pcid) : 0};
+        static_cast<TLB*>(itb)->invalidatePage(address, context);
+        if (dtb != itb)
+            static_cast<TLB*>(dtb)->invalidatePage(address, context);
+    }
+
+    using BaseMMU::translateFunctional;
 
     Walker*
     getDataWalker()

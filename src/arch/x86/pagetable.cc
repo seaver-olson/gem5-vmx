@@ -50,16 +50,16 @@ namespace X86ISA
 
 TlbEntry::TlbEntry()
     : paddr(0), vaddr(0), logBytes(0), writable(0),
-      user(true), uncacheable(0), global(false), patBit(0),
-      noExec(false), lruSeq(0)
+      user(true), pwt(false), pcd(false), uncacheable(0), global(false), patBit(0),
+      noExec(false), dirty(false), lruSeq(0)
 {
 }
 
 TlbEntry::TlbEntry(Addr asn, Addr _vaddr, Addr _paddr,
                    bool uncacheable, bool read_only) :
     paddr(_paddr), vaddr(_vaddr), logBytes(PageShift), writable(!read_only),
-    user(true), uncacheable(uncacheable), global(false), patBit(0),
-    noExec(false), lruSeq(0)
+    user(true), pwt(false), pcd(false), uncacheable(uncacheable), global(false), patBit(0),
+    noExec(false), dirty(false), lruSeq(0)
 {}
 
 void
@@ -70,10 +70,15 @@ TlbEntry::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(logBytes);
     SERIALIZE_SCALAR(writable);
     SERIALIZE_SCALAR(user);
+    SERIALIZE_SCALAR(pwt);
+    SERIALIZE_SCALAR(pcd);
     SERIALIZE_SCALAR(uncacheable);
     SERIALIZE_SCALAR(global);
     SERIALIZE_SCALAR(patBit);
     SERIALIZE_SCALAR(noExec);
+    SERIALIZE_SCALAR(dirty);
+    paramOut(cp, "contextThread", context.thread);
+    paramOut(cp, "contextAsn", context.addressSpace);
     SERIALIZE_SCALAR(lruSeq);
 }
 
@@ -85,10 +90,16 @@ TlbEntry::unserialize(CheckpointIn &cp)
     UNSERIALIZE_SCALAR(logBytes);
     UNSERIALIZE_SCALAR(writable);
     UNSERIALIZE_SCALAR(user);
+    optParamIn(cp, "pwt", pwt);
     UNSERIALIZE_SCALAR(uncacheable);
+    pcd = uncacheable;
+    optParamIn(cp, "pcd", pcd);
     UNSERIALIZE_SCALAR(global);
     UNSERIALIZE_SCALAR(patBit);
     UNSERIALIZE_SCALAR(noExec);
+    optParamIn(cp, "dirty", dirty);
+    optParamIn(cp, "contextThread", context.thread);
+    optParamIn(cp, "contextAsn", context.addressSpace);
     UNSERIALIZE_SCALAR(lruSeq);
 }
 

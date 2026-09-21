@@ -39,6 +39,7 @@
 #define __ARCH_X86_TLB_HH__
 
 #include <list>
+#include <map>
 #include <vector>
 
 #include "arch/generic/tlb.hh"
@@ -71,16 +72,14 @@ namespace X86ISA
         typedef X86TLBParams Params;
         TLB(const Params &p);
 
-        void takeOverFrom(BaseTLB *otlb) override {}
+        void takeOverFrom(BaseTLB *otlb) override { flushAll(); }
 
-        TlbEntry *lookup(Addr va, bool update_lru = true);
+        TlbEntry *lookup(Addr va, bool update_lru = true,
+                         TlbContext context = {});
 
         void setConfigAddress(uint32_t addr);
-        //concatenate Page Addr and pcid
-        inline Addr concAddrPcid(Addr vpn, uint64_t pcid)
-        {
-          return (vpn | pcid);
-        }
+        uint64_t generation() const { return invalidationGeneration; }
+
 
       protected:
 
@@ -96,6 +95,7 @@ namespace X86ISA
         void flushNonGlobal();
 
         void demapPage(Addr va, uint64_t asn) override;
+        void invalidatePage(Addr va, TlbContext context);
 
       protected:
         uint32_t size;
@@ -104,10 +104,11 @@ namespace X86ISA
 
         EntryList freeList;
 
-        TlbEntryTrie trie;
+        // Each address-space tag has its own address prefix tree. PCID
+        // bits never participate in the page offset/prefix calculation.
+        std::map<TlbContext, TlbEntryTrie> tries;
+        uint64_t invalidationGeneration = 0;
         uint64_t lruSeq;
-
-        AddrRange m5opRange;
 
         struct TlbStats : public statistics::Group
         {
@@ -121,13 +122,12 @@ namespace X86ISA
             statistics::Scalar exMisses;
         } stats;
 
-        Fault translateInt(bool read, RequestPtr req, ThreadContext *tc);
-
-        Fault translate(const RequestPtr &req, ThreadContext *tc,
-                BaseMMU::Translation *translation, BaseMMU::Mode mode,
-                bool &delayedResponse, bool timing);
-
       public:
+
+        void recordAccess(BaseMMU::Mode mode);
+        void recordMiss(BaseMMU::Mode mode);
+        // Replacement does not invalidate other accepted walks.
+        void evict(TlbEntry &entry);
 
         void evictLRU();
 
@@ -163,7 +163,7 @@ namespace X86ISA
         Fault finalizePhysical(const RequestPtr &req, ThreadContext *tc,
                                BaseMMU::Mode mode) const override;
 
-        TlbEntry *insert(Addr vpn, const TlbEntry &entry, uint64_t pcid);
+        TlbEntry *insert(Addr vpn, const TlbEntry &entry, TlbContext context);
 
         // Checkpointing
         void serialize(CheckpointOut &cp) const override;
