@@ -4,11 +4,11 @@ name: Workflow Scheduler
 # GitHub scheduled workflows run on the default branch ('stable' in the case of
 # gem5). this means for changes in a workflow to take effect, the default
 # branch must be updated. This is not ideal as it requires regular commits into
-# the stable branch. Ideally we just want to update the workflow on develop and
-# have it run on the develop branch.
+# the stable branch. Ideally we just want to update the workflow on gem5-vmx and
+# have it run on the gem5-vmx branch.
 #
 # This workflow is designed to run on the stable branch and will trigger other
-# workflows on the develop branch.
+# workflows on the gem5-vmx branch.
 #
 # To do so we simply schedule this workflow to run every hour and use some
 # simple bash logic to determine if the current time is when we want to run the
@@ -54,8 +54,8 @@ jobs:
                   # If current time is 7pm then run the workflow.
                   if [[ $HOUR  == '19' ]]
                   then
-                    gh workflow run daily-tests.yaml --ref develop >/dev/null
-                    echo "Daily test scheduled to run on develop branch."
+                    gh workflow run daily-tests.yaml --ref gem5-vmx >/dev/null
+                    echo "Daily test scheduled to run on gem5-vmx branch."
                   else
                     echo "Daily tests not scheduled."
                   fi
@@ -69,8 +69,8 @@ jobs:
                   # the workflow.
                   if [[ $DAY == '5' ]] && [[ $HOUR  == '19' ]]
                   then
-                    gh workflow run weekly-tests.yaml --ref develop >/dev/null
-                    echo "Weekly test scheduled to run on develop branch."
+                    gh workflow run weekly-tests.yaml --ref gem5-vmx >/dev/null
+                    echo "Weekly test scheduled to run on gem5-vmx branch."
                   else
                     echo "Weekly tests not scheduled."
                   fi
@@ -84,8 +84,8 @@ jobs:
                   # the workflow.
                   if [[ $DAY == '2' ]] && [[ $HOUR  == '21' ]]
                   then
-                    gh workflow run compiler-tests.yaml --ref develop >/dev/null
-                    echo "Compiler tests scheduled to run on the develop branch."
+                    gh workflow run compiler-tests.yaml --ref gem5-vmx >/dev/null
+                    echo "Compiler tests scheduled to run on the gem5-vmx branch."
                   else
                     echo "Compiler tests not scheduled."
                   fi
