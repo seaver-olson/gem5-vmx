@@ -32,28 +32,6 @@ output header {{
         Fault execute(ExecContext *, trace::InstRecord *) const override;
     };
 
-    class VmxMemInst : public X86ISA::X86StaticInst
-    {
-      protected:
-        const uint8_t scale;
-        const RegIndex index;
-        const RegIndex base;
-        const uint64_t disp;
-        const uint8_t segment;
-        const uint8_t addressSize;
-        const bool ripRelative;
-
-        Addr operandEA(ExecContext *xc) const;
-        Request::Flags operandFlags() const;
-
-      public:
-        VmxMemInst(const char *_mnemonic, ExtMachInst machInst,
-                OpClass __opClass, bool rip_relative);
-
-        std::string generateDisassembly(Addr pc,
-                const loader::SymbolTable *symtab) const override;
-    };
-
     class VmxNoOperandInst : public X86ISA::X86StaticInst
     {
       public:
@@ -64,37 +42,6 @@ output header {{
                 const loader::SymbolTable *symtab) const override;
     };
 
-    class VmxRegMemInst : public X86ISA::X86StaticInst
-    {
-      protected:
-        const RegIndex reg;
-        const RegIndex rmReg;
-        const bool rmIsReg;
-        const uint8_t opSize;
-        const uint8_t scale;
-        const RegIndex index;
-        const RegIndex base;
-        const uint64_t disp;
-        const uint8_t segment;
-        const uint8_t addressSize;
-        const bool ripRelative;
-
-        Addr operandEA(ExecContext *xc) const;
-        Request::Flags operandFlags() const;
-        uint64_t readIntOperand(ThreadContext *tc, RegIndex regIdx) const;
-        void writeIntOperand(ThreadContext *tc, RegIndex regIdx,
-                uint64_t value) const;
-        Fault readRmOperand(ExecContext *xc, uint64_t &value) const;
-        Fault writeRmOperand(ExecContext *xc, uint64_t value) const;
-        void printRmOperand(std::ostream &os) const;
-
-      public:
-        VmxRegMemInst(const char *_mnemonic, ExtMachInst machInst,
-                OpClass __opClass);
-
-        std::string generateDisassembly(Addr pc,
-                const loader::SymbolTable *symtab) const override;
-    };
 }};
 
 output decoder {{
@@ -131,52 +78,6 @@ output decoder {{
     {
     }
 
-    VmxMemInst::VmxMemInst(const char *_mnemonic, ExtMachInst machInst,
-            OpClass __opClass, bool rip_relative)
-        : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass),
-          scale(([&]() {
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.scale;
-          })()),
-          index(([&]() {
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.index.index();
-          })()),
-          base(([&]() {
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.base.index();
-          })()),
-          disp(machInst.displacement),
-          segment(([&]() {
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return uint8_t(env.seg);
-          })()),
-          addressSize(machInst.addrSize),
-          // In 64-bit mode, ModRM mod=00/rm=101 is RIP-relative only with
-          // 64-bit address size. A 67H override makes it absolute disp32.
-          ripRelative(rip_relative && machInst.addrSize == 8)
-    {
-        flags[IsNonSpeculative] = true;
-        flags[IsSerializing] = true;
-        flags[IsSerializeAfter] = true;
-    }
-
-    std::string
-    VmxMemInst::generateDisassembly(
-            Addr pc, const loader::SymbolTable *symtab) const
-    {
-        std::stringstream response;
-        printMnemonic(response, mnemonic);
-        ccprintf(response, " ");
-        printMem(response, segment, scale, index, base, disp,
-                addressSize, ripRelative);
-        return response.str();
-    }
-
     VmxNoOperandInst::VmxNoOperandInst(const char *_mnemonic,
             ExtMachInst machInst, OpClass __opClass)
         : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass)
@@ -202,74 +103,6 @@ output decoder {{
         return response.str();
     }
 
-    VmxRegMemInst::VmxRegMemInst(const char *_mnemonic, ExtMachInst machInst,
-            OpClass __opClass)
-        : X86ISA::X86StaticInst(_mnemonic, machInst, __opClass),
-          reg(machInst.modRM.reg | (machInst.rex.r << 3)),
-          rmReg(machInst.modRM.rm | (machInst.rex.b << 3)),
-          rmIsReg(machInst.modRM.mod == 3),
-          opSize(machInst.mode.mode == LongMode &&
-                  machInst.mode.submode == SixtyFourBitMode ? 8 : 4),
-          scale(([&]() {
-              if (machInst.modRM.mod == 3) {
-                  return uint8_t(0);
-              }
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.scale;
-          })()),
-          index(([&]() {
-              if (machInst.modRM.mod == 3) {
-                  return RegIndex(int_reg::T0);
-              }
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.index.index();
-          })()),
-          base(([&]() {
-              if (machInst.modRM.mod == 3) {
-                  return RegIndex(int_reg::T0);
-              }
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return env.base.index();
-          })()),
-          disp(machInst.displacement),
-          segment(([&]() {
-              if (machInst.modRM.mod == 3) {
-                  return uint8_t(segment_idx::Ds);
-              }
-              EmulEnv env(int_reg::T0, int_reg::T0, 8, machInst.addrSize, 8);
-              env.doModRM(machInst);
-              return uint8_t(env.seg);
-          })()),
-          addressSize(machInst.addrSize),
-          ripRelative(machInst.modRM.mod == 0 && machInst.modRM.rm == 5 &&
-                  machInst.addrSize == 8)
-    {
-        flags[IsNonSpeculative] = true;
-        flags[IsSerializing] = true;
-        flags[IsSerializeAfter] = true;
-    }
-
-    std::string
-    VmxRegMemInst::generateDisassembly(
-            Addr pc, const loader::SymbolTable *symtab) const
-    {
-        std::stringstream response;
-        printMnemonic(response, mnemonic);
-        ccprintf(response, " ");
-        if (strcmp(mnemonic, "vmread") == 0) {
-            printReg(response, intRegClass[reg], opSize);
-            ccprintf(response, ", ");
-            printRmOperand(response);
-        } else {
-            printRmOperand(response);
-            ccprintf(response, ", ");
-            printReg(response, intRegClass[reg], opSize);
-        }
-        return response.str();
-    }
 }};
 
 output exec {{
@@ -401,186 +234,6 @@ output exec {{
 
     } // namespace
 
-    Addr
-    VmxMemInst::operandEA(ExecContext *xc) const
-    {
-        auto *tc = xc->tcBase();
-        const uint64_t segBase = tc->readMiscRegNoEffect(
-                X86ISA::misc_reg::segEffBase(segment));
-        const uint64_t indexVal = index == int_reg::T0 ? 0 :
-            tc->getReg(X86ISA::intRegClass[index]);
-        const uint64_t baseVal = ripRelative ?
-            tc->pcState().as<X86ISA::PCState>().npc() :
-            (base == int_reg::T0 ? 0 : tc->getReg(X86ISA::intRegClass[base]));
-
-        const uint64_t linear =
-            bits(scale * indexVal + baseVal + disp, addressSize * 8 - 1, 0);
-        return segBase + linear;
-    }
-
-    Addr
-    VmxRegMemInst::operandEA(ExecContext *xc) const
-    {
-        auto *tc = xc->tcBase();
-        const uint64_t segBase = tc->readMiscRegNoEffect(
-                X86ISA::misc_reg::segEffBase(segment));
-        const uint64_t indexVal = index == int_reg::T0 ? 0 :
-            tc->getReg(X86ISA::intRegClass[index]);
-        const uint64_t baseVal = ripRelative ?
-            tc->pcState().as<X86ISA::PCState>().npc() :
-            (base == int_reg::T0 ? 0 : tc->getReg(X86ISA::intRegClass[base]));
-
-        const uint64_t linear =
-            bits(scale * indexVal + baseVal + disp, addressSize * 8 - 1, 0);
-        return segBase + linear;
-    }
-
-    namespace
-    {
-
-    Request::Flags
-    vmxOperandFlags(uint8_t segment, uint8_t addressSize)
-    {
-        const unsigned logAddressSize = addressSize == 2 ? 1 :
-            addressSize == 4 ? 2 : 3;
-        return Request::Flags(segment |
-                ((logAddressSize & AddrSizeFlagMask) << AddrSizeFlagShift));
-    }
-
-    } // namespace
-
-    Request::Flags
-    VmxMemInst::operandFlags() const
-    {
-        return vmxOperandFlags(segment, addressSize);
-    }
-
-    Request::Flags
-    VmxRegMemInst::operandFlags() const
-    {
-        return vmxOperandFlags(segment, addressSize);
-    }
-
-    uint64_t
-    VmxRegMemInst::readIntOperand(ThreadContext *tc, RegIndex regIdx) const
-    {
-        const uint64_t value = tc->getReg(X86ISA::intRegClass[regIdx]);
-        return opSize == 8 ? value : bits(value, opSize * 8 - 1, 0);
-    }
-
-    void
-    VmxRegMemInst::writeIntOperand(ThreadContext *tc, RegIndex regIdx,
-            uint64_t value) const
-    {
-        auto regId = X86ISA::intRegClass[regIdx];
-
-        if (opSize >= 4) {
-            tc->setReg(regId, bits(value, opSize * 8 - 1, 0));
-            return;
-        }
-
-        uint64_t current = tc->getReg(regId);
-        replaceBits(current, opSize * 8 - 1, 0, bits(value, opSize * 8 - 1, 0));
-        tc->setReg(regId, current);
-    }
-
-    Fault
-    VmxRegMemInst::readRmOperand(ExecContext *xc, uint64_t &value) const
-    {
-        if (rmIsReg) {
-            value = readIntOperand(xc->tcBase(), rmReg);
-            return NoFault;
-        }
-
-        const std::vector<bool> byteEnable(opSize, true);
-        value = 0;
-        if (auto fault = vmxMemoryOperandFault(
-                    xc->tcBase(), operandEA(xc), opSize, operandFlags());
-                fault != NoFault) {
-            return fault;
-        }
-        return xc->readMem(
-                operandEA(xc), reinterpret_cast<uint8_t *>(&value), opSize,
-                operandFlags(), byteEnable);
-    }
-
-    Fault
-    VmxRegMemInst::writeRmOperand(ExecContext *xc, uint64_t value) const
-    {
-        if (rmIsReg) {
-            writeIntOperand(xc->tcBase(), rmReg, value);
-            return NoFault;
-        }
-
-        const std::vector<bool> byteEnable(opSize, true);
-        if (auto fault = vmxMemoryOperandFault(
-                    xc->tcBase(), operandEA(xc), opSize, operandFlags());
-                fault != NoFault) {
-            return fault;
-        }
-        return xc->writeMem(
-                reinterpret_cast<uint8_t *>(&value), opSize, operandEA(xc),
-                operandFlags(), nullptr, byteEnable);
-    }
-
-    void
-    VmxRegMemInst::printRmOperand(std::ostream &os) const
-    {
-        if (rmIsReg) {
-            printReg(os, intRegClass[rmReg], opSize);
-        } else {
-            printMem(os, segment, scale, index, base, disp,
-                    addressSize, ripRelative);
-        }
-    }
-}};
-
-def template VmxMemDeclare {{
-    class %(class_name)s : public VmxMemInst
-    {
-      public:
-        %(class_name)s(X86ISA::ExtMachInst machInst);
-        Fault execute(ExecContext *, trace::InstRecord *) const override;
-    };
-}};
-
-def template VmxMemConstruct {{
-    %(class_name)s::%(class_name)s(X86ISA::ExtMachInst machInst)
-        : VmxMemInst("%(base_mnemonic)s", machInst, No_OpClass, %(rip_relative)s)
-    {
-    }
-}};
-
-def template VmxMemExecute {{
-    Fault %(class_name)s::execute(ExecContext *xc,
-            trace::InstRecord *traceData) const
-    {
-        ISA *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
-        const Addr EA = operandEA(xc);
-        X86ISA::VmxResult result;
-
-        if (strcmp(mnemonic, "vmxon") == 0) {
-            result = isa->vmxState().vmxon(xc, EA, operandFlags(), size());
-        } else if (strcmp(mnemonic, "vmclear") == 0) {
-            result = isa->vmxState().vmclear(
-                    xc, EA, operandFlags(), size());
-        } else if (strcmp(mnemonic, "vmptrld") == 0) {
-            result = isa->vmxState().vmptrld(
-                    xc, EA, operandFlags(), size());
-        } else if (strcmp(mnemonic, "vmptrst") == 0) {
-            result = isa->vmxState().vmptrst(
-                    xc, EA, operandFlags(), size());
-        } else {
-            panic("Unhandled VMX memory instruction '%s'", mnemonic);
-        }
-
-        if (result.fault != NoFault) {
-            return result.fault;
-        }
-
-        completeVmxResult(xc->tcBase(), result);
-        return NoFault;
-    }
 }};
 
 def template VmxNoOperandDeclare {{
@@ -627,91 +280,6 @@ def template VmxNoOperandExecute {{
     }
 }};
 
-def template VmxRegMemDeclare {{
-    class %(class_name)s : public VmxRegMemInst
-    {
-      public:
-        %(class_name)s(X86ISA::ExtMachInst machInst);
-        Fault execute(ExecContext *, trace::InstRecord *) const override;
-    };
-}};
-
-def template VmxRegMemConstruct {{
-    %(class_name)s::%(class_name)s(X86ISA::ExtMachInst machInst)
-        : VmxRegMemInst("%(base_mnemonic)s", machInst, No_OpClass)
-    {
-    }
-}};
-
-def template VmxRegMemExecute {{
-    Fault %(class_name)s::execute(ExecContext *xc,
-            trace::InstRecord *traceData) const
-    {
-        ISA *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
-        X86ISA::VmxResult result;
-        uint64_t field = 0;
-        uint64_t value = 0;
-        Fault fault = NoFault;
-
-        if (strcmp(mnemonic, "vmread") == 0) {
-            field = readIntOperand(xc->tcBase(), reg);
-
-            result = isa->vmxState().vmread(xc, field, value, size());
-            if (result.fault != NoFault) {
-                return result.fault;
-            }
-
-            if (result.succeeded() && !result.redirectsNextPc) {
-                fault = writeRmOperand(xc, value);
-                if (fault != NoFault) {
-                    return fault;
-                }
-            }
-        } else if (strcmp(mnemonic, "vmwrite") == 0) {
-            field = readIntOperand(xc->tcBase(), reg);
-
-            // Intel checks VMX operation, CPL, non-root interception, and
-            // current-VMCS availability before accessing a memory source.
-            // In particular, VMWRITE in non-root operation must VM-exit even
-            // if its source linear address would fault.
-            result = isa->vmxState().vmwritePrecheck(xc, size());
-            if (result.fault != NoFault || !result.succeeded() ||
-                    result.redirectsNextPc) {
-                if (result.fault != NoFault) {
-                    return result.fault;
-                }
-                completeVmxResult(xc->tcBase(), result);
-                return NoFault;
-            }
-
-            fault = readRmOperand(xc, value);
-            if (fault != NoFault) {
-                return fault;
-            }
-
-            result = isa->vmxState().vmwrite(xc, field, value, size());
-            if (result.fault != NoFault) {
-                return result.fault;
-            }
-        } else {
-            panic("Unhandled VMX reg/mem instruction '%s'", mnemonic);
-        }
-
-        completeVmxResult(xc->tcBase(), result);
-        return NoFault;
-    }
-}};
-
-def format VmxMemInst(rip_relative) {{
-    iop = InstObjParams(name, Name, 'VmxMemInst', '', [])
-    iop.rip_relative = str(rip_relative).lower()
-    iop.base_mnemonic = Name.split('_')[0].lower()
-    header_output = VmxMemDeclare.subst(iop)
-    decoder_output = VmxMemConstruct.subst(iop)
-    decode_block = BasicDecode.subst(iop)
-    exec_output = VmxMemExecute.subst(iop)
-}};
-
 def format VmxNoOperandInst() {{
     iop = InstObjParams(name, Name, 'VmxNoOperandInst', '', [])
     iop.base_mnemonic = Name.lower()
@@ -719,15 +287,6 @@ def format VmxNoOperandInst() {{
     decoder_output = VmxNoOperandConstruct.subst(iop)
     decode_block = BasicDecode.subst(iop)
     exec_output = VmxNoOperandExecute.subst(iop)
-}};
-
-def format VmxRegMemInst() {{
-    iop = InstObjParams(name, Name, 'VmxRegMemInst', '', [])
-    iop.base_mnemonic = Name.lower()
-    header_output = VmxRegMemDeclare.subst(iop)
-    decoder_output = VmxRegMemConstruct.subst(iop)
-    decode_block = BasicDecode.subst(iop)
-    exec_output = VmxRegMemExecute.subst(iop)
 }};
 
 def format VmxInvdInst() {{

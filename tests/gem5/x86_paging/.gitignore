@@ -1,0 +1,10 @@
+/paging.elf
+/vmx_operands.elf
+/legacy.elf
+/pae.elf
+/gdb.elf
+/host_faults
+/se-context-1
+/se-context-2
+
+/__pycache__/

@@ -78,7 +78,12 @@ namespace X86ISA
                          TlbContext context = {});
 
         void setConfigAddress(uint32_t addr);
-        uint64_t generation() const { return invalidationGeneration; }
+        // Changes after any invalidation of this cache.
+        uint64_t generation() const;
+        // Changes after any invalidation that can affect this thread's
+        // walks: shared flushes and the thread's own linear invalidations.
+        // Both counters only increase, so the sum changes whenever either does.
+        uint64_t generation(ContextID thread) const;
 
 
       protected:
@@ -108,6 +113,7 @@ namespace X86ISA
         // bits never participate in the page offset/prefix calculation.
         std::map<TlbContext, TlbEntryTrie> tries;
         uint64_t invalidationGeneration = 0;
+        std::map<ContextID, uint64_t> threadGenerations;
         uint64_t lruSeq;
 
         struct TlbStats : public statistics::Group

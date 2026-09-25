@@ -13,13 +13,19 @@ on:
         branches: [vmx-ext]
         paths:
             - 'src/arch/x86/**'
+            - 'src/arch/generic/mmu.*'
             - 'tests/gem5/vmx/**'
+            - 'tests/gem5/x86_paging/**'
+            - 'src/python/gem5/components/cachehierarchies/classic/**'
             - '.github/workflows/vmx-tests.yaml'
     pull_request:
         branches: [vmx-ext]
         paths:
             - 'src/arch/x86/**'
+            - 'src/arch/generic/mmu.*'
             - 'tests/gem5/vmx/**'
+            - 'tests/gem5/x86_paging/**'
+            - 'src/python/gem5/components/cachehierarchies/classic/**'
             - '.github/workflows/vmx-tests.yaml'
     schedule:
         # Weekly, Monday 06:17 UTC. Off-the-hour to avoid the top-of-hour
@@ -45,13 +51,16 @@ jobs:
             - uses: actions/checkout@v7
 
             - name: Build VMX unit tests
-              run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt -j "$(nproc)"
+              run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt build/X86/arch/x86/paging.test.opt -j "$(nproc)"
 
             - name: Run vmx_utils.test
               run: build/X86/arch/x86/vmx_utils.test.opt --gtest_output=xml:vmx_utils.test.xml
 
             - name: Run vmcs.test
               run: build/X86/arch/x86/vmcs.test.opt --gtest_output=xml:vmcs.test.xml
+
+            - name: Run paging.test
+              run: build/X86/arch/x86/paging.test.opt --gtest_output=xml:paging.test.xml
 
             - name: Upload gtest results
               if: always()
@@ -61,6 +70,47 @@ jobs:
                   path: |
                       vmx_utils.test.xml
                       vmcs.test.xml
+                      paging.test.xml
+
+    paging-full-system:
+        name: Disk-free paging CPU and memory matrix
+        runs-on: ubuntu-24.04
+        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
+        timeout-minutes: 90
+        steps:
+            - uses: actions/checkout@v7
+            - name: Build gem5
+              run: scons build/X86/gem5.opt -j 2
+            - name: Run paging regressions
+              run: python3 tests/gem5/x86_paging/run.py
+            - name: Record no-EPT regression signature
+              run: python3 tests/gem5/x86_paging/baseline.py record --results-dir m5out-paging-matrix --baseline m5out-paging-matrix/signature.json
+            - name: Run shared paging transport and lifecycle regressions
+              run: python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
+            - name: Run native VMX operand regressions
+              run: python3 tests/gem5/x86_paging/run.py --vmx-operands-only --outdir m5out-vmx-operands
+            - name: Run debugger paging regressions
+              run: |
+                  for cpu in atomic timing o3; do
+                      python3 tests/gem5/x86_paging/gdb.py --cpu "$cpu" --outdir "m5out-paging-gdb-$cpu"
+                  done
+            - name: Upload paging results
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: paging-results-${{ github.run_id }}
+                  path: |
+                      m5out-paging-matrix/results.json
+                      m5out-paging-matrix/source.tar.gz
+                      m5out-paging-transport/
+                      m5out-vmx-operands/
+                      m5out-paging-matrix/provenance.json
+                      m5out-paging-matrix/signature.json
+                      m5out-paging-matrix/**/console.log
+                      m5out-paging-matrix/**/failure.bin
+                      m5out-paging-matrix/**/config.ini
+                      m5out-paging-matrix/**/stats.txt
+                      m5out-paging-gdb-*/
 
     # Best-effort tier: the full-system kernel-module regression
     # (tests/gem5/vmx/run.sh transition), which boots a real Linux 5.4.49

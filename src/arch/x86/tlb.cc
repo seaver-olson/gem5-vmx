@@ -118,17 +118,19 @@ TlbEntry *
 TLB::insert(Addr vpn, const TlbEntry &entry, TlbContext context)
 {
     auto &trie = tries[context];
-    // If somebody beat us to it, just use that existing entry.
-    TlbEntry *newEntry = trie.lookup(vpn);
-    if (newEntry) {
-        assert(newEntry->vaddr == vpn);
-        return newEntry;
-    }
+    // Replace any entry covering this page number: an identical walk that
+    // completed first, or a different page size left by a paging-structure
+    // change without invalidation. Either translation is permitted
+    // (SDM 5.10.2.3); the most recent walk is at least as current. Other
+    // smaller entries inside a new large page may remain, which the SDM
+    // also allows.
+    while (TlbEntry *existing = trie.lookup(vpn))
+        evict(*existing);
 
     if (freeList.empty())
         evictLRU();
 
-    newEntry = freeList.front();
+    TlbEntry *newEntry = freeList.front();
     freeList.pop_front();
 
     *newEntry = entry;
@@ -144,6 +146,23 @@ TLB::insert(Addr vpn, const TlbEntry &entry, TlbContext context)
         trie.insert(vpn, TlbEntryTrie::MaxBits, newEntry);
     }
     return newEntry;
+}
+
+uint64_t
+TLB::generation() const
+{
+    uint64_t total = invalidationGeneration;
+    for (const auto &[thread, count] : threadGenerations)
+        total += count;
+    return total;
+}
+
+uint64_t
+TLB::generation(ContextID thread) const
+{
+    auto it = threadGenerations.find(thread);
+    return invalidationGeneration +
+        (it == threadGenerations.end() ? 0 : it->second);
 }
 
 TlbEntry *
@@ -208,7 +227,9 @@ TLB::demapPage(Addr va, uint64_t asn)
 void
 TLB::invalidatePage(Addr va, TlbContext context)
 {
-    ++invalidationGeneration;
+    // INVLPG and #PF invalidation affect only this logical processor, so
+    // they do not make other threads' outstanding walks obsolete.
+    ++threadGenerations[context.thread];
     for (auto &entry : tlb) {
         if (entry.trieHandle && entry.context.thread == context.thread &&
             (entry.context.addressSpace == context.addressSpace || entry.global) &&

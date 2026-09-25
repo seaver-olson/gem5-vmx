@@ -209,31 +209,6 @@ vmcsRevisionId(ThreadContext *tc)
     return bits(isa->readMiscRegNoEffect(misc_reg::VmxBasic), 30, 0);
 }
 
-Fault
-readOperand(ExecContext *xc, Addr operandEA, Request::Flags operandFlags,
-        uint64_t &value, size_t size)
-{
-    if (auto fault = vmxMemoryOperandFault(
-                xc->tcBase(), operandEA, size, operandFlags);
-            fault != NoFault) {
-        return fault;
-    }
-    const std::vector<bool> byteEnable(size, true);
-    value = 0;
-    auto fault = xc->readMem(
-            operandEA, reinterpret_cast<uint8_t *>(&value), size,
-            operandFlags, byteEnable);
-    return fault;
-}
-
-bool
-readVmcsHeader(ThreadContext *tc, Addr regionPtr, Vmcs::VmcsHeader &header)
-{
-    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
-    proxy.readBlob(regionPtr, &header, sizeof(header));
-    return true;
-}
-
 bool
 validPhysicalAddress(Addr addr)
 {
@@ -340,20 +315,6 @@ vmxAvailable(ThreadContext *tc)
         vmx::fixedBitsAllowed(cr4,
             isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed0),
             isa->readMiscRegNoEffect(misc_reg::VmxCr4Fixed1));
-}
-
-bool
-validateRegion(ThreadContext *tc, Addr regionPtr)
-{
-    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
-        return false;
-    }
-
-    Vmcs::VmcsHeader header;
-    readVmcsHeader(tc, regionPtr, header);
-
-    return bits(header.revisionId, 30, 0) == vmcsRevisionId(tc) &&
-           !bits(header.revisionId, 31);
 }
 
 VmxResult
@@ -1929,49 +1890,126 @@ VmxState::currentVmcs() const
 }
 
 VmxResult
-VmxState::vmxon(ExecContext *xc, Addr operandEA,
-        Request::Flags operandFlags, uint8_t instructionSize)
+VmxState::prepareOperand(ExecContext *xc, VmxExitReason operation,
+        uint64_t field, uint64_t &value, bool &access)
 {
     auto *tc = xc->tcBase();
-    uint64_t regionPtr = 0;
-
-    if (!vmxCr4Enabled(tc) || !vmxInstructionRecognized(tc)) {
-        return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
-    }
-
-    if (vmxActive) {
-        if (inVmxNonRoot) {
-            return vmexitInstruction(xc, VmxExitReason::Vmxon,
-                    instructionSize);
-        }
-        if (!atCpl0(tc)) {
-            return VmxResult::propagateFault(
+    access = false;
+    value = 0;
+    if (HandyM5Reg(tc->readMiscRegNoEffect(misc_reg::M5Reg)).submode !=
+        SixtyFourBitMode)
+        field = uint32_t(field);
+    auto exit = [operation] {
+        VmxExitInfo info;
+        info.reason = operation;
+        info.hasInstructionLength = true;
+        // Fault delivery supplies the enclosing instruction length.
+        return VmxResult::propagateFault(std::make_shared<VmxExitFault>(info));
+    };
+    if (operation == VmxExitReason::Vmxon) {
+        if (!vmxCr4Enabled(tc) || !vmxInstructionRecognized(tc))
+            return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+        if (vmxActive) {
+            if (inVmxNonRoot)
+                return exit();
+            if (!atCpl0(tc))
+                return VmxResult::propagateFault(
                     std::make_shared<GeneralProtection>(0));
+            return vmFailIfCurrent(currentVmcs(),
+                                   VmxInstructionError::VmxonInRoot);
         }
-        return vmFailIfCurrent(currentVmcs(),
-                VmxInstructionError::VmxonInRoot);
+        if (!atCpl0(tc) || !vmxAvailable(tc))
+            return VmxResult::propagateFault(
+                std::make_shared<GeneralProtection>(0));
+    } else {
+        if (!vmxActive || !vmxInstructionRecognized(tc))
+            return VmxResult::propagateFault(std::make_shared<InvalidOpcode>());
+        if (inVmxNonRoot)
+            return exit();
+        if (!atCpl0(tc))
+            return VmxResult::propagateFault(
+                std::make_shared<GeneralProtection>(0));
     }
-
-    if (!atCpl0(tc) || !vmxAvailable(tc)) {
-        return VmxResult::propagateFault(std::make_shared<GeneralProtection>(
-                    0));
+    if (operation == VmxExitReason::Vmread) {
+        const auto result = vmread(xc, field, value, 0);
+        access = result.succeeded();
+        return result;
     }
-
-    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
-            sizeof(regionPtr));
-    if (fault != NoFault) {
-        return VmxResult::propagateFault(fault);
-    }
-
-    if (!validateRegion(tc, regionPtr)) {
+    if (operation == VmxExitReason::Vmwrite && !currentVmcs())
         return VmxResult::failInvalid();
-    }
+    if (operation == VmxExitReason::Vmptrst)
+        value = currentVmcsPtr;
+    access = true;
+    return VmxResult::success();
+}
 
-    vmxActive = true;
-    inVmxNonRoot = false;
-    vmxonRegion = regionPtr;
-    currentVmcsPtr = InvalidVmcsPointer;
-    DPRINTF(VMX, "VMXON region %#x\n", vmxonRegion);
+VmxResult
+VmxState::checkRegionOperand(ExecContext *xc, VmxExitReason operation,
+                            uint64_t pointer, bool &readHeader)
+{
+    readHeader = false;
+    const bool aligned = validAlignedPhysicalAddress(pointer, Vmcs::VmcsRegionSize);
+    if (operation == VmxExitReason::Vmxon) {
+        if (!aligned)
+            return VmxResult::failInvalid();
+    } else if (operation == VmxExitReason::Vmptrld) {
+        if (!aligned)
+            return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmptrldInvalidPhysicalAddress);
+        if (pointer == vmxonRegion)
+            return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmptrldWithVmxonPointer);
+    } else {
+        panic("Unexpected VMX region-header operation");
+    }
+    readHeader = true;
+    return VmxResult::success();
+}
+
+VmxResult
+VmxState::completeOperand(ExecContext *xc, VmxExitReason operation,
+                         uint64_t field, uint64_t value, uint32_t header)
+{
+    auto *tc = xc->tcBase();
+    if (operation == VmxExitReason::Vmwrite) {
+        if (HandyM5Reg(tc->readMiscRegNoEffect(misc_reg::M5Reg)).submode !=
+            SixtyFourBitMode)
+            field = uint32_t(field);
+        return vmwrite(xc, field, value, 0);
+    }
+    if (operation == VmxExitReason::Vmclear) {
+        if (!validAlignedPhysicalAddress(value, Vmcs::VmcsRegionSize))
+            return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmclearInvalidPhysicalAddress);
+        if (value == vmxonRegion)
+            return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmclearWithVmxonPointer);
+        if (currentVmcsPtr == value)
+            currentVmcsPtr = InvalidVmcsPointer;
+        auto [it, inserted] = vmcsRegions.try_emplace(value, value, vmcsRevisionId(tc));
+        if (!inserted)
+            it->second.clear();
+        return VmxResult::success();
+    }
+    const bool validHeader = bits(header, 30, 0) == vmcsRevisionId(tc) &&
+                             !bits(header, 31);
+    if (operation == VmxExitReason::Vmxon) {
+        if (!validHeader)
+            return VmxResult::failInvalid();
+        vmxActive = true;
+        inVmxNonRoot = false;
+        vmxonRegion = value;
+        currentVmcsPtr = InvalidVmcsPointer;
+    } else if (operation == VmxExitReason::Vmptrld) {
+        if (!validHeader)
+            return vmFailIfCurrent(currentVmcs(),
+                VmxInstructionError::VmptrldIncorrectVmcsRevision);
+        auto it = vmcsRegions.try_emplace(value, value, vmcsRevisionId(tc)).first;
+        it->second.setActive(true);
+        currentVmcsPtr = value;
+    } else {
+        panic("Unexpected VMX operand commit operation");
+    }
     return VmxResult::success();
 }
 
@@ -1991,117 +2029,6 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
     vmxonRegion = 0;
     currentVmcsPtr = InvalidVmcsPointer;
     DPRINTF(VMX, "VMXOFF\n");
-    return VmxResult::success();
-}
-
-VmxResult
-VmxState::vmclear(ExecContext *xc, Addr operandEA,
-        Request::Flags operandFlags, uint8_t instructionSize)
-{
-    auto *tc = xc->tcBase();
-    uint64_t regionPtr = 0;
-
-    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmclear,
-                instructionSize)) {
-        return *result;
-    }
-
-    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
-            sizeof(regionPtr));
-
-    if (fault != NoFault) {
-        return VmxResult::propagateFault(fault);
-    }
-
-    Vmcs *current = currentVmcs();
-    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmclearInvalidPhysicalAddress);
-    }
-    if (regionPtr == vmxonRegion) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmclearWithVmxonPointer);
-    }
-    if (currentVmcsPtr == regionPtr) {
-        currentVmcsPtr = InvalidVmcsPointer;
-    }
-
-    auto [it, inserted] = vmcsRegions.try_emplace(
-            regionPtr, regionPtr, vmcsRevisionId(tc));
-    if (!inserted) {
-        it->second.clear();
-    }
-
-    DPRINTF(VMX, "VMCLEAR VMCS %#x\n", regionPtr);
-    return VmxResult::success();
-}
-
-VmxResult
-VmxState::vmptrld(ExecContext *xc, Addr operandEA,
-        Request::Flags operandFlags, uint8_t instructionSize)
-{
-    auto *tc = xc->tcBase();
-    uint64_t regionPtr = 0;
-
-    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmptrld,
-                instructionSize)) {
-        return *result;
-    }
-
-    auto fault = readOperand(xc, operandEA, operandFlags, regionPtr,
-            sizeof(regionPtr));
-
-    if (fault != NoFault) {
-        return VmxResult::propagateFault(fault);
-    }
-
-    Vmcs *current = currentVmcs();
-    if (!validAlignedPhysicalAddress(regionPtr, Vmcs::VmcsRegionSize)) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmptrldInvalidPhysicalAddress);
-    }
-    if (regionPtr == vmxonRegion) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmptrldWithVmxonPointer);
-    }
-    if (!validateRegion(tc, regionPtr)) {
-        return vmFailIfCurrent(current,
-                VmxInstructionError::VmptrldIncorrectVmcsRevision);
-    }
-
-    auto it = vmcsRegions.try_emplace(
-            regionPtr, regionPtr, vmcsRevisionId(tc)).first;
-    it->second.setActive(true);
-    currentVmcsPtr = regionPtr;
-    DPRINTF(VMX, "VMPTRLD current VMCS %#x\n", currentVmcsPtr);
-    return VmxResult::success();
-}
-
-VmxResult
-VmxState::vmptrst(ExecContext *xc, Addr operandEA,
-        Request::Flags operandFlags, uint8_t instructionSize)
-{
-    uint64_t regionPtr = currentVmcsPtr;
-    const std::vector<bool> byteEnable(sizeof(regionPtr), true);
-
-    auto *tc = xc->tcBase();
-    if (auto result = commonInstructionEntryCheck(xc, VmxExitReason::Vmptrst,
-                instructionSize)) {
-        return *result;
-    }
-
-    auto fault = vmxMemoryOperandFault(
-            tc, operandEA, sizeof(regionPtr), operandFlags);
-    if (fault != NoFault) {
-        return VmxResult::propagateFault(fault);
-    }
-    fault = xc->writeMem(
-            reinterpret_cast<uint8_t *>(&regionPtr), sizeof(regionPtr),
-            operandEA, operandFlags, nullptr, byteEnable);
-    if (fault != NoFault) {
-        return VmxResult::propagateFault(fault);
-    }
-
     return VmxResult::success();
 }
 

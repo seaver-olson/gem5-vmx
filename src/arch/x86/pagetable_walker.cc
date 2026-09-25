@@ -317,12 +317,14 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     bool doWrite = false;
     bool doTLBInsert = false;
     bool doEndWalk = false;
-    bool badNX = pte.nx && mode == BaseMMU::Execute && enableNX;
     if (pte.p && reserved(pte)) {
         fault = pageFault(true, true);
         endWalk();
         return fault;
     }
+    // XD is an access right of the complete translation (SDM 5.6). Like
+    // U/S and R/W it is checked at the leaf, so a deeper nonpresent or
+    // reserved entry still reports P=0 or RSVD=1 (SDM 5.7).
     if (dataSize == 8)
         entry.noExec = entry.noExec || (enableNX && pte.nx);
     switch(state) {
@@ -333,7 +335,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = pte.w;
         entry.user = pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;
@@ -347,7 +349,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = entry.writable && pte.w;
         entry.user = entry.user && pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;
@@ -360,7 +362,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = entry.writable && pte.w;
         entry.user = entry.user && pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;
@@ -391,7 +393,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = entry.writable && pte.w;
         entry.user = entry.user && pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;
@@ -412,7 +414,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = pte.w;
         entry.user = pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;
@@ -444,7 +446,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
         pte.a = 1;
         entry.writable = entry.writable && pte.w;
         entry.user = entry.user && pte.u;
-        if (badNX || !pte.p) {
+        if (!pte.p) {
             doEndWalk = true;
             fault = pageFault(pte.p);
             break;

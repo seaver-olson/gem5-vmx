@@ -77,7 +77,7 @@ MMU::drain()
 TranslationContextPtr
 MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
                     Mode access, Mode original, Addr linear,
-                    Addr faultAddress) const
+                    Addr faultAddress, bool supervisor) const
 {
     auto context = std::make_shared<TranslationContext>();
     context->cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
@@ -89,7 +89,7 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     context->apicBase = tc->readMiscRegNoEffect(misc_reg::ApicBase);
     context->tag = {tc->contextId(), context->cr4.pcide ?
         uint64_t(context->cr3.pcid) : 0};
-    context->generation = cache.generation();
+    context->generation = cache.generation(context->tag.thread);
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     context->nonRoot = isa->vmxState().nonRootActive();
     context->paePdpte = isa->paePdpte();
@@ -102,6 +102,8 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     context->linearAddress = linear;
     context->faultAddress = faultAddress;
     context->flags = req->getFlags();
+    if (supervisor)
+        context->flags.set(CPL0FlagBit);
     context->accessMode = access;
     context->originalMode = original;
     context->stream = original == Execute ? TranslationContext::Stream::Instruction :
@@ -151,7 +153,8 @@ class MMU::WalkContinuation : public Walker::Completion
         Fault finalFault = fault;
         if (finalFault == NoFault) {
             assert(result);
-            if (result->generation != cache.generation()) {
+            if (result->generation !=
+                    cache.generation(snapshot->tag.thread)) {
                 finalFault = std::make_shared<ReExec>();
             } else {
                 cache.insert(result->entry.vaddr, result->entry, result->context);
@@ -365,9 +368,15 @@ MMU::translate(const RequestPtr &req,
     }
 
     Addr vaddr = req->getVaddr();
-    const Addr faultAddr = mode == BaseMMU::Execute && req->hasPC() ?
-        paging::faultAddress(vaddr, req->getSize(), req->getPC()) : vaddr;
     DPRINTF(TLB, "Translating vaddr %#x.\n", vaddr);
+
+    // Port proxies (debugger, pseudo-instructions, workload loaders) name
+    // linear addresses on the simulator's behalf. Like the original
+    // functional walk, they translate as a supervisor read without segment
+    // checks or A/D side effects. CPU-originated functional requests keep
+    // the architectural checks of the access they model.
+    const bool debugAccess =
+        functional && req->requestorId() == Request::funcRequestorId;
 
     HandyM5Reg m5Reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
 
@@ -391,7 +400,7 @@ MMU::translate(const RequestPtr &req,
     if (m5Reg.prot) {
         DPRINTF(TLB, "In protected mode.\n");
         // If we're not in 64-bit mode, do protection/limit checks
-        if (m5Reg.mode != LongMode) {
+        if (m5Reg.mode != LongMode && !debugAccess) {
             DPRINTF(TLB, "Not in long mode. Checking segment protection.\n");
 
             // CPUs won't know to use CS when building fetch requests, so we
@@ -439,8 +448,15 @@ MMU::translate(const RequestPtr &req,
                 }
             }
         }
-        if (m5Reg.submode != SixtyFourBitMode && addrSize != 64)
-            vaddr &= mask(32);
+        const Addr linearMask =
+            m5Reg.submode != SixtyFourBitMode && addrSize != 64 ?
+            mask(32) : ~Addr(0);
+        vaddr &= linearMask;
+        // CR2 receives the linear address, which is 32 bits outside 64-bit
+        // mode (SDM 5.1, 5.7), including after segment-offset wraparound.
+        const Addr faultAddr = mode == BaseMMU::Execute && req->hasPC() ?
+            paging::faultAddress(vaddr, req->getSize(),
+                                 req->getPC() & linearMask) : vaddr;
         // If paging is enabled, do the translation.
         if (m5Reg.paging) {
             DPRINTF(TLB, "Paging enabled.\n");
@@ -461,12 +477,20 @@ MMU::translate(const RequestPtr &req,
                 cache.recordAccess(mode);
             if (FullSystem && entry && mode == BaseMMU::Write &&
                 !entry->dirty) {
-                // Rewalk to locate the current leaf; do not retain a pointer
-                // to a descriptor that software may have replaced.
-                // This is cache replacement, not an architectural
-                // invalidation. Other accepted walks remain valid.
-                cache.evict(*entry);
-                entry = nullptr;
+                // A write the cached rights deny faults from this entry
+                // (SDM 5.10.2.3) and must not set D, so keep the entry.
+                const bool user = m5Reg.cpl == 3 && !(flags & CPL0FlagBit);
+                const CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+                const bool denied = (user && !entry->user) ||
+                    (!entry->writable && (user || cr0.wp));
+                if (!denied) {
+                    // Rewalk to locate the current leaf; do not retain a
+                    // pointer to a descriptor that software may have
+                    // replaced. This is cache replacement, not an
+                    // architectural invalidation.
+                    cache.evict(*entry);
+                    entry = nullptr;
+                }
             }
             if (!entry) {
                 DPRINTF(TLB, "Handling a TLB miss for "
@@ -476,8 +500,9 @@ MMU::translate(const RequestPtr &req,
                     cache.recordMiss(mode);
                 TranslationContextPtr snapshot;
                 if (FullSystem)
-                    snapshot = captureContext(req, tc, cache, mode,
-                                              completionMode, vaddr, faultAddr);
+                    snapshot = captureContext(req, tc, cache,
+                        debugAccess ? BaseMMU::Read : mode, completionMode,
+                        vaddr, faultAddr, debugAccess);
                 if (FullSystem && functional) {
                     Fault fault = cache.getWalker()->startFunctional(snapshot,
                         functionalEntry);
@@ -500,12 +525,13 @@ MMU::translate(const RequestPtr &req,
                         delayedResponse = true;
                         return fault;
                     }
-                    if (result.generation != cache.generation())
+                    if (result.generation !=
+                            cache.generation(snapshot->tag.thread))
                         return std::make_shared<ReExec>();
+                    // Complete from the walk result, as the timing path does;
+                    // the cache may hold another page size for this range.
                     cache.insert(result.entry.vaddr, result.entry, result.context);
-                    entry = cache.lookup(pageAlignedVaddr, true, context);
-                    assert(entry);
-                    return finishWalk(req, *snapshot, *entry);
+                    return finishWalk(req, *snapshot, result.entry);
                 } else {
                     Process *p = tc->getProcessPtr();
                     const EmulationPageTable::Entry *pte =

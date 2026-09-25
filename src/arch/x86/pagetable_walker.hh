@@ -157,7 +157,7 @@ namespace X86ISA
             bool wasStarted();
             bool isTiming();
             bool obsolete() const
-            { return generation != walker->tlb->generation(); }
+            { return generation != walker->tlb->generation(context.thread); }
             std::string name() const {return walker->name();}
 
           private:

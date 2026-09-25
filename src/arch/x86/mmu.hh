@@ -67,7 +67,7 @@ class MMU : public BaseMMU
                     TLB &cache);
     TranslationContextPtr captureContext(const RequestPtr &req,
         ThreadContext *tc, TLB &cache, Mode access, Mode original,
-        Addr linear, Addr faultAddress) const;
+        Addr linear, Addr faultAddress, bool supervisor = false) const;
     Fault finishWalk(const RequestPtr &req, const TranslationContext &context,
                      const TlbEntry &entry);
     Fault finalizePhysical(const RequestPtr &req, Mode mode,

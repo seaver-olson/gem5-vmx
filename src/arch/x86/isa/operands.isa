@@ -253,7 +253,7 @@ def operands {{
         # Operands to access specific control registers directly.
         'EferOp':        SquashCReg('X86ISA::misc_reg::Efer', 200),
         'CR4Op':         ControlReg('X86ISA::misc_reg::Cr4', 201),
-        'CR3Op':         ControlReg('X86ISA::misc_reg::Cr3', 202),
+        'CR3Op':         ControlReg('X86ISA::misc_reg::Cr3', 214),
         'CR0Op':         ControlReg('X86ISA::misc_reg::Cr0', 220),
         'VmxValue':      IntReg('X86ISA::intRegMicro(2)', 227),
         'VmxHeader':     IntReg('X86ISA::intRegMicro(3)', 228),
