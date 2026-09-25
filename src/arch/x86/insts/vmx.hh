@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 
+#include "arch/x86/ept.hh"
 #include "arch/x86/regs/segment.hh"
 #include "arch/x86/vmcs.hh"
 #include "base/types.hh"
@@ -260,6 +261,7 @@ class VmxState
     Addr vmxonRegion = 0;
     Addr currentVmcsPtr = InvalidVmcsPointer;
     VmcsMap vmcsRegions;
+    std::optional<EptConfig> activeEptConfig;
     // Tracks "blocking by NMI" (SDM Vol. 3C 24.4.2) across VM entry/exit
     // for the current VMCS's guest. This model does not implement the
     // "virtual NMIs" control, "NMI-window exiting", or IRET-triggered
@@ -294,6 +296,7 @@ class VmxState
         VmxInstructionError instructionError =
             VmxInstructionError::VmEntryInvalidControlFields;
         VmxExitReason exitReason = VmxExitReason::VmEntryInvalidGuestState;
+        std::optional<EptConfig> eptConfig;
     };
 
     Vmcs *findVmcs(Addr regionPtr);
@@ -324,6 +327,8 @@ class VmxState
   public:
     bool active() const { return vmxActive; }
     bool nonRootActive() const { return inVmxNonRoot; }
+    const std::optional<EptConfig> &eptConfig() const
+    { return activeEptConfig; }
     Addr vmxonPtr() const { return vmxonRegion; }
     Addr currentVmcsPointer() const { return currentVmcsPtr; }
 

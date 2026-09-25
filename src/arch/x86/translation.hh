@@ -4,8 +4,10 @@
 
 #include <array>
 #include <memory>
+#include <optional>
 
 #include "arch/generic/mmu.hh"
+#include "arch/x86/ept.hh"
 #include "arch/x86/pagetable.hh"
 #include "arch/x86/regs/misc.hh"
 
@@ -18,12 +20,14 @@ class PagingPort;
 // Captured by the MMU before handing a request to asynchronous work. Every
 // consumer retains a const view; restart and finalization use this snapshot,
 // never live control registers or a subsequently modified CPU request.
-// EPT configuration/generations will extend this contract when implemented.
+// The EPT configuration is captured now; EPT generation tracking and the
+// second-stage walk will extend this contract when implemented.
 struct TranslationContext
 {
     TlbContext tag;
     uint64_t generation;
     bool nonRoot;
+    std::optional<EptConfig> ept;
     CR0 cr0;
     CR3 cr3;
     CR4 cr4;

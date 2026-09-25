@@ -10,7 +10,7 @@ name: VMX Tests
 
 on:
     push:
-        branches: [vmx-ext]
+        branches: [vmx-ext, ept-bootstrap]
         paths:
             - 'src/arch/x86/**'
             - 'src/arch/generic/mmu.*'
@@ -51,7 +51,7 @@ jobs:
             - uses: actions/checkout@v7
 
             - name: Build VMX unit tests
-              run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt build/X86/arch/x86/paging.test.opt -j "$(nproc)"
+              run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt build/X86/arch/x86/paging.test.opt build/X86/arch/x86/ept.test.opt -j "$(nproc)"
 
             - name: Run vmx_utils.test
               run: build/X86/arch/x86/vmx_utils.test.opt --gtest_output=xml:vmx_utils.test.xml
@@ -62,6 +62,9 @@ jobs:
             - name: Run paging.test
               run: build/X86/arch/x86/paging.test.opt --gtest_output=xml:paging.test.xml
 
+            - name: Run ept.test
+              run: build/X86/arch/x86/ept.test.opt --gtest_output=xml:ept.test.xml
+
             - name: Upload gtest results
               if: always()
               uses: actions/upload-artifact@v7
@@ -71,6 +74,7 @@ jobs:
                       vmx_utils.test.xml
                       vmcs.test.xml
                       paging.test.xml
+                      ept.test.xml
 
     paging-full-system:
         name: Disk-free paging CPU and memory matrix

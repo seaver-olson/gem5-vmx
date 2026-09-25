@@ -661,6 +661,7 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
 
+    std::optional<EptConfig> entryEptConfig;
     if (procControls & CpuBasedActivateSecondaryControls) {
         uint64_t secondaryControls = 0;
         if (!readRequired(vmcs, VmcsSecondaryVmExecControl,
@@ -669,6 +670,22 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
                     isa->readMiscRegNoEffect(misc_reg::VmxProcbasedCtls2))) {
             return failInstruction(
                     VmxInstructionError::VmEntryInvalidControlFields);
+        }
+        if (secondaryControls & ept::EnableEptSecondaryControl) {
+            uint64_t eptp = 0;
+            CpuidResult addressSize;
+            if (!readRequired(vmcs, VmcsField::EptPointer, eptp) ||
+                    !isa->cpuid->doCpuid(tc, 0x80000008, 0, addressSize)) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
+            entryEptConfig = ept::decodeEptp(eptp,
+                    isa->readMiscRegNoEffect(misc_reg::VmxEptVpidCap),
+                    bits(addressSize.rax, 7, 0));
+            if (!entryEptConfig) {
+                return failInstruction(
+                        VmxInstructionError::VmEntryInvalidControlFields);
+            }
         }
     }
 
@@ -1018,7 +1035,9 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
         return failEntry(VmxExitReason::VmEntryInvalidGuestState);
     }
 
-    return {};
+    VmEntryValidationResult result;
+    result.eptConfig = entryEptConfig;
+    return result;
 }
 
 bool
@@ -1265,6 +1284,7 @@ VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
             "Validated VM-entry host state could not be loaded");
 
     inVmxNonRoot = false;
+    activeEptConfig.reset();
     DPRINTF(VMX, "VM-entry failed after entry began: reason %u "
             "encoded %#x host RIP %#x VMCS %#x\n",
             toInt(reason), encodedReason, hostRip, currentVmcsPtr);
@@ -1332,6 +1352,14 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
         return vmFailValid(vmcs, toInt(validation.instructionError));
     }
 
+    // EPT's second-stage translation and exit reporting are not wired into
+    // the MMU yet. Never enter a guest that requests EPT with only the
+    // configuration parser available.
+    if (validation.eptConfig) {
+        return vmFailValid(vmcs,
+                toInt(VmxInstructionError::VmEntryInvalidControlFields));
+    }
+
     DPRINTF(VMX, "VM-entry validation passed: pin %#x primary %#x "
             "exit %#x entry %#x VMCS %#x\n",
             readOrZero(*vmcs, VmcsPinBasedVmExecControl),
@@ -1353,6 +1381,10 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     if (readOrZero(*vmcs, VmcsVmEntryMsrLoadCount) != 0) {
         return failVmEntry(tc, *vmcs, VmxExitReason::VmEntryMsrLoad, 1);
     }
+
+    // Entry-time configuration must already be stable if the injected event
+    // performs an MMU access before the guest's first ordinary instruction.
+    activeEptConfig = validation.eptConfig;
 
     const uint32_t entryIntrInfo =
         bits(readOrZero(*vmcs, VmcsVmEntryIntrInfoField), 31, 0);
@@ -1457,6 +1489,7 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
     }
 
     inVmxNonRoot = false;
+    activeEptConfig.reset();
 
     if (hostRip) {
         *hostRip = hostRipValue;
@@ -2026,6 +2059,7 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
     }
     vmxActive = false;
     inVmxNonRoot = false;
+    activeEptConfig.reset();
     vmxonRegion = 0;
     currentVmcsPtr = InvalidVmcsPointer;
     DPRINTF(VMX, "VMXOFF\n");
@@ -2161,6 +2195,8 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
 void
 VmxState::serialize(CheckpointOut &cp) const
 {
+    panic_if(activeEptConfig,
+            "Cannot checkpoint an EPT guest before EPT MMU support exists");
     size_t numVmcsRegions = vmcsRegions.size();
     SERIALIZE_SCALAR(vmxActive);
     SERIALIZE_SCALAR(inVmxNonRoot);
@@ -2183,6 +2219,7 @@ VmxState::serialize(CheckpointOut &cp) const
 void
 VmxState::unserialize(CheckpointIn &cp)
 {
+    activeEptConfig.reset();
     // If VMX is inactive, ignore any stale serialized VMX state.
     if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;

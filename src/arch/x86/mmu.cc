@@ -92,6 +92,7 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     context->generation = cache.generation(context->tag.thread);
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     context->nonRoot = isa->vmxState().nonRootActive();
+    context->ept = isa->vmxState().eptConfig();
     context->paePdpte = isa->paePdpte();
     CpuidResult cpuid;
     fatal_if(!isa->cpuid->doCpuid(tc, 0x80000008, 0, cpuid),
