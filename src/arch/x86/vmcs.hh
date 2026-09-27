@@ -448,8 +448,8 @@ class Vmcs
             {F::_field, #_field, Group::_group, _writable}
 
         static constexpr FieldInfo supportedFields[] = {
-            // Keep this list aligned with the VMX capabilities advertised in
-            // ISA::clear() and the fields the VM-entry/VM-exit path consumes.
+            // Optional fields are known here but VMREAD/VMWRITE gate them
+            // against the active ISA's advertised control capabilities.
             VMCS_FIELD(GuestEsSelector, GuestState, true),
             VMCS_FIELD(GuestCsSelector, GuestState, true),
             VMCS_FIELD(GuestSsSelector, GuestState, true),
@@ -473,6 +473,7 @@ class Vmcs
             VMCS_FIELD(VmExitMsrStoreAddress, VmExitControl, true),
             VMCS_FIELD(VmExitMsrLoadAddress, VmExitControl, true),
             VMCS_FIELD(VmEntryMsrLoadAddress, VmEntryControl, true),
+            VMCS_FIELD(EptPointer, VmExecutionControl, true),
 
             VMCS_FIELD(GuestPhysicalAddress, VmExitInformation, false),
 
@@ -495,6 +496,7 @@ class Vmcs
             VMCS_FIELD(VmEntryIntrInfoField, VmEntryControl, true),
             VMCS_FIELD(VmEntryExceptionErrorCode, VmEntryControl, true),
             VMCS_FIELD(VmEntryInstructionLen, VmEntryControl, true),
+            VMCS_FIELD(SecondaryVmExecControl, VmExecutionControl, true),
 
             VMCS_FIELD(VmInstructionError, VmExitInformation, false),
             VMCS_FIELD(VmExitReason, VmExitInformation, false),

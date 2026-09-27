@@ -121,6 +121,15 @@ void paging_test(void)
     FAULT(op_vmwrite_mem, hole, 0xffff8000, 14, 0, 42);
     STATUS(op_vmwrite_reg, 0, 0x4400, 7, 0x40, 43);
     check(read_field(0x4400) == 13, 44);
+    /* Metadata knows these encodings, but the CPU advertises neither the
+     * secondary controls nor EPT. Both must remain inaccessible to VMX code. */
+    STATUS(op_vmwrite_reg, 0, 0x201a, value, 0x40, 61);
+    check(read_field(0x4400) == 12, 62);
+    STATUS(op_vmread_mem, hole, 0x201a, 0, 0x40, 63);
+    check(read_field(0x4400) == 12, 64);
+    STATUS(op_vmwrite_reg, 0, 0x401e, 2, 0x40, 65);
+    check(read_field(0x4400) == 12, 66);
+    STATUS(op_vmwrite_reg, 0, 0x201b, value >> 32, 0x40, 67);
     FAULT(op_vmptrst, hole, 0, 14, 2, 45);
     FAULT(op_vmread_mem, hole, RIP, 14, 2, 46);
     FAULT(op_vmread_mem, 1ull << 47, RIP, 13, 0, 47);

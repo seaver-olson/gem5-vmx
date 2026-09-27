@@ -44,6 +44,16 @@ struct TranslationContext
     BaseMMU::Mode originalMode;
     enum class Stream { Instruction, Data } stream;
     PagingPort *port;
+
+    std::optional<EptWalkRequest>
+    eptWalkRequest(Addr guestPhysical, EptAccess access,
+                   EptOrigin origin) const
+    {
+        if (!ept)
+            return std::nullopt;
+        return EptWalkRequest{*ept, guestPhysical, access, origin,
+                              physicalBits};
+    }
 };
 using TranslationContextPtr = std::shared_ptr<const TranslationContext>;
 

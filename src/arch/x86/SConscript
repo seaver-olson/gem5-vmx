@@ -74,7 +74,7 @@ Source('types.cc', tags=['x86 isa'])
 Source('utility.cc', tags=['x86 isa'])
 
 GTest('paging.test', 'paging.test.cc')
-GTest('ept.test', 'ept.test.cc')
+GTest('ept.test', 'ept.test.cc', '../../base/debug.cc')
 GTest('vmcs.test', 'vmcs.test.cc')
 GTest('vmx_utils.test', 'vmx_utils.test.cc', '../../base/debug.cc')
 

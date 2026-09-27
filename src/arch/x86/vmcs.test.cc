@@ -170,11 +170,36 @@ TEST(VmcsLifecycle, ClearAndLaunchedTransitions)
     EXPECT_EQ(vmcs.abortIndicator(), 0);
 }
 
-// Components belonging only to unadvertised advanced features must fail
-// lookup instead of being accepted and silently ignored.
-TEST(VmcsFields, RejectsUnadvertisedAdvancedComponents)
+// EPTP is a 64-bit VM-execution control at 0x201A; availability to VMREAD
+// and VMWRITE is separately gated by the processor's VMX capabilities.
+TEST(VmcsFields, StoresEptPointerAtArchitecturalEncoding)
 {
-    EXPECT_FALSE(Vmcs::fieldSupported(Field::EptPointer));
+    Vmcs vmcs(0x2000, 1);
+    uint64_t value = 0;
+    EXPECT_EQ(Vmcs::encodingOf(Field::EptPointer), 0x201a);
+    EXPECT_EQ(Vmcs::widthFromEncoding(Vmcs::encodingOf(Field::EptPointer)),
+              FieldWidth::U64);
+    EXPECT_EQ(Vmcs::typeFromEncoding(Vmcs::encodingOf(Field::EptPointer)),
+              FieldType::Control);
+    ASSERT_TRUE(vmcs.write(Field::EptPointer, 0x1122334455667788ull));
+    ASSERT_TRUE(vmcs.read(Vmcs::encodingOf(Field::EptPointer) | 1, value));
+    EXPECT_EQ(value, 0x11223344);
+    ASSERT_TRUE(vmcs.write(Vmcs::encodingOf(Field::EptPointer) | 1,
+                           0xaabbccdd));
+    ASSERT_TRUE(vmcs.read(Field::EptPointer, value));
+    EXPECT_EQ(value, 0xaabbccdd55667788ull);
+    EXPECT_EQ(Vmcs::encodingOf(Field::SecondaryVmExecControl), 0x401e);
+    EXPECT_EQ(Vmcs::widthFromEncoding(
+                  Vmcs::encodingOf(Field::SecondaryVmExecControl)),
+              FieldWidth::U32);
+    EXPECT_FALSE(Vmcs::fieldSupported(
+        Vmcs::encodingOf(Field::SecondaryVmExecControl) | 1));
+}
+
+// Other advanced components still fail lookup instead of being accepted
+// and silently ignored.
+TEST(VmcsFields, RejectsUnmodeledAdvancedComponents)
+{
     EXPECT_FALSE(Vmcs::fieldSupported(Field::VirtualApicAddress));
     EXPECT_FALSE(Vmcs::fieldSupported(Field::VmreadBitmapAddress));
     EXPECT_FALSE(Vmcs::fieldSupported(

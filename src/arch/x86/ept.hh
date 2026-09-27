@@ -22,10 +22,41 @@ struct EptConfig
     bool accessedDirty;
 };
 
+// Keep the cause of a second-stage lookup with its GPA. Guest descriptor
+// reads/updates and the final access need different EPT-violation metadata.
+enum class EptAccess : uint8_t { Read, Write, Execute };
+enum class EptOrigin : uint8_t { GuestPageTable, FinalAccess };
+
+struct EptWalkRequest
+{
+    EptConfig config;
+    Addr guestPhysical;
+    EptAccess access;
+    EptOrigin origin;
+    unsigned hostPhysicalBits;
+};
+
 namespace ept
 {
 
 constexpr uint32_t EnableEptSecondaryControl = 1u << 1;
+constexpr uint32_t ActivateSecondaryControls = 1u << 31;
+
+// These VMCS components exist only if their enabling control can be 1.
+// Capability MSRs put allowed-one control bits in the high dword.
+inline constexpr bool
+secondaryControlsAvailable(uint64_t primaryCapability)
+{
+    return (primaryCapability >> 32) & ActivateSecondaryControls;
+}
+
+inline constexpr bool
+eptPointerAvailable(uint64_t primaryCapability,
+                    uint64_t secondaryCapability)
+{
+    return secondaryControlsAvailable(primaryCapability) &&
+        ((secondaryCapability >> 32) & EnableEptSecondaryControl);
+}
 
 // Intel SDM Vol. 3C, EPTP format and VM-entry execution-control checks.
 // The capability argument is IA32_VMX_EPT_VPID_CAP. This parser does not
@@ -60,6 +91,55 @@ decodeEptp(uint64_t eptp, uint64_t capability, unsigned physicalBits)
     return EptConfig{eptp, eptp & ~mask(12), walkLength, memoryType,
                      accessedDirty};
 }
+
+// The address-planning half of a second-stage walk. It does not fetch an EPT
+// entry or grant access. EPT table bases and entry addresses are host-physical;
+// a continuation can use them on the existing PagingPort without queuing
+// behind its guest-page-walk parent.
+class WalkPlan
+{
+  private:
+    EptWalkRequest request;
+
+    explicit WalkPlan(const EptWalkRequest &input) : request(input) {}
+
+  public:
+    static std::optional<WalkPlan>
+    create(const EptWalkRequest &input)
+    {
+        const unsigned levels = input.config.walkLength;
+        if ((levels != 4 && levels != 5) ||
+                input.hostPhysicalBits < 32 ||
+                input.hostPhysicalBits > 52 ||
+                (input.guestPhysical & ~mask(12 + 9 * levels)) ||
+                (input.config.root & mask(12)) ||
+                (input.config.root & ~mask(input.hostPhysicalBits))) {
+            return std::nullopt;
+        }
+        return WalkPlan(input);
+    }
+
+    const EptWalkRequest &input() const { return request; }
+
+    std::optional<Addr>
+    entryAddress(Addr tableBase, unsigned level) const
+    {
+        if (level == 0 || level > request.config.walkLength ||
+                (tableBase & mask(12)) ||
+                (tableBase & ~mask(request.hostPhysicalBits))) {
+            return std::nullopt;
+        }
+        const unsigned shift = 12 + 9 * (level - 1);
+        const Addr index = (request.guestPhysical >> shift) & mask(9);
+        return tableBase + index * sizeof(uint64_t);
+    }
+
+    std::optional<Addr>
+    rootEntryAddress() const
+    {
+        return entryAddress(request.config.root, request.config.walkLength);
+    }
+};
 
 } // namespace ept
 } // namespace gem5::X86ISA

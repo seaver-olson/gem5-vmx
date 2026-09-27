@@ -260,6 +260,23 @@ vmxControlCapability(ThreadContext *tc, RegIndex legacyMsr,
 }
 
 bool
+vmcsFieldAvailable(ThreadContext *tc, VmcsField field)
+{
+    if (field != VmcsField::EptPointer &&
+            field != VmcsSecondaryVmExecControl) {
+        return true;
+    }
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    const uint64_t primary = vmxControlCapability(tc,
+            misc_reg::VmxProcbasedCtls, misc_reg::VmxTrueProcbasedCtls);
+    if (field == VmcsSecondaryVmExecControl) {
+        return ept::secondaryControlsAvailable(primary);
+    }
+    return ept::eptPointerAvailable(primary,
+            isa->readMiscRegNoEffect(misc_reg::VmxProcbasedCtls2));
+}
+
+bool
 vmxCr4Enabled(ThreadContext *tc)
 {
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
@@ -2130,9 +2147,10 @@ VmxState::vmread(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
-    // vmcs->read() itself resolves and rejects an unsupported field, so a
-    // separate fieldSupported() pre-check would only repeat that lookup.
-    if (!vmcs->read(encoding, value)) {
+    // VMCS metadata describes the component format; optional components
+    // are exposed only when their enabling control is advertised.
+    if (!vmcsFieldAvailable(xc->tcBase(), encoding.field()) ||
+            !vmcs->read(encoding, value)) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }
@@ -2175,7 +2193,7 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
     // vmcs->write() below does not need to repeat it just to report
     // failure; fieldSupported()+fieldWritable() would each redo the scan.
     const auto *field = Vmcs::lookupField(encoding);
-    if (!field) {
+    if (!field || !vmcsFieldAvailable(xc->tcBase(), encoding.field())) {
         return vmFailValid(vmcs,
                 toInt(VmxInstructionError::UnsupportedVmcsComponent));
     }

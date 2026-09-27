@@ -401,7 +401,7 @@ or architectural execution requirement.
 | 0 | Traceable requirements and reproducible baseline | `no-ept-baseline` branch and recorded 56-case signature; EPT-specific release requirements remain open |
 | 1 | Guest paging repair; separately repair VMX memory operands | No-EPT paging and native VMX operand gates pass; do not enable EPT |
 | 2 | MMU coordinator, typed context, queued shared ports, explicit stage results, drain | Current guest coordinator, immutable context, shared queued endpoints, explicit results and lifecycle tests pass with unchanged 56-case no-EPT measurements; EPT child lifecycle integration remains in phases 4–5 |
-| 3 | EPTP/entry rules, LRU cache, 4/5 levels, 4 KiB/2 MiB/1 GiB, memory types | EPTP decoder and VM-entry validation hook added on `ept-bootstrap`; walk/cache/leaf/memory-type work pending |
+| 3 | EPTP/entry rules, LRU cache, 4/5 levels, 4 KiB/2 MiB/1 GiB, memory types | EPTP decoder, VM-entry validation, capability-gated VMCS fields and 4-/5-level entry-address planning added; packet walk/cache/leaf/memory-type work pending |
 | 4 | EPT on every guest descriptor access/update and final GPA; VM entry/deferred faults | Pending |
 | 5 | Nested timing, event vectoring, cancellation, checkpoints/takeover | Pending |
 | 6 | INVEPT ordering/barriers, capabilities, Classic/Ruby and CPU release matrix | Pending; production EPT remains disabled |
@@ -411,10 +411,15 @@ The `ept-bootstrap` branch adds an EPTP decoder, VM-entry validation hook,
 and an entry-time EPT configuration snapshot carried into each MMU
 `TranslationContext`. It checks capability-supported UC/WB memory type,
 4-/5-level walk length, A/D enable, reserved bits, and physical-address
-width. This is only a configuration foundation: EPT remains unadvertised,
-the EPTP VMCS field remains unsupported, and VM entry requests for EPT are
-rejected until GPA-to-HPA translation and EPT exit handling are implemented.
-Phase 3's walk, cache, leaf sizes, and effective memory-type work remain open.
+width. EPTP now has its architectural 0x201A VMCS location, with VMREAD and
+VMWRITE gated by the advertised secondary/EPT control capabilities. The
+captured context can form a typed EPT lookup request that preserves the GPA,
+access type and whether it came from a guest page-table access or the final
+memory access. A pure 4-/5-level walk plan computes EPT entry addresses;
+it does not yet fetch entries or grant access. EPT remains unadvertised and
+VM entry requests for EPT are rejected until GPA-to-HPA translation and EPT
+exit handling are implemented. Phase 3's packet walk, cache, leaf sizes,
+and effective memory-type work remain open.
 
 The target retains IA-32e guests and 64-bit hosts. EPT's walk depth and leaf
 sizes do not enable guest LA57 or guest 1 GiB pages. VPID, unrestricted guests,
