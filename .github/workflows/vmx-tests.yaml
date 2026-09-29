@@ -81,11 +81,11 @@ jobs:
 
             - name: Install Linux-kernel build dependencies
               # ubuntu-24.04_all-dependencies has gem5's own deps
-              # (build-essential -> gcc-13, libelf-dev, ...) but not these
+              # (build-essential -> gcc-13, ...) but not these
               # kernel-build-specific ones.
               run: |
                   apt-get update
-                  apt-get install -y bison flex libssl-dev bc cpio
+                  apt-get install -y bison flex libssl-dev libelf-dev bc cpio
 
             - name: Build gem5.opt (X86)
               run: scons build/X86/gem5.opt -j "$(nproc)"
