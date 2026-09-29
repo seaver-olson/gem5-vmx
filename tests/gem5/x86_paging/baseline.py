@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -44,18 +45,49 @@ def collect(directory):
     return result
 
 
-def provenance(binary, source_archive=None):
-    root = Path(__file__).resolve().parents[3]
+def provenance(binary, source_archive=None, *, root=None, suite=None):
+    if root is None:
+        root = Path(__file__).resolve().parents[3]
+        workspace = os.environ.get('GITHUB_WORKSPACE')
+        if os.environ.get('GITHUB_ACTIONS') == 'true' and workspace:
+            checkout = Path(workspace).resolve()
+            if Path(__file__).resolve().is_relative_to(checkout):
+                root = checkout
     def git(*args):
-        return subprocess.check_output(['git', *args], cwd=root)
+        return subprocess.check_output(['git', *args], cwd=root,
+                                       stderr=subprocess.PIPE)
     digest = hashlib.sha256()
     # Include staged/unstaged tracked edits and new source files. Ignored
     # binaries, checkpoints and output directories are deliberately excluded.
-    patch = git('diff', 'HEAD', '--binary')
-    digest.update(patch)
-    sources = {'tracked.patch': patch, 'HEAD': git('rev-parse', 'HEAD')}
+    try:
+        in_worktree = git('rev-parse', '--is-inside-work-tree').strip() == b'true'
+    except subprocess.CalledProcessError:
+        in_worktree = False
+    if in_worktree:
+        head = git('rev-parse', 'HEAD')
+        patch = git('diff', 'HEAD', '--binary')
+        digest.update(patch)
+        sources = {'tracked.patch': patch, 'HEAD': head}
+        source_state = 'git-worktree'
+    else:
+        # Containerized CI can lack .git after checkout/build. Preserve the
+        # checked-out commit identity, but never represent an unverified
+        # worktree as a clean one or manufacture an empty tracked.patch.
+        sha = os.environ.get('GITHUB_SHA', '')
+        workspace = os.environ.get('GITHUB_WORKSPACE', '')
+        if (os.environ.get('GITHUB_ACTIONS') != 'true' or
+                not re.fullmatch(r'[0-9a-fA-F]{40}', sha) or
+                not workspace or Path(workspace).resolve() != root):
+            raise RuntimeError(f'Git worktree unavailable at {root}; '
+                               'cannot record source provenance')
+        head = (sha.lower() + '\n').encode()
+        source_state = 'github-sha-only; worktree changes unverified'
+        digest.update(source_state.encode() + b'\0' + head)
+        sources = {'HEAD': head, 'source_state': source_state.encode() + b'\n'}
     modes = {}
-    for raw in sorted(git('ls-files', '--others', '--exclude-standard', '-z').split(b'\0')):
+    untracked = (git('ls-files', '--others', '--exclude-standard', '-z')
+                 if in_worktree else b'')
+    for raw in sorted(untracked.split(b'\0')):
         if raw:
             digest.update(raw + b'\0')
             content = (root / raw.decode()).read_bytes()
@@ -70,7 +102,7 @@ def provenance(binary, source_archive=None):
                 entry.size = len(content)
                 entry.mode = modes.get(name, 0o644)
                 archive.addfile(entry, io.BytesIO(content))
-    suite = Path(__file__).resolve().parent
+    suite = suite or Path(__file__).resolve().parent
     artifacts = [binary, *sorted(suite.glob('*.elf')),
                  suite / 'se-context-1', suite / 'se-context-2']
     hashes = {}
@@ -80,7 +112,7 @@ def provenance(binary, source_archive=None):
             for block in iter(lambda: stream.read(1024 * 1024), b''):
                 artifact_digest.update(block)
         hashes[str(path)] = artifact_digest.hexdigest()
-    return {'git_head': git('rev-parse', 'HEAD').decode().strip(),
+    return {'git_head': head.decode().strip(), 'source_state': source_state,
             'working_tree_sha256': digest.hexdigest(), 'artifacts_sha256': hashes,
             'source_archive': str(source_archive) if source_archive else None,
             'source_archive_sha256': hashlib.sha256(source_archive.read_bytes()).hexdigest()

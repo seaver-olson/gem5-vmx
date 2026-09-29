@@ -27,6 +27,11 @@ untracked source files (including executable modes). To reconstruct the source,
 check out the recorded HEAD in a separate checkout, apply `tracked.patch`, and
 copy the archive's `untracked/` contents into that checkout. Preserve this
 archive with `provenance.json`, configuration files, logs and statistics.
+If a container cannot access checkout Git metadata, CI instead records
+`source_state: github-sha-only; worktree changes unverified` and archives only
+the GitHub checkout SHA. That evidence identifies the requested revision but
+does not prove that the built working tree was unchanged; do not use it as a
+fully reconstructible source snapshot.
 This checks behavior
 against the corrected simulator baseline, not timing fidelity against hardware.
 Intentional bug fixes may require a reviewed new baseline. Future EPT-disabled

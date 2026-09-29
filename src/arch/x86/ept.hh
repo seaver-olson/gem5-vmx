@@ -39,6 +39,20 @@ struct EptWalkRequest
 namespace ept
 {
 
+// A non-leaf can deny a requested access, but a later entry may still be
+// misconfigured. Only a leaf can decide the final permission outcome.
+enum class EntryKind : uint8_t { NextTable, Mapping, Violation,
+                                 Misconfiguration };
+
+struct EntryResult
+{
+    EntryKind kind;
+    Addr base = 0;
+    uint8_t permissions = 0;
+    uint8_t pageShift = 0;
+    uint8_t memoryType = 0;
+};
+
 constexpr uint32_t EnableEptSecondaryControl = 1u << 1;
 constexpr uint32_t ActivateSecondaryControls = 1u << 31;
 
@@ -90,6 +104,62 @@ decodeEptp(uint64_t eptp, uint64_t capability, unsigned physicalBits)
 
     return EptConfig{eptp, eptp & ~mask(12), walkLength, memoryType,
                      accessedDirty};
+}
+
+// Decode one entry in a walk, with level 1 denoting an EPT PTE. The caller
+// passes the effective permissions from all ancestors (7 at the root) to
+// the next level. This covers ordinary R/W/X EPT; controls that alter those
+// semantics (MBEC, SPP, paging-write, #VE) are not enabled by this model.
+// Absent entries cause violations before their otherwise-ignored bits are
+// checked. A denied non-leaf must still be walked to detect a misconfigured
+// descendant before reporting the final permission violation.
+inline std::optional<EntryResult>
+decodeEntry(uint64_t raw, unsigned level, unsigned physicalBits,
+            uint64_t capability, uint8_t inheritedPermissions,
+            EptAccess access)
+{
+    if (level < 1 || level > 5 || physicalBits < 32 ||
+            physicalBits > 52 || inheritedPermissions > 7 ||
+            (access != EptAccess::Read && access != EptAccess::Write &&
+             access != EptAccess::Execute)) {
+        return std::nullopt;
+    }
+
+    if (!(raw & 7)) {
+        return EntryResult{EntryKind::Violation};
+    }
+    if ((!bits(raw, 0) && bits(raw, 1)) ||
+            (!bits(raw, 0) && bits(raw, 2) && !bits(capability, 0))) {
+        return EntryResult{EntryKind::Misconfiguration};
+    }
+
+    const bool large = (level == 2 || level == 3) && bits(raw, 7);
+    const bool leaf = level == 1 || large;
+    const unsigned pageShift = leaf ? 12 + 9 * (level - 1) : 12;
+    if ((!leaf && bits(raw, 7, 3)) ||
+            (large && !bits(capability, level == 2 ? 16 : 17)) ||
+            (raw & mask(52) & ~mask(physicalBits) & ~mask(pageShift)) ||
+            (large && bits(raw, pageShift - 1, 12))) {
+        return EntryResult{EntryKind::Misconfiguration};
+    }
+
+    const uint8_t memoryType = leaf ? bits(raw, 5, 3) : 0;
+    if (leaf && (memoryType == 2 || memoryType == 3 || memoryType == 7)) {
+        return EntryResult{EntryKind::Misconfiguration};
+    }
+
+    const uint8_t permissions = inheritedPermissions & (raw & 7);
+    const Addr base = raw & mask(52) & ~mask(pageShift);
+    if (!leaf) {
+        return EntryResult{EntryKind::NextTable, base, permissions};
+    }
+
+    const unsigned accessBit = access == EptAccess::Read ? 0 :
+        access == EptAccess::Write ? 1 : 2;
+    const EntryKind kind = permissions & (1u << accessBit) ?
+        EntryKind::Mapping : EntryKind::Violation;
+    return EntryResult{kind, base, permissions,
+                       static_cast<uint8_t>(pageShift), memoryType};
 }
 
 // The address-planning half of a second-stage walk. It does not fetch an EPT
