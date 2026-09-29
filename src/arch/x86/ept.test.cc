@@ -120,6 +120,24 @@ TEST(EptWalkPlan, RejectsOutOfRangeAddressesAndLevels)
     invalid = request;
     invalid.hostPhysicalBits = 31;
     EXPECT_FALSE(ept::WalkPlan::create(invalid));
+
+    // A caller must not be able to override the validated EPTP by mutating
+    // one of its decoded fields before the second-stage walk starts.
+    invalid = request;
+    invalid.config.root = 0x2000;
+    EXPECT_FALSE(ept::WalkPlan::create(invalid));
+    invalid = request;
+    invalid.config.walkLength = 5;
+    EXPECT_FALSE(ept::WalkPlan::create(invalid));
+    invalid = request;
+    invalid.config.memoryType = 0;
+    EXPECT_FALSE(ept::WalkPlan::create(invalid));
+    invalid = request;
+    invalid.config.accessedDirty = true;
+    EXPECT_FALSE(ept::WalkPlan::create(invalid));
+    invalid = request;
+    invalid.config.eptp |= 1ull << 7;
+    EXPECT_FALSE(ept::WalkPlan::create(invalid));
 }
 
 TEST(EptWalkPlan, ContextCarriesCapturedConfigurationIntoRequest)

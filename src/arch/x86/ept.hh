@@ -108,9 +108,19 @@ class WalkPlan
     create(const EptWalkRequest &input)
     {
         const unsigned levels = input.config.walkLength;
+        // Do not trust a copied decoded config independently of its EPTP:
+        // an inconsistent root or format could walk a different host table.
         if ((levels != 4 && levels != 5) ||
                 input.hostPhysicalBits < 32 ||
                 input.hostPhysicalBits > 52 ||
+                input.config.root != (input.config.eptp & ~mask(12)) ||
+                levels != bits(input.config.eptp, 5, 3) + 1 ||
+                input.config.memoryType != bits(input.config.eptp, 2, 0) ||
+                (input.config.memoryType != 0 &&
+                 input.config.memoryType != 6) ||
+                input.config.accessedDirty !=
+                    bool(bits(input.config.eptp, 6)) ||
+                bits(input.config.eptp, 11, 7) ||
                 (input.guestPhysical & ~mask(12 + 9 * levels)) ||
                 (input.config.root & mask(12)) ||
                 (input.config.root & ~mask(input.hostPhysicalBits))) {

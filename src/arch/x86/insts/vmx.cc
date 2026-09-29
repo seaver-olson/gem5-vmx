@@ -263,6 +263,7 @@ bool
 vmcsFieldAvailable(ThreadContext *tc, VmcsField field)
 {
     if (field != VmcsField::EptPointer &&
+            field != VmcsGuestPhysicalAddress &&
             field != VmcsSecondaryVmExecControl) {
         return true;
     }
@@ -272,6 +273,8 @@ vmcsFieldAvailable(ThreadContext *tc, VmcsField field)
     if (field == VmcsSecondaryVmExecControl) {
         return ept::secondaryControlsAvailable(primary);
     }
+    // The read-only guest-physical-address field has the same availability
+    // condition as EPTP: support for the enable-EPT execution control.
     return ept::eptPointerAvailable(primary,
             isa->readMiscRegNoEffect(misc_reg::VmxProcbasedCtls2));
 }
