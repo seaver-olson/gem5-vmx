@@ -27,6 +27,20 @@ enum class EptAccess : uint8_t { Read, Write, Execute };
 namespace ept
 {
 
+// Inputs for one GPA lookup. The caller supplies an already validated,
+// captured configuration; this object owns a copy, not live VMCS state.
+// Construction does not validate the address, walk tables or grant access.
+struct LookupInput
+{
+    const Addr guestPhysical;
+    const EptAccess access;
+    const EptConfig config;
+
+    LookupInput(Addr guestPhysical, EptAccess access, const EptConfig &config)
+        : guestPhysical(guestPhysical), access(access), config(config)
+    {}
+};
+
 // A non-leaf can deny a requested access, but a later entry may still be
 // misconfigured. Only a leaf can decide the final permission outcome.
 enum class EntryKind : uint8_t { NextTable, Mapping, Violation,
