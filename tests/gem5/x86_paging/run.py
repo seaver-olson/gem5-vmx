@@ -6,7 +6,6 @@ import json
 from pathlib import Path
 import subprocess
 import time
-from baseline import provenance
 
 
 def main():
@@ -21,8 +20,6 @@ def main():
     suite = Path(__file__).resolve().parent
     subprocess.run(['make', '-C', str(suite)], check=True)
     args.outdir.mkdir(parents=True, exist_ok=True)
-    (args.outdir / 'provenance.json').write_text(
-        json.dumps(provenance(args.gem5, args.outdir / 'source.tar.gz'), indent=2) + '\n')
     cases = []
     for guest in ('paging', 'legacy', 'pae'):
         for cpu in ('atomic', 'timing', 'o3'):

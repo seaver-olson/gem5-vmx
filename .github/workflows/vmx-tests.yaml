@@ -85,12 +85,16 @@ jobs:
             - uses: actions/checkout@v7
             - name: Build gem5
               run: scons build/X86/gem5.opt -j "$(nproc)"
-            - name: Test paging provenance
-              run: python3 -m unittest discover -s tests/gem5/x86_paging -p test_baseline.py
+            - name: Capture no-EPT source and binary provenance
+              id: provenance
+              # Keep behavioral regressions runnable if evidence capture fails.
+              # The signature step below still requires successful capture.
+              continue-on-error: true
+              run: |
+                  make -C tests/gem5/x86_paging
+                  python3 tests/gem5/x86_paging/baseline.py capture --results-dir m5out-paging-matrix
             - name: Run paging regressions
               run: python3 tests/gem5/x86_paging/run.py
-            - name: Record no-EPT regression signature
-              run: python3 tests/gem5/x86_paging/baseline.py record --results-dir m5out-paging-matrix --baseline m5out-paging-matrix/signature.json
             - name: Run shared paging transport and lifecycle regressions
               run: python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
             - name: Run native VMX operand regressions
@@ -100,6 +104,12 @@ jobs:
                   for cpu in atomic timing o3; do
                       python3 tests/gem5/x86_paging/gdb.py --cpu "$cpu" --outdir "m5out-paging-gdb-$cpu"
                   done
+            - name: Test paging provenance
+              run: python3 -m unittest discover -s tests/gem5/x86_paging -p test_baseline.py
+            - name: Record no-EPT regression signature
+              run: |
+                  test "${{ steps.provenance.outcome }}" = success
+                  python3 tests/gem5/x86_paging/baseline.py record --results-dir m5out-paging-matrix --baseline m5out-paging-matrix/signature.json
             - name: Upload paging results
               if: always()
               uses: actions/upload-artifact@v7

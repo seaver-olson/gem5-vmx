@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Unit checks for source provenance when Git metadata is unavailable."""
+"""Checks for independent provenance capture and missing Git metadata."""
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -10,7 +13,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from baseline import provenance
+from baseline import main, provenance
 
 
 class ProvenanceTest(unittest.TestCase):
@@ -18,8 +21,8 @@ class ProvenanceTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.suite = self.root / 'suite'
-        self.suite.mkdir()
+        self.suite = self.root / 'tests' / 'gem5' / 'x86_paging'
+        self.suite.mkdir(parents=True)
         self.binary = self.root / 'gem5.opt'
         self.binary.write_bytes(b'binary')
         for name in ('se-context-1', 'se-context-2'):
@@ -47,6 +50,26 @@ class ProvenanceTest(unittest.TestCase):
                 patch('baseline.subprocess.check_output', side_effect=unavailable):
             with self.assertRaisesRegex(RuntimeError, 'Git worktree unavailable'):
                 provenance(self.binary, root=self.root, suite=self.suite)
+
+    def test_capture_command_preserves_evidence_before_tests_run(self):
+        directory = self.root / 'results'
+        environment = {'GITHUB_ACTIONS': 'true', 'GITHUB_SHA': 'a' * 40,
+                       'GITHUB_WORKSPACE': str(self.root)}
+        arguments = ['capture', '--results-dir', str(directory),
+                     '--gem5', str(self.binary)]
+        with patch.dict(os.environ, environment, clear=True), \
+                patch('baseline.__file__', str(self.suite / 'baseline.py')), \
+                redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(arguments), 0)
+            manifest = (directory / 'provenance.json').read_bytes()
+            archive = (directory / 'source.tar.gz').read_bytes()
+            self.assertIn(str(self.binary), json.loads(manifest)['artifacts_sha256'])
+            self.assertFalse((directory / 'results.json').exists())
+            with self.assertRaises(SystemExit) as error:
+                main(arguments)
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual((directory / 'provenance.json').read_bytes(), manifest)
+            self.assertEqual((directory / 'source.tar.gz').read_bytes(), archive)
 
     def test_git_worktree_records_patch_and_untracked_source(self):
         subprocess.run(['git', 'init', '-q', str(self.root)], check=True)

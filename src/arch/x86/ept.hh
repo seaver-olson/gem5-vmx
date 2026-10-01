@@ -22,19 +22,7 @@ struct EptConfig
     bool accessedDirty;
 };
 
-// Keep the cause of a second-stage lookup with its GPA. Guest descriptor
-// reads/updates and the final access need different EPT-violation metadata.
 enum class EptAccess : uint8_t { Read, Write, Execute };
-enum class EptOrigin : uint8_t { GuestPageTable, FinalAccess };
-
-struct EptWalkRequest
-{
-    EptConfig config;
-    Addr guestPhysical;
-    EptAccess access;
-    EptOrigin origin;
-    unsigned hostPhysicalBits;
-};
 
 namespace ept
 {
@@ -162,64 +150,24 @@ decodeEntry(uint64_t raw, unsigned level, unsigned physicalBits,
                        static_cast<uint8_t>(pageShift), memoryType};
 }
 
-// The address-planning half of a second-stage walk. It does not fetch an EPT
-// entry or grant access. EPT table bases and entry addresses are host-physical;
-// a continuation can use them on the existing PagingPort without queuing
-// behind its guest-page-walk parent.
-class WalkPlan
+// Compute the host-physical address of an EPT entry (level 1 is a PTE).
+// The walk length bounds the GPA; the host width bounds the table address.
+inline std::optional<Addr>
+entryAddress(Addr tableBase, Addr guestPhysical, unsigned level,
+             unsigned walkLength, unsigned hostPhysicalBits)
 {
-  private:
-    EptWalkRequest request;
-
-    explicit WalkPlan(const EptWalkRequest &input) : request(input) {}
-
-  public:
-    static std::optional<WalkPlan>
-    create(const EptWalkRequest &input)
-    {
-        const unsigned levels = input.config.walkLength;
-        // Do not trust a copied decoded config independently of its EPTP:
-        // an inconsistent root or format could walk a different host table.
-        if ((levels != 4 && levels != 5) ||
-                input.hostPhysicalBits < 32 ||
-                input.hostPhysicalBits > 52 ||
-                input.config.root != (input.config.eptp & ~mask(12)) ||
-                levels != bits(input.config.eptp, 5, 3) + 1 ||
-                input.config.memoryType != bits(input.config.eptp, 2, 0) ||
-                (input.config.memoryType != 0 &&
-                 input.config.memoryType != 6) ||
-                input.config.accessedDirty !=
-                    bool(bits(input.config.eptp, 6)) ||
-                bits(input.config.eptp, 11, 7) ||
-                (input.guestPhysical & ~mask(12 + 9 * levels)) ||
-                (input.config.root & mask(12)) ||
-                (input.config.root & ~mask(input.hostPhysicalBits))) {
-            return std::nullopt;
-        }
-        return WalkPlan(input);
+    if ((walkLength != 4 && walkLength != 5) ||
+            level == 0 || level > walkLength ||
+            hostPhysicalBits < 32 || hostPhysicalBits > 52 ||
+            (guestPhysical & ~mask(12 + 9 * walkLength)) ||
+            (tableBase & mask(12)) ||
+            (tableBase & ~mask(hostPhysicalBits))) {
+        return std::nullopt;
     }
-
-    const EptWalkRequest &input() const { return request; }
-
-    std::optional<Addr>
-    entryAddress(Addr tableBase, unsigned level) const
-    {
-        if (level == 0 || level > request.config.walkLength ||
-                (tableBase & mask(12)) ||
-                (tableBase & ~mask(request.hostPhysicalBits))) {
-            return std::nullopt;
-        }
-        const unsigned shift = 12 + 9 * (level - 1);
-        const Addr index = (request.guestPhysical >> shift) & mask(9);
-        return tableBase + index * sizeof(uint64_t);
-    }
-
-    std::optional<Addr>
-    rootEntryAddress() const
-    {
-        return entryAddress(request.config.root, request.config.walkLength);
-    }
-};
+    const unsigned shift = 12 + 9 * (level - 1);
+    const Addr index = (guestPhysical >> shift) & mask(9);
+    return tableBase + index * sizeof(uint64_t);
+}
 
 } // namespace ept
 } // namespace gem5::X86ISA

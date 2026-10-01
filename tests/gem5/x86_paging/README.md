@@ -9,24 +9,36 @@ Run the CPU/memory/checkpoint/takeover matrix with
 and simulator statistics under `m5out-paging-matrix`. CI runs this job without
 `continue-on-error`; it is independent of the Linux boot job.
 
-For a corrected no-EPT baseline, keep the results directory from a passing
-revision and record its signature before further architectural changes:
+For a reproducible no-EPT baseline, build the simulator and guests, capture
+provenance into a fresh output directory, run the matrix, and record its
+signature before further architectural changes:
 
 ```
+make -C tests/gem5/x86_paging
+python3 tests/gem5/x86_paging/baseline.py capture --results-dir m5out-paging-matrix
+python3 tests/gem5/x86_paging/run.py --outdir m5out-paging-matrix
 python3 tests/gem5/x86_paging/baseline.py record --results-dir m5out-paging-matrix --baseline m5out-paging-baseline.json
+python3 tests/gem5/x86_paging/baseline.py capture --results-dir m5out-paging-candidate
 python3 tests/gem5/x86_paging/run.py --outdir m5out-paging-candidate
 python3 tests/gem5/x86_paging/baseline.py compare --results-dir m5out-paging-candidate --baseline m5out-paging-baseline.json
 ```
 
 The comparison requires the same passing test set and exact simulated tick,
 instruction/operation (where emitted), and TLB access/miss counts. Host speed
-is excluded. The runner records the source revision, working-tree digest and
-simulator/guest binary hashes when it starts; build the binary from that source
-first. `source.tar.gz` retains `HEAD`, the binary-capable tracked patch and
+is excluded. The separate `capture` command records the source revision,
+working-tree digest and simulator/guest binary hashes. Run it after building
+and immediately before executing tests, without changing the source or
+binaries between capture and execution. `source.tar.gz` retains `HEAD`, the
+binary-capable tracked patch and
 untracked source files (including executable modes). To reconstruct the source,
 check out the recorded HEAD in a separate checkout, apply `tracked.patch`, and
 copy the archive's `untracked/` contents into that checkout. Preserve this
 archive with `provenance.json`, configuration files, logs and statistics.
+Behavioral tests run without Git metadata or provenance capture. CI captures
+provenance in a separate step before the tests and checks capture succeeded
+before recording the signature, after the behavioral regressions have run.
+`capture` refuses to overwrite existing evidence. A signature recorded without
+capture explicitly marks its source provenance as missing.
 If a container cannot access checkout Git metadata, CI instead records
 `source_state: github-sha-only; worktree changes unverified` and archives only
 the GitHub checkout SHA. That evidence identifies the requested revision but

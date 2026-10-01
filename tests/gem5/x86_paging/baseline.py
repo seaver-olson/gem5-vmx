@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: BSD-3-Clause
-"""Record/compare deterministic no-EPT paging regression measurements.
+"""Capture provenance and record/compare no-EPT paging measurements.
 
 These signatures cover elapsed simulated ticks, committed instructions/ops,
 and TLB access/miss counts. They exclude host speed and are not a calibration
@@ -119,12 +119,27 @@ def provenance(binary, source_archive=None, *, root=None, suite=None):
             if source_archive else None}
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['record', 'compare'])
+    parser.add_argument('action', choices=['capture', 'record', 'compare'])
     parser.add_argument('--results-dir', type=Path, required=True)
-    parser.add_argument('--baseline', type=Path, required=True)
-    args = parser.parse_args()
+    parser.add_argument('--baseline', type=Path,
+                        help='Required for record and compare')
+    parser.add_argument('--gem5', type=Path, default=Path('build/X86/gem5.opt'),
+                        help='Simulator binary to hash for capture')
+    args = parser.parse_args(argv)
+    if args.action == 'capture':
+        source = args.results_dir / 'provenance.json'
+        archive = args.results_dir / 'source.tar.gz'
+        if source.exists() or archive.exists():
+            parser.error('Provenance exists; use a new results directory')
+        args.results_dir.mkdir(parents=True, exist_ok=True)
+        source.write_text(json.dumps(provenance(args.gem5, archive),
+                                     indent=2) + '\n')
+        print(f'Captured source and binary provenance in {args.results_dir}')
+        return 0
+    if args.baseline is None:
+        parser.error('--baseline is required for record and compare')
     actual = collect(args.results_dir)
     if args.action == 'record':
         if args.baseline.exists():

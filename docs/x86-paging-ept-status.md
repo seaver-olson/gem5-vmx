@@ -30,8 +30,8 @@ x86 paging mode or interleaving is implemented.
 3. **Current guest context/lifecycle contract — implemented and validated:**
    the MMU captures an immutable context shared with the walker and continuation.
    It includes paging registers, retained PDPTEs, permissions, request flags,
-   normalized/fault addresses, generation, root/non-root regime, APIC state and
-   originating stream/port. No asynchronous completion rereads these from the
+   normalized/fault addresses, generation, captured EPT configuration, APIC
+   state and originating port. No asynchronous completion rereads these from the
    CPU. Targeted tests cover queued, rejected and issued reads/updates, callback
    reentry, squash batches exceeding the per-cycle limit, concurrent I/D work,
    functional overlap and drain ownership. EPT-specific child continuations,
@@ -308,8 +308,9 @@ or against hardware. Host runtime is excluded.
 All three GDB CPU configurations pass after the move, and the Linux VMX
 transition regression again reports `PASS: COMPLETE`
 (`m5out-vmx-mmu-regression/board.pc.com_1.device`).
-`tests/gem5/x86_paging/baseline.py` records and compares the signatures; the
-runner records source revision/working-tree digest and binary hashes. The
+`tests/gem5/x86_paging/baseline.py` records and compares the signatures; its
+separate `capture` command records source revision/working-tree digest and
+binary hashes before execution. Behavioral tests do not require capture. The
 comparison rejects a deliberately injected one-tick difference. CI retains
 the signature and provenance for later no-EPT comparisons. The old results
 predate source-manifest recording and are explicitly marked as such.
@@ -375,7 +376,7 @@ are all complete.
 | Files under `src/` unless noted | Implemented change |
 |---|---|
 | `arch/x86/pagetable_walker.hh/.cc` | Accumulate U/S, R/W and NX; retain leaf A updates; set D on permitted writes; validate supported reserved encodings, physical widths and large-page alignment; correct PAT, PSE indexing and 4 MiB size; use retained legacy PAE PDPTEs; capture context on acceptance; return explicit completion results; retire packet ownership during invalidation, retries and drain. |
-| `arch/x86/paging_port.hh/.cc`, `translation.hh` | Shared queued physical transport, validity-checked retry/cancellation, per-client response routing and callback ownership; immutable MMU-captured guest context including originating I/D stream and APIC finalization state. |
+| `arch/x86/paging_port.hh/.cc`, `translation.hh` | Shared queued physical transport, validity-checked retry/cancellation, per-client response routing and callback ownership; immutable MMU-captured guest context including originating port, EPT configuration and APIC finalization state. |
 | `arch/x86/paging.hh` | Pure PDPTE validation/reload rules, physical-width and fetch-fault-address helpers, and little-endian conditional compare-and-OR descriptor updates. |
 | `arch/x86/tlb.hh/.cc` | Separate context tags from address prefixes; cache lookup/LRU/replacement and statistics; invalidation generations; empty caches on restore/takeover. Legacy BaseTLB translation entrypoints forward to MMU. |
 | `arch/x86/pagetable.hh/.cc` | Store dirty state and structured logical-thread/address-space tags, with serialization support. |

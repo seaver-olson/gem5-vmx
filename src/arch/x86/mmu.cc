@@ -91,7 +91,6 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
         uint64_t(context->cr3.pcid) : 0};
     context->generation = cache.generation(context->tag.thread);
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
-    context->nonRoot = isa->vmxState().nonRootActive();
     context->ept = isa->vmxState().eptConfig();
     context->paePdpte = isa->paePdpte();
     CpuidResult cpuid;
@@ -107,8 +106,6 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
         context->flags.set(CPL0FlagBit);
     context->accessMode = access;
     context->originalMode = original;
-    context->stream = original == Execute ? TranslationContext::Stream::Instruction :
-                                           TranslationContext::Stream::Data;
     context->port = &cache.getWalker()->pagingPort();
     return context;
 }
