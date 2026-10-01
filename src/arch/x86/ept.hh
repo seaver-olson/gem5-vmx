@@ -183,6 +183,16 @@ entryAddress(Addr tableBase, Addr guestPhysical, unsigned level,
     return tableBase + index * sizeof(uint64_t);
 }
 
+// Locate the first entry using the captured root and walk length. This only
+// computes an address; nullopt is an addressing failure, not an EPT exit.
+inline std::optional<Addr>
+rootEntryAddress(const LookupInput &input, unsigned hostPhysicalBits)
+{
+    return entryAddress(input.config.root, input.guestPhysical,
+                        input.config.walkLength, input.config.walkLength,
+                        hostPhysicalBits);
+}
+
 } // namespace ept
 } // namespace gem5::X86ISA
 
