@@ -193,6 +193,21 @@ rootEntryAddress(const LookupInput &input, unsigned hostPhysicalBits)
                         hostPhysicalBits);
 }
 
+// Locate the child entry after decoding a non-leaf at currentLevel. Denied
+// permissions do not stop descent: a deeper entry may be misconfigured.
+// nullopt means no child address can be formed; it does not report an exit.
+inline std::optional<Addr>
+nextEntryAddress(const LookupInput &input, const EntryResult &parent,
+                 unsigned currentLevel, unsigned hostPhysicalBits)
+{
+    if (parent.kind != EntryKind::NextTable || currentLevel <= 1 ||
+            currentLevel > input.config.walkLength) {
+        return std::nullopt;
+    }
+    return entryAddress(parent.base, input.guestPhysical, currentLevel - 1,
+                        input.config.walkLength, hostPhysicalBits);
+}
+
 } // namespace ept
 } // namespace gem5::X86ISA
 
