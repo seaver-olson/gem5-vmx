@@ -14,6 +14,9 @@ on:
         paths:
             - 'src/arch/x86/**'
             - 'src/arch/generic/mmu.*'
+            - 'src/cpu/FuncUnit.py'
+            - 'src/cpu/op_class.hh'
+            - 'src/cpu/o3/**'
             - 'tests/gem5/vmx/**'
             - 'tests/gem5/x86_paging/**'
             - 'src/python/gem5/components/cachehierarchies/classic/**'
@@ -23,6 +26,9 @@ on:
         paths:
             - 'src/arch/x86/**'
             - 'src/arch/generic/mmu.*'
+            - 'src/cpu/FuncUnit.py'
+            - 'src/cpu/op_class.hh'
+            - 'src/cpu/o3/**'
             - 'tests/gem5/vmx/**'
             - 'tests/gem5/x86_paging/**'
             - 'src/python/gem5/components/cachehierarchies/classic/**'
@@ -99,6 +105,8 @@ jobs:
               run: python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
             - name: Run native VMX operand regressions
               run: python3 tests/gem5/x86_paging/run.py --vmx-operands-only --outdir m5out-vmx-operands
+            - name: Run VMRESUME O3 latency and entry/exit regressions
+              run: python3 tests/gem5/x86_paging/vmresume.py
             - name: Run debugger paging regressions
               run: |
                   for cpu in atomic timing o3; do
@@ -120,6 +128,7 @@ jobs:
                       m5out-paging-matrix/source.tar.gz
                       m5out-paging-transport/
                       m5out-vmx-operands/
+                      m5out-vmresume/
                       m5out-paging-matrix/provenance.json
                       m5out-paging-matrix/signature.json
                       m5out-paging-matrix/**/console.log

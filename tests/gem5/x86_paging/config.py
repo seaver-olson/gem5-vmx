@@ -13,7 +13,9 @@ parser.add_argument('--cpu', choices=['atomic', 'timing', 'o3'], default='atomic
 parser.add_argument('--caches', action='store_true')
 parser.add_argument('--pcid', action='store_true',
                     help='Advertise PCID for control-register tests')
-parser.add_argument('--guest', choices=['vmx_operands', 'paging', 'legacy', 'pae', 'gdb'], default='paging')
+parser.add_argument('--guest', choices=['vmx_operands', 'vmresume', 'paging', 'legacy', 'pae', 'gdb'], default='paging')
+parser.add_argument('--vmresume-latency', type=int,
+                    help='Uncalibrated O3 VMRESUME execution latency in cycles')
 parser.add_argument('--gdb-socket', help='Wait for a debugger on this Unix socket')
 parser.add_argument('--fixture', action='store_true',
                     help='Inspect MMU results directly using a suspended CPU')
@@ -27,6 +29,9 @@ parser.add_argument('--switch-at', type=int, default=6025000)
 parser.add_argument('--transport', action='store_true',
                     help='Include shared transport and lifecycle fixture cases')
 args = parser.parse_args()
+if args.vmresume_latency is not None and (
+        args.cpu != 'o3' or args.switch_to or args.vmresume_latency < 1):
+    parser.error('--vmresume-latency requires O3, no CPU switch, and >= 1 cycle')
 args.fixture |= args.transport
 root = Root(full_system=True)
 root.system = system = System()
@@ -39,6 +44,11 @@ system.memory.port = system.membus.mem_side_ports
 system.system_port = system.membus.cpu_side_ports
 system.cpu = {'atomic': AtomicSimpleCPU, 'timing': TimingSimpleCPU,
               'o3': DerivO3CPU}[args.cpu]()
+if args.vmresume_latency is not None:
+    for unit in system.cpu.instQueues[0].fuPool.FUList:
+        for op in unit.opList:
+            if str(op.opClass) == 'VmxResume':
+                op.opLat = args.vmresume_latency
 if args.caches:
     for name in ('icache', 'dcache'):
         cache = Cache(size='16KiB', assoc=2, tag_latency=2,

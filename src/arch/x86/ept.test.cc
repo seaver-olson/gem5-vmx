@@ -73,6 +73,41 @@ TEST(Eptp, RejectsReservedBitsAndPhysicalAddressOverflow)
     EXPECT_FALSE(ept::decodeEptp(FourLevelWb, AllCaps, 53));
 }
 
+TEST(EptLookupInput, PreservesGuestPhysicalAddressAndAccess)
+{
+    const auto config = ept::decodeEptp(FourLevelWb, AllCaps, 48);
+    ASSERT_TRUE(config);
+    // Keep the byte offset; this is a GPA, not an aligned table address.
+    constexpr Addr guestPhysical = 0x123456789abc;
+    for (const auto access : {EptAccess::Read, EptAccess::Write,
+                              EptAccess::Execute}) {
+        const ept::LookupInput input(guestPhysical, access, *config);
+        EXPECT_EQ(input.guestPhysical, guestPhysical);
+        EXPECT_EQ(input.access, access);
+    }
+}
+
+TEST(EptLookupInput, OwnsCapturedConfiguration)
+{
+    const uint64_t capturedEptp = Root | (4ull << 3) | (1ull << 6);
+    auto config = ept::decodeEptp(capturedEptp, AllCaps, 48);
+    const auto replacement = ept::decodeEptp(
+        0x2000 | (3ull << 3) | 6, AllCaps, 48);
+    ASSERT_TRUE(config);
+    ASSERT_TRUE(replacement);
+    const ept::LookupInput input(0x1234, EptAccess::Read, *config);
+
+    // Change every source field, then destroy the source configuration.
+    // The lookup must retain the snapshot supplied at construction.
+    *config = *replacement;
+    config.reset();
+    EXPECT_EQ(input.config.eptp, capturedEptp);
+    EXPECT_EQ(input.config.root, Root);
+    EXPECT_EQ(input.config.walkLength, 5);
+    EXPECT_EQ(input.config.memoryType, 0);
+    EXPECT_TRUE(input.config.accessedDirty);
+}
+
 TEST(EptEntryAddress, SelectsFourAndFiveLevelEntries)
 {
     const Addr fourLevelGpa = (0x12ull << 39) | (0x34ull << 30) |
@@ -116,6 +151,123 @@ TEST(EptEntryAddress, LastTableSlotStaysWithinHostAddressWidth)
                                    1, 4, width),
                   (1ull << width) - sizeof(uint64_t));
     }
+}
+
+TEST(EptRootEntryAddress, SelectsCapturedRootAndStartingLevel)
+{
+    const auto fourLevel = ept::decodeEptp(FourLevelWb, AllCaps, 48);
+    constexpr Addr fiveLevelRoot = 0x56789000;
+    const auto fiveLevel = ept::decodeEptp(
+        fiveLevelRoot | (4ull << 3) | 6, AllCaps, 48);
+    ASSERT_TRUE(fourLevel);
+    ASSERT_TRUE(fiveLevel);
+    const Addr fourLevelGpa = (0x12ull << 39) | (0x34ull << 30) | 0xabc;
+    const ept::LookupInput fourInput(
+        fourLevelGpa, EptAccess::Read, *fourLevel);
+    const ept::LookupInput fiveInput(
+        (0x1aull << 48) | fourLevelGpa, EptAccess::Execute, *fiveLevel);
+
+    EXPECT_EQ(ept::rootEntryAddress(fourInput, 48), Root + 0x12 * 8);
+    EXPECT_EQ(ept::rootEntryAddress(fiveInput, 48), fiveLevelRoot + 0x1a * 8);
+}
+
+TEST(EptRootEntryAddress, KeepsGuestAndHostAddressBoundsSeparate)
+{
+    for (unsigned levels : {4u, 5u}) {
+        const Addr maxGpa = (1ull << (12 + 9 * levels)) - 1;
+        for (unsigned width : {32u, 48u, 52u}) {
+            const Addr root = (1ull << width) - 4096;
+            const auto config = ept::decodeEptp(
+                root | (uint64_t(levels - 1) << 3) | 6, AllCaps, width);
+            ASSERT_TRUE(config);
+            const ept::LookupInput last(maxGpa, EptAccess::Write, *config);
+            const ept::LookupInput overflow(
+                maxGpa + 1, EptAccess::Write, *config);
+
+            EXPECT_EQ(ept::rootEntryAddress(last, width),
+                      (1ull << width) - 8);
+            EXPECT_FALSE(ept::rootEntryAddress(overflow, width));
+        }
+    }
+}
+
+TEST(EptRootEntryAddress, RejectsInvalidHostWidthAndOutOfRangeRoot)
+{
+    const auto config = ept::decodeEptp(
+        (1ull << 40) | (3ull << 3) | 6, AllCaps, 48);
+    ASSERT_TRUE(config);
+    const ept::LookupInput input(0x1234, EptAccess::Read, *config);
+    EXPECT_FALSE(ept::rootEntryAddress(input, 31));
+    EXPECT_FALSE(ept::rootEntryAddress(input, 53));
+    EXPECT_FALSE(ept::rootEntryAddress(input, 32));
+}
+
+TEST(EptNextEntryAddress, SelectsEachChildInFourAndFiveLevelWalks)
+{
+    const Addr fourLevelGpa = (0x12ull << 39) | (0x34ull << 30) |
+        (0x56ull << 21) | (0x78ull << 12) | 0x9ab;
+    const Addr indices[] = {0, 0x78, 0x56, 0x34, 0x12};
+    for (unsigned levels : {4u, 5u}) {
+        const auto config = ept::decodeEptp(
+            Root | (uint64_t(levels - 1) << 3) | 6, AllCaps, 48);
+        ASSERT_TRUE(config);
+        const Addr gpa = fourLevelGpa | (levels == 5 ? 0x1aull << 48 : 0);
+        const ept::LookupInput input(gpa, EptAccess::Read, *config);
+        for (unsigned level = levels; level > 1; --level) {
+            const Addr nextTable = 0x1000 * level;
+            const auto parent = ept::decodeEntry(
+                nextTable | 7, level, 48, AllCaps, 7, input.access);
+            ASSERT_TRUE(parent);
+            ASSERT_EQ(parent->kind, ept::EntryKind::NextTable);
+            EXPECT_EQ(ept::nextEntryAddress(input, *parent, level, 48),
+                      nextTable + indices[level - 1] * 8);
+        }
+    }
+}
+
+TEST(EptNextEntryAddress, RejectsTerminalResultsAndInvalidLevels)
+{
+    const auto config = ept::decodeEptp(FourLevelWb, AllCaps, 48);
+    ASSERT_TRUE(config);
+    const ept::LookupInput input(0x1234, EptAccess::Read, *config);
+    for (auto kind : {ept::EntryKind::Mapping, ept::EntryKind::Violation,
+                      ept::EntryKind::Misconfiguration}) {
+        const ept::EntryResult terminal{kind, 0x2000};
+        EXPECT_FALSE(ept::nextEntryAddress(input, terminal, 3, 48));
+    }
+    const ept::EntryResult parent{ept::EntryKind::NextTable, 0x2000};
+    for (unsigned level : {0u, 1u, 5u, 6u, ~0u}) {
+        EXPECT_FALSE(ept::nextEntryAddress(input, parent, level, 48));
+    }
+}
+
+TEST(EptNextEntryAddress, ContinuesAfterInheritedPermissionDenial)
+{
+    const auto config = ept::decodeEptp(FourLevelWb, AllCaps, 48);
+    ASSERT_TRUE(config);
+    const ept::LookupInput input(0x3456, EptAccess::Write, *config);
+    const auto parent = ept::decodeEntry(0x2001, 2, 48, AllCaps, 0,
+                                         input.access);
+    ASSERT_TRUE(parent);
+    ASSERT_EQ(parent->kind, ept::EntryKind::NextTable);
+    ASSERT_EQ(parent->permissions, 0);
+    EXPECT_EQ(ept::nextEntryAddress(input, *parent, 2, 48), 0x2000 + 3 * 8);
+}
+
+TEST(EptNextEntryAddress, RejectsInvalidChildAddressInputs)
+{
+    const auto config = ept::decodeEptp(FourLevelWb, AllCaps, 48);
+    ASSERT_TRUE(config);
+    const ept::LookupInput input(0x1234, EptAccess::Read, *config);
+    const ept::EntryResult parent{ept::EntryKind::NextTable, 0x2000};
+    EXPECT_FALSE(ept::nextEntryAddress(input, parent, 3, 31));
+    EXPECT_FALSE(ept::nextEntryAddress(input, parent, 3, 53));
+    for (Addr base : {0x2001ull, 1ull << 48}) {
+        const ept::EntryResult invalid{ept::EntryKind::NextTable, base};
+        EXPECT_FALSE(ept::nextEntryAddress(input, invalid, 3, 48));
+    }
+    const ept::LookupInput overflow(1ull << 48, EptAccess::Read, *config);
+    EXPECT_FALSE(ept::nextEntryAddress(overflow, parent, 3, 48));
 }
 
 TEST(EptEntry, MapsFourKibPageAndCarriesPermissions)

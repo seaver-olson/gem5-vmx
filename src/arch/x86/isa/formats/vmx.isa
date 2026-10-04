@@ -211,20 +211,22 @@ output exec {{
     }
 
     void
-    redirectNextPc(ThreadContext *tc, Addr nextPc)
+    redirectNextPc(ExecContext *xc, Addr nextPc)
     {
-        X86ISA::PCState pc = tc->pcState().as<X86ISA::PCState>();
+        // O3 resolves control flow from the executing instruction's PC, not
+        // ThreadContext's committed PC. Simple CPUs use this interface too.
+        X86ISA::PCState pc = xc->pcState().as<X86ISA::PCState>();
         pc.setNPC(nextPc);
-        tc->pcState(pc);
+        xc->pcState(pc);
     }
 
     void
-    completeVmxResult(ThreadContext *tc, const X86ISA::VmxResult &result)
+    completeVmxResult(ExecContext *xc, const X86ISA::VmxResult &result)
     {
         if (result.redirectsNextPc) {
-            redirectNextPc(tc, result.nextPc);
+            redirectNextPc(xc, result.nextPc);
         } else if (!result.pcAlreadyRedirected) {
-            setVmxResult(tc, result);
+            setVmxResult(xc->tcBase(), result);
         }
         // If pcAlreadyRedirected is set, the callee (VM-entry event
         // injection) has already pointed the CPU's PCState at a microcode
@@ -247,7 +249,7 @@ def template VmxNoOperandDeclare {{
 
 def template VmxNoOperandConstruct {{
     %(class_name)s::%(class_name)s(X86ISA::ExtMachInst machInst)
-        : VmxNoOperandInst("%(base_mnemonic)s", machInst, No_OpClass)
+        : VmxNoOperandInst("%(base_mnemonic)s", machInst, %(op_class)s)
     {
     }
 }};
@@ -275,7 +277,7 @@ def template VmxNoOperandExecute {{
             return result.fault;
         }
 
-        completeVmxResult(xc->tcBase(), result);
+        completeVmxResult(xc, result);
         return NoFault;
     }
 }};
@@ -283,6 +285,7 @@ def template VmxNoOperandExecute {{
 def format VmxNoOperandInst() {{
     iop = InstObjParams(name, Name, 'VmxNoOperandInst', '', [])
     iop.base_mnemonic = Name.lower()
+    iop.op_class = 'VmxResumeOp' if iop.base_mnemonic == 'vmresume' else 'No_OpClass'
     header_output = VmxNoOperandDeclare.subst(iop)
     decoder_output = VmxNoOperandConstruct.subst(iop)
     decode_block = BasicDecode.subst(iop)

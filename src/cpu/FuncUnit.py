@@ -133,6 +133,7 @@ class OpClass(Enum):
         "SimdBf16MultAcc",
         "Bf16Cvt",
         "System",
+        "VmxResume",
     ]
 
 

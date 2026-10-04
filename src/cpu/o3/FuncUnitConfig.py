@@ -149,6 +149,13 @@ class System_Unit(FUDesc):
     count = 1
 
 
+class VmxResumeUnit(FUDesc):
+    # Uncalibrated opcode latency, including failed VMRESUME attempts.
+    # Configure opLat in CPU cycles; this is not a Skylake timing claim.
+    opList = [OpDesc(opClass="VmxResume", opLat=1, pipelined=False)]
+    count = 1
+
+
 class PredALU(FUDesc):
     opList = [OpDesc(opClass="SimdPredAlu")]
     count = 1

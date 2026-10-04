@@ -1,5 +1,6 @@
 /paging.elf
 /vmx_operands.elf
+/vmresume.elf
 /legacy.elf
 /pae.elf
 /gdb.elf
