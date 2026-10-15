@@ -179,10 +179,11 @@ std::ostream &operator <<(std::ostream &os, BranchData::Reason reason);
  *  for MinorTrace */
 std::ostream &operator <<(std::ostream &os, const BranchData &branch);
 
-/** Line fetch data in the forward direction.  Contains a single cache line
- *  (or fragment of a line), its address, a sequence number assigned when
- *  that line was fetched and a bubbleFlag that can allow ForwardLineData to
- *  be used to represent the absence of line data in a pipeline. */
+/** Forward data: a fetched cache line (or fragment), a fetch fault, or a
+ *  byte-free ROM continuation. The PC and sequence numbers identify its
+ *  stream. A bubbleFlag allows ForwardLineData to represent the absence of
+ *  data in the pipeline.
+ */
 class ForwardLineData /* : public ReportIF, public BubbleIF */
 {
   private:
@@ -248,6 +249,15 @@ class ForwardLineData /* : public ReportIF, public BubbleIF */
   public:
     /** This is a fault, not a line */
     bool isFault() const { return fault != NoFault; }
+
+    /** ROM continuations carry a PC but no fetched instruction bytes. */
+    bool isRom() const
+    {
+        return !isBubble() && !isFault() && lineWidth == 0 && pc &&
+            isRomMicroPC(pc->microPC());
+    }
+
+    void setRom(const PCStateBase &rom_pc);
 
     /** Set fault and possible clear the bubble flag */
     void setFault(Fault fault_);

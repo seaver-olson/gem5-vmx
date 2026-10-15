@@ -194,8 +194,7 @@ Fetch2::predictBranch(MinorDynInstPtr inst, BranchData &branch)
 
     assert(!inst->predictedTaken);
 
-    /* Skip non-control/sys call instructions */
-    if (inst->staticInst->isControl() || inst->staticInst->isSyscall()){
+    if (inst->staticInst->isControl() || inst->staticInst->isSyscall()) {
         std::unique_ptr<PCStateBase> inst_pc(inst->pc->clone());
 
         /* Tried to predict */
@@ -309,7 +308,7 @@ Fetch2::evaluate()
          * using more than one input line.  Note that lineWidth will be 0
          * for faulting lines */
         while (line_in &&
-            (line_in->isFault() ||
+            (line_in->isFault() || line_in->isRom() ||
                 fetch_info.inputIndex < line_in->lineWidth) && /* More input */
             output_index < outputWidth && /* More output to fill */
             prediction.isBubble() /* No predicted branch */)
@@ -332,7 +331,7 @@ Fetch2::evaluate()
             if (!discard_line && (!fetch_info.havePC || set_pc)) {
                 /* Set the inputIndex to be the MachInst-aligned offset
                  *  from lineBaseAddr of the new PC value */
-                fetch_info.inputIndex =
+                fetch_info.inputIndex = line_in->isRom() ? 0 :
                     (line_in->pc->instAddr() & decoder->pcMask()) -
                     line_in->lineBaseAddr;
                 DPRINTF(Fetch, "Setting new PC value: %s inputIndex: 0x%x"
@@ -355,6 +354,18 @@ Fetch2::evaluate()
                     " due to predictionSeqNum mismatch (expected: %d)\n",
                     line_in->id, fetch_info.inputIndex,
                     fetch_info.predictionSeqNum);
+            } else if (line_in->isRom()) {
+                // Seed Decode with a real ROM micro-op, not an instruction
+                // decoded from the (possibly inaccessible) architectural PC.
+                // Decode expands the sequence; Execute redirects Fetch1 on
+                // a micro-branch or at ROM completion. Do not predict the
+                // original opcode or advance its architectural PC here.
+                StaticInstPtr rom_inst = decoder->fetchRomMicroop(
+                    fetch_info.pc->microPC(), nullptr);
+                dyn_inst = new MinorDynInst(rom_inst, line_in->id);
+                dyn_inst->id.fetchSeqNum = fetch_info.fetchSeqNum;
+                dyn_inst->id.predictionSeqNum = fetch_info.predictionSeqNum;
+                set(dyn_inst->pc, fetch_info.pc);
             } else if (line_in->isFault()) {
                 /* Pack a fault as a MinorDynInst with ->fault set */
 
@@ -505,7 +516,7 @@ Fetch2::evaluate()
             /* Asked to discard line or there was a branch or fault */
             if (!prediction.isBubble() || /* The remains of a
                     line with a prediction in it */
-                line_in->isFault() /* A line which is just a fault */)
+                line_in->isFault() || line_in->isRom())
             {
                 DPRINTF(Fetch, "Discarding all input on branch/fault\n");
                 dumpAllInput(tid);

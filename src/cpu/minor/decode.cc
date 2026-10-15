@@ -173,7 +173,13 @@ Decode::evaluate()
 
                     decode_info.inputIndex++;
                     decode_info.inMacroop = false;
-                } else if (static_inst->isMacroop()) {
+                } else if (static_inst->isMacroop() ||
+                           isRomMicroPC(inst->pc->microPC())) {
+                    // Exception delivery can enter ROM microcode even when
+                    // the faulting instruction is not a macro-op. Honor that
+                    // micro-PC instead of executing the faulting opcode again.
+                    parent_static_inst =
+                        static_inst->isMacroop() ? static_inst : nullptr;
                     /* Generate a new micro-op */
                     StaticInstPtr static_micro_inst;
 
@@ -185,7 +191,8 @@ Decode::evaluate()
 
                     if (isRomMicroPC(decode_info.microopPC->microPC())) {
                         static_micro_inst = dec_ptr->fetchRomMicroop(
-                            decode_info.microopPC->microPC(), static_inst);
+                            decode_info.microopPC->microPC(),
+                            parent_static_inst);
                     } else {
                         /* Get the micro-op static instruction from the
                          * static_inst. */
@@ -214,10 +221,6 @@ Decode::evaluate()
                             "true" : "false"),
                         *decode_info.microopPC,
                         *output_inst);
-
-                    /* Acknowledge that the static_inst isn't mine, it's my
-                     * parent macro-op's */
-                    parent_static_inst = static_inst;
 
                     static_micro_inst->advancePC(*decode_info.microopPC);
 

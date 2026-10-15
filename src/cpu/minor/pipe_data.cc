@@ -171,6 +171,16 @@ ForwardLineData::setFault(Fault fault_)
 }
 
 void
+ForwardLineData::setRom(const PCStateBase &rom_pc)
+{
+    assert(isBubble() && !line && !packet && !isFault());
+    assert(isRomMicroPC(rom_pc.microPC()));
+    set(pc, rom_pc);
+    lineWidth = 0;
+    bubbleFlag = false;
+}
+
+void
 ForwardLineData::allocateLine(unsigned int width_)
 {
     lineWidth = width_;
@@ -200,7 +210,7 @@ ForwardLineData::freeLine()
 {
     /* Only free lines in non-faulting, non-bubble lines */
     if (!isFault() && !isBubble()) {
-        assert(line);
+        assert(line || isRom());
         /* If packet is not NULL then the line must belong to the packet so
          *  we don't need to separately deallocate the line */
         if (packet) {

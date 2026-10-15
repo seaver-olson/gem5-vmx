@@ -221,13 +221,15 @@ Execute::tryToBranch(MinorDynInstPtr inst, Fault fault, BranchData &branch)
     const std::unique_ptr<PCStateBase> pc_before(inst->pc->clone());
     std::unique_ptr<PCStateBase> target(thread->pcState().clone());
 
-    /* Force a branch for SerializeAfter/SquashAfter instructions
-     * at the end of micro-op sequence when we're not suspended */
+    /* Force a branch for SerializeAfter/SquashAfter instructions and ROM
+     * completion. Fetch1 waits during ROM execution; its final micro-op must
+     * restart fetching at the resulting architectural PC. */
     bool force_branch = thread->status() != ThreadContext::Suspended &&
         !inst->isFault() &&
         inst->isLastOpInInst() &&
         (inst->staticInst->isSerializeAfter() ||
-         inst->staticInst->isSquashAfter());
+         inst->staticInst->isSquashAfter() ||
+         isRomMicroPC(inst->pc->microPC()));
 
     DPRINTF(Branch, "tryToBranch before: %s after: %s%s\n",
         *pc_before, *target, (force_branch ? " (forcing)" : ""));

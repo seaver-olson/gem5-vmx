@@ -645,16 +645,23 @@ Fetch1::evaluate()
         }
     }
 
+    ThreadID rom_tid = InvalidThreadID;
     if (numInFlightFetches() < fetchLimit) {
         ThreadID fetch_tid = getScheduledThread();
 
         if (fetch_tid != InvalidThreadID) {
             DPRINTF(Fetch, "Fetching from thread %d\n", fetch_tid);
 
-            /* Generate fetch to selected thread */
-            fetchLine(fetch_tid);
-            /* Take up a slot in the fetch queue */
-            nextStageReserve[fetch_tid].reserve();
+            if (isRomMicroPC(fetchInfo[fetch_tid].pc->microPC())) {
+                // ROM is internal to the decoder. Refetching program bytes
+                // here would repeat an instruction-fetch fault indefinitely.
+                rom_tid = fetch_tid;
+            } else {
+                /* Generate fetch to selected thread */
+                fetchLine(fetch_tid);
+                /* Take up a slot in the fetch queue */
+                nextStageReserve[fetch_tid].reserve();
+            }
         } else {
             DPRINTF(Fetch, "No active threads available to fetch from\n");
         }
@@ -689,6 +696,20 @@ Fetch1::evaluate()
         }
 
         popAndDiscard(transfers);
+    }
+
+    // Give an arriving memory response priority on the shared output latch.
+    // A ROM continuation uses the same reservation and stream tags, but has
+    // no ITLB lookup, packet, or fabricated instruction bytes.
+    if (rom_tid != InvalidThreadID && line_out.isBubble()) {
+        auto &thread = fetchInfo[rom_tid];
+        line_out.setRom(*thread.pc);
+        line_out.id = InstId(rom_tid, thread.streamSeqNum,
+            thread.predictionSeqNum, lineSeqNum++);
+        nextStageReserve[rom_tid].reserve();
+        thread.state = FetchWaitingForPC;
+        DPRINTF(Fetch, "Forwarding ROM continuation %s pc: %s\n",
+            line_out.id, *line_out.pc);
     }
 
     /* If we generated output, and mark the stage as being active

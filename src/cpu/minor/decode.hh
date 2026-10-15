@@ -109,7 +109,7 @@ class Decode : public Named
          *  instructions */
         unsigned int inputIndex = 0;
 
-        /** True when we're in the process of decomposing a micro-op and
+        /** True while expanding a macro-op or ROM microcode sequence;
          *  microopPC will be valid.  This is only the case when there isn't
          *  sufficient space in Executes input buffer to take the whole of a
          *  decomposed instruction and some of that instructions micro-ops must
