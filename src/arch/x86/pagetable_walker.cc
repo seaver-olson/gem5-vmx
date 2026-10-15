@@ -186,7 +186,7 @@ Walker::sendEptTiming(WalkerState *state, PacketPtr pkt)
     const Addr gpa = pkt->getAddr();
     const EptAccess access = pkt->req->isAtomicReturn() ?
         EptAccess::Write : EptAccess::Read;
-    const ept::LookupInput input(gpa, access, *state->snapshot->ept);
+    const ept::LookupInput input(gpa, access, *state->snapshot->ept, true);
     // A rejected preflight can call back inline. Defer only that case: the
     // caller may still be inside recvPacket()/sendPackets() on this state.
     auto issuing = std::make_shared<bool>(true);
@@ -735,7 +735,7 @@ Walker::WalkerState::translatePacket(PacketPtr packet, EptAccess access)
 {
     if (!snapshot->ept)
         return NoFault;
-    const ept::LookupInput input(packet->getAddr(), access, *snapshot->ept);
+    const ept::LookupInput input(packet->getAddr(), access, *snapshot->ept, true);
     const auto result = functional ?
         ept::walkFunctional(*snapshot->port, walker->requestorId, input,
             physicalBits, snapshot->eptCapabilities) :

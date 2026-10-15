@@ -2,21 +2,23 @@
 
 This fork of gem5 adds a research-oriented Intel VMX model for x86 full-system
 simulation. It focuses on a testable VMX lifecycle and the paging machinery
-needed for future Extended Page Tables (EPT).
+needed for Extended Page Tables (EPT) guest execution.
 
 ## Current status
 
 - VMXON/VMXOFF, VMCS management, VMREAD/VMWRITE, VMLAUNCH/VMRESUME, and VMCALL.
 - 64-bit guest entry and exit, selected intercepts and event injection, VMCS
   validation, and checkpoint/restore of VMX state.
-- Reworked x86 paging and MMU paths, plus a standalone memory-backed EPT walker
-  tested in atomic, functional, and timing modes. **EPT is not yet enabled for
-  guest execution.**
+- Reworked x86 paging and MMU paths, with a memory-backed EPT walker connected
+  to guest page-table reads, guest A/D writes, and final instruction/data
+  translations. Atomic and timing walks use conditional physical EPT A/D
+  updates; functional inspection remains read-only. These paths are tested
+  with suspended-CPU fixtures. **EPT is not yet enabled for guest execution.**
 
 ## Remaining work
 
-- [ ] Connect EPT to guest translation, including guest page-table walks.
-- [ ] Complete EPT exits, memory attributes, invalidation, and end-to-end tests
+- [ ] Enable EPT at VM entry and validate EPT exit delivery during guest execution.
+- [ ] Complete EPT memory attributes, invalidation, and end-to-end tests
       before advertising EPT support.
 - [ ] Expand VMX coverage beyond the current 64-bit, single-vCPU subset
       (including optional controls and multi-vCPU behavior).

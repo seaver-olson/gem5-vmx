@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "arch/x86/paging_tester.hh"
 
+#include <algorithm>
 #include <array>
 
 #include "arch/x86/ept_walker.hh"
@@ -76,7 +77,7 @@ checkResult(const ept::WalkResult &actual, const ept::WalkResult &expected,
 } // anonymous namespace
 
 void
-PagingTester::setupEpt(bool presetAD)
+PagingTester::setupEpt(bool presetAD, bool eptAD)
 {
     setup(Long);
     std::array<uint8_t, 4 * 4096> zero{};
@@ -110,9 +111,10 @@ PagingTester::setupEpt(bool presetAD)
     panic_if(isa->vmxState().activeEptConfig,
              "EPT fixture overwrote an active EPT context");
     savedEptCapability = tc->readMiscRegNoEffect(misc_reg::VmxEptVpidCap);
-    tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, NestedCaps);
+    const uint64_t caps = NestedCaps | (eptAD ? 1ULL << 21 : 0);
+    tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, caps);
     isa->vmxState().activeEptConfig =
-        *ept::decodeEptp(EptRoot | (3 << 3) | 6, NestedCaps, 48);
+        *ept::decodeEptp(EptRoot | (3 << 3) | 6 | (eptAD ? 64 : 0), caps, 48);
 }
 
 void
@@ -188,6 +190,302 @@ PagingTester::eptMmuCases()
             cases.emplace_back([=, this] { eptMmuTiming(2, inject, true); });
         }
         cases.emplace_back([this] { eptMmuTiming(4, SquashRead); });
+    }
+    for (auto test : {EptAdTest::Read, EptAdTest::Write, EptAdTest::Execute,
+                     EptAdTest::Large2M, EptAdTest::Large1G, EptAdTest::FiveLevel,
+                     EptAdTest::AlreadySet, EptAdTest::Replace, EptAdTest::Revoke,
+                     EptAdTest::Denied, EptAdTest::Absent, EptAdTest::Misconfig,
+                     EptAdTest::UpdateError}) {
+        cases.emplace_back([=, this] { eptAdCase(test); });
+    }
+    if (system->isTimingMode()) {
+        for (auto test : {EptAdTest::Retry, EptAdTest::CancelQueued,
+                          EptAdTest::CancelIssued}) {
+            cases.emplace_back([=, this] { eptAdCase(test); });
+        }
+    }
+    for (bool denied : {false, true}) {
+        for (bool functional : {false, true}) {
+            cases.emplace_back([=, this] { eptAdGuest(denied, functional); });
+        }
+    }
+    cases.emplace_back([this] { eptAdGuest(false, false, false, false); });
+}
+
+void
+PagingTester::eptAdCase(EptAdTest test)
+{
+    setup(Long);
+    constexpr uint64_t A = 1ULL << 8, D = 1ULL << 9;
+    constexpr uint64_t Software = (1ULL << 11) | (1ULL << 52) | (1ULL << 63);
+    constexpr uint64_t Caps = NestedCaps | (1ULL << 7) | (1ULL << 17) |
+                              (1ULL << 21);
+    const unsigned levels = test == EptAdTest::FiveLevel ? 5 : 4;
+    const unsigned leaf = test == EptAdTest::Large2M ? 2 :
+                          test == EptAdTest::Large1G ? 3 : 1;
+    const auto access = test == EptAdTest::Execute ? EptAccess::Execute :
+        test == EptAdTest::Read || test == EptAdTest::Replace ||
+        test == EptAdTest::FiveLevel ? EptAccess::Read : EptAccess::Write;
+    const Addr gpa = 0x123456789abcULL |
+        (levels == 5 ? 1ULL << 48 : 0);
+    // Fresh pages keep the UC case separate from WB aliases in the cache.
+    const Addr root = 0x1800000 + unsigned(test) * 0x10000;
+    std::array<uint8_t, 5 * 4096> zero{};
+    system->physProxy.writeBlob(root, zero.data(), zero.size());
+    descriptors.clear();
+    for (unsigned level = levels; level >= leaf; --level) {
+        const Addr table = root + (levels - level) * 4096;
+        descriptors.push_back(table +
+            8 * ((gpa >> (12 + 9 * (level - 1))) & 511));
+        uint64_t raw = level == leaf ?
+            0x80000000ULL | 7 | (6 << 3) | (leaf > 1 ? 128 : 0) :
+            (table + 4096) | 7 | D; // Non-leaf bit 9 is ignored; preserve it.
+        raw |= Software;
+        if (test == EptAdTest::AlreadySet)
+            raw |= A | (level == leaf ? D : 0);
+        descriptor(descriptors.size() - 1, raw);
+    }
+    if (test == EptAdTest::Denied || test == EptAdTest::Misconfig ||
+        test == EptAdTest::Absent)
+        descriptor(descriptors.size() - 1,
+            (descriptor(descriptors.size() - 1) & ~7ULL) |
+            (test == EptAdTest::Denied ? 5 :
+             test == EptAdTest::Misconfig ? 2 : 0));
+    const auto config = *ept::decodeEptp(root | ((levels - 1) << 3) | 64 |
+        (test == EptAdTest::Write ? 0 : 6), Caps, 48);
+    const ept::LookupInput input(gpa, access, config);
+    auto &port = tlb->getWalker()->pagingPort();
+    const auto requestor = system->getRequestorId(this);
+    std::vector<uint64_t> before;
+    for (unsigned i = 0; i < descriptors.size(); ++i)
+        before.push_back(descriptor(i));
+    const Tick functionalStart = curTick();
+    const auto functional = ept::walkFunctional(port, requestor, input, 48, Caps);
+    const auto initialStatus = test == EptAdTest::Misconfig ?
+        ept::WalkStatus::Misconfiguration :
+        test == EptAdTest::Denied || test == EptAdTest::Absent ?
+        ept::WalkStatus::Violation : ept::WalkStatus::Mapping;
+    panic_if(functional.status != initialStatus,
+             "Functional EPT A/D returned an incorrect status");
+    for (unsigned i = 0; i < before.size(); ++i)
+        panic_if(descriptor(i) != before[i], "Functional EPT A/D changed memory");
+    panic_if(curTick() != functionalStart, "Functional EPT A/D advanced time");
+
+    struct Progress { unsigned updates = 0, callbacks = 0; bool armed = false; };
+    auto progress = std::make_shared<Progress>();
+    auto cancelled = std::make_shared<bool>(false);
+    squash = [cancelled] { *cancelled = true; };
+    inspectAttributes = [=, this](PacketPtr packet) {
+        const auto slot = std::find(descriptors.begin(), descriptors.end(),
+                                    packet->getAddr());
+        panic_if(pendingPackets || slot == descriptors.end() ||
+                 packet->getSize() != 8 ||
+                 packet->req->getPaddr() != packet->getAddr() ||
+                 !packet->req->getFlags().isSet(Request::PHYSICAL) ||
+                 packet->req->isUncacheable() != (config.memoryType == 0),
+                 "EPT A/D sent an incorrect physical request");
+        const bool update = packet->req->isAtomicReturn();
+        panic_if(packet->cmd != (update ? MemCmd::SwapReq : MemCmd::ReadReq),
+                 "EPT A/D used an incorrect memory command");
+        if (!update)
+            return;
+        ++progress->updates;
+        if (packet->getAddr() != descriptors.back() || progress->armed)
+            return;
+        progress->armed = true;
+        if (test == EptAdTest::Replace || test == EptAdTest::Revoke) {
+            // Change the root rights as well: resuming at the old leaf would
+            // return stale permissions even if it noticed the new PFN.
+            descriptor(0, descriptor(0) & ~2ULL);
+            descriptor(descriptors.size() - 1,
+                0xc0000000ULL | 7 | (6 << 3) | Software |
+                (test == EptAdTest::Replace ? D : 0));
+        } else if (test == EptAdTest::UpdateError && system->isAtomicMode()) {
+            packet->makeResponse();
+            packet->setBadAddress();
+        } else if (test == EptAdTest::Retry) {
+            injection = RetryUpdate;
+        } else if (test == EptAdTest::CancelQueued) {
+            injection = SquashRetryUpdate;
+        } else if (test == EptAdTest::CancelIssued) {
+            injection = SquashUpdate;
+        }
+    };
+    inspectResponse = [=, this](PacketPtr packet) {
+        if ((test == EptAdTest::UpdateError || *cancelled) &&
+            packet->req->isAtomicReturn() &&
+            packet->getAddr() == descriptors.back())
+            packet->setBadAddress();
+    };
+    const auto verify = [=, this](const ept::WalkResult &result, Tick latency) {
+        const bool cancel = test == EptAdTest::CancelQueued ||
+                            test == EptAdTest::CancelIssued;
+        const auto status = cancel ? ept::WalkStatus::Cancelled :
+            test == EptAdTest::UpdateError ? ept::WalkStatus::MemoryError :
+            test == EptAdTest::Revoke ? ept::WalkStatus::Violation :
+            functional.status;
+        panic_if(++progress->callbacks != 1 || result.status != status ||
+                 (system->isAtomicMode() && latency != observedAtomicLatency),
+                 "EPT A/D returned wrong status, latency or callback count");
+        if (status == ept::WalkStatus::Mapping) {
+            const Addr base = test == EptAdTest::Replace ? 0xc0000000 : 0x80000000;
+            panic_if(result.hostPhysical !=
+                     (base | (gpa & mask(12 + 9 * (leaf - 1)))) ||
+                     result.permissions != (test == EptAdTest::Replace ? 5 : 7),
+                     "EPT A/D returned a stale HPA or permissions");
+        } else {
+            panic_if(result.hostPhysical, "Failed EPT A/D exposed an HPA");
+            if (test == EptAdTest::Revoke)
+                panic_if(result.permissions != 5,
+                         "EPT A/D retained stale rights after replacement");
+        }
+        if (test == EptAdTest::UpdateError)
+            panic_if(result.entryAddress != descriptors.back() ||
+                     result.level != leaf || result.entry,
+                     "EPT A/D update error lost its address/level");
+        for (unsigned i = 0; i < before.size(); ++i) {
+            uint64_t expected = before[i];
+            const bool last = i + 1 == before.size();
+            if (test == EptAdTest::Replace || test == EptAdTest::Revoke) {
+                if (i == 0)
+                    expected &= ~2ULL;
+                if (last)
+                    expected = 0xc0000000ULL | 7 | (6 << 3) | Software |
+                        (test == EptAdTest::Replace ? D : 0);
+            }
+            const bool unchanged = last && (test == EptAdTest::Misconfig ||
+                test == EptAdTest::Absent ||
+                test == EptAdTest::CancelQueued ||
+                (test == EptAdTest::UpdateError && system->isAtomicMode()));
+            if (!unchanged) {
+                expected |= A;
+                if (last && access == EptAccess::Write &&
+                    test != EptAdTest::Denied && test != EptAdTest::Revoke)
+                    expected |= D;
+            }
+            panic_if(descriptor(i) != expected,
+                     "EPT A/D changed permissions, address or unrelated bits");
+        }
+        panic_if(test == EptAdTest::AlreadySet && progress->updates,
+                 "EPT A/D issued a redundant update");
+        panic_if((test == EptAdTest::Replace || test == EptAdTest::Revoke) &&
+                 system->isTimingMode() &&
+                 failedUpdates != 1, "EPT A/D replacement did not fail its compare");
+        panic_if((test == EptAdTest::Retry || cancel) && injected != 1,
+                 "EPT A/D did not exercise update retry/cancellation");
+        inspectAttributes = {};
+        inspectResponse = {};
+        squash = {};
+        awaiting = false;
+        schedule(nextEvent, curTick() + 1);
+    };
+    observedAtomicLatency = 0;
+    awaiting = true;
+    if (system->isTimingMode()) {
+        ept::walkTiming(port, requestor, input, 48, Caps,
+            [cancelled] { return !*cancelled; },
+            [verify](const ept::WalkResult &result) { verify(result, 0); });
+    } else {
+        const auto result = ept::walkAtomic(port, requestor, input, 48, Caps);
+        verify(result.result, result.latency);
+    }
+}
+
+void
+PagingTester::eptAdGuest(bool denied, bool functional, bool writing, bool presetAD)
+{
+    if (!writing)
+        setupEpt(presetAD, true);
+    // Preset guest A/D tests EPT write permission on an ordinary table read.
+    // The additional cold write sets both guest and EPT A/D from clear bits.
+    if (denied) {
+        const auto raw = system->physProxy.read<uint64_t>(
+            EptTableLeaves, ByteOrder::little);
+        system->physProxy.write<uint64_t>(EptTableLeaves, raw & ~2ULL,
+                                          ByteOrder::little);
+    }
+    const auto mode = writing || !presetAD ? BaseMMU::Write : BaseMMU::Read;
+    std::vector<uint64_t> guestBefore;
+    for (unsigned l = 0; l < 4; ++l)
+        guestBefore.push_back(descriptor(l));
+    std::array<uint8_t, 4 * 4096> eptBefore;
+    system->physProxy.readBlob(EptRoot, eptBefore.data(), eptBefore.size());
+    auto updates = std::make_shared<unsigned>(0);
+    auto tableReads = std::make_shared<unsigned>(0);
+    inspectAttributes = [=](PacketPtr pkt) {
+        if (pkt->req->isAtomicReturn())
+            ++*updates;
+        else if (pkt->getAddr() >= HostTables &&
+                 pkt->getAddr() < HostTables + 16384)
+            ++*tableReads;
+    };
+    const Tick start = curTick();
+    auto req = std::make_shared<Request>(Virtual, 1, accessFlags,
+        system->getRequestorId(this), Virtual, tc->contextId());
+    const auto verify = [=, this](const Fault &fault, const RequestPtr &out,
+                                  ThreadContext *context,
+                                  BaseMMU::Mode returned) {
+        panic_if(out != req || context != tc || returned != mode,
+                 "EPT A/D guest callback lost its request/mode");
+        if (denied) {
+            const auto *exit = dynamic_cast<VmxExitFault *>(fault.get());
+            panic_if(!exit || exit->info().reason != VmxExitReason::EptViolation ||
+                     !exit->info().hasQualification ||
+                     exit->info().qualification != (3 | (5 << 3) | 128) ||
+                     !exit->info().hasGuestPhysicalAddress ||
+                     exit->info().guestPhysicalAddress != Tables ||
+                     !exit->info().hasGuestLinearAddress ||
+                     exit->info().guestLinearAddress != Virtual || *tableReads,
+                     "EPT A/D did not classify a guest table read as a write");
+        } else {
+            panic_if(fault || out->getPaddr() != HostData + (Virtual & 4095) ||
+                     *tableReads != (writing ? 0 : 4),
+                     "EPT A/D guest translation returned wrong HPA or rewalked");
+        }
+        for (unsigned l = 0; l < 4; ++l) {
+            const auto expected = guestBefore[l] |
+                (denied || functional ? 0 : 32) |
+                (!denied && !functional && l == 3 && mode == BaseMMU::Write ?
+                 64 : 0);
+            panic_if(descriptor(l) != expected,
+                     "EPT A/D lost guest A/D updates or changed unrelated bits");
+            const auto leaf = system->physProxy.read<uint64_t>(
+                EptTableLeaves + l * 8, ByteOrder::little);
+            panic_if(bool(leaf & (1ULL << 9)) != (!denied && !functional),
+                     "EPT A/D guest read did not dirty its EPT leaf");
+        }
+        const auto data = system->physProxy.read<uint64_t>(
+            EptDataLeaf, ByteOrder::little);
+        panic_if(bool(data & (1ULL << 9)) !=
+                 (!denied && !functional && mode == BaseMMU::Write),
+                 "EPT A/D dirtied final data on read or missed a warm write");
+        if (functional) {
+            std::array<uint8_t, 4 * 4096> after;
+            system->physProxy.readBlob(EptRoot, after.data(), after.size());
+            panic_if(after != eptBefore || *updates || curTick() != start,
+                     "Functional guest translation modified EPT A/D or time");
+        }
+        panic_if(writing && *updates != 1,
+                 "Warm guest write did not issue exactly one EPT dirty update");
+        awaiting = false;
+        if (!denied && !functional && !writing && presetAD) {
+            schedule(new EventFunctionWrapper([this] {
+                eptAdGuest(false, false, true);
+            }, name() + ".ept_ad_warm", true), curTick() + 1);
+        } else {
+            finishEpt();
+        }
+    };
+    awaiting = true;
+    if (functional) {
+        verify(mmu->translateFunctional(req, tc, mode), req, tc, mode);
+    } else if (system->isTimingMode()) {
+        auto callback = std::make_unique<EptTranslation>(verify);
+        auto *raw = callback.get();
+        continuations.push_back(std::move(callback));
+        mmu->translateTiming(req, tc, raw, mode);
+    } else {
+        verify(mmu->translateAtomic(req, tc, mode), req, tc, mode);
     }
 }
 
@@ -846,7 +1144,8 @@ PagingTester::eptCases()
     }
     setup();
     config = *ept::decodeEptp(config.eptp | 64, capability, physicalBits);
-    check("A/D not implemented", WalkStatus::UnsupportedConfig, 0);
+    capability &= ~(1ULL << 21);
+    check("unsupported A/D capability", WalkStatus::InvalidInput, 0);
     inform("EPT fixture: %u lookups passed (%s)", checks,
            system->isAtomicMode() ? "functional + atomic" : "functional only");
     if (system->isTimingMode()) {

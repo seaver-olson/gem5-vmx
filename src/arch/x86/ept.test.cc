@@ -84,6 +84,10 @@ TEST(EptLookupInput, PreservesGuestPhysicalAddressAndAccess)
         const ept::LookupInput input(guestPhysical, access, *config);
         EXPECT_EQ(input.guestPhysical, guestPhysical);
         EXPECT_EQ(input.access, access);
+        EXPECT_FALSE(input.pagingStructure);
+        const ept::LookupInput table(guestPhysical, access, *config, true);
+        EXPECT_TRUE(table.pagingStructure);
+        EXPECT_EQ(table.access, access);
     }
 }
 

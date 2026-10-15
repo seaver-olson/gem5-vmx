@@ -35,9 +35,14 @@ struct LookupInput
     const Addr guestPhysical;
     const EptAccess access;
     const EptConfig config;
+    // Normal guest page-walk reads and A/D writes. PAE PDPTE-register loads
+    // are separate accesses and must not set this flag (SDM 29.3.5).
+    const bool pagingStructure;
 
-    LookupInput(Addr guestPhysical, EptAccess access, const EptConfig &config)
-        : guestPhysical(guestPhysical), access(access), config(config)
+    LookupInput(Addr guestPhysical, EptAccess access, const EptConfig &config,
+                bool pagingStructure = false)
+        : guestPhysical(guestPhysical), access(access), config(config),
+          pagingStructure(pagingStructure)
     {}
 };
 

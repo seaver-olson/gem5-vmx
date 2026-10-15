@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "arch/x86/insts/vmx.hh"
+#include "arch/x86/paging.hh"
 #include "arch/x86/paging_port.hh"
 #include "base/logging.hh"
 #include "mem/packet_access.hh"
@@ -20,15 +21,25 @@ struct WalkState
     const LookupInput input;
     const unsigned physicalBits;
     const uint64_t capability;
+    const bool functional;
     unsigned level;
     Addr address = 0;
     uint8_t permissions = 7;
     // Empty while walking; initialization starts with a fail-closed result.
     std::optional<WalkResult> result = WalkResult{};
+    struct Update
+    {
+        Addr address;
+        unsigned level;
+        uint64_t observed;
+        uint64_t bits;
+    };
+    std::optional<Update> update;
 
     WalkState(const LookupInput &lookup, unsigned hostPhysicalBits,
-              uint64_t caps)
+              uint64_t caps, bool functional = false)
         : input(lookup), physicalBits(hostPhysicalBits), capability(caps),
+          functional(functional),
           level(input.config.walkLength)
     {
         const auto &config = input.config;
@@ -45,22 +56,36 @@ struct WalkState
         const auto root = rootEntryAddress(input, physicalBits);
         if (!root)
             return;
-        if (config.accessedDirty) {
-            result->status = WalkStatus::UnsupportedConfig;
-            return;
-        }
         address = *root;
         result.reset();
     }
 
+    bool done() const { return result.has_value() && !update; }
+
+    void cancel()
+    {
+        update.reset();
+        result = WalkResult{WalkStatus::Cancelled};
+    }
+
     std::unique_ptr<Packet>
-    readPacket(RequestorID requestor) const
+    nextPacket(RequestorID requestor) const
     {
         Request::Flags flags = Request::PHYSICAL;
         flags.set(Request::UNCACHEABLE, input.config.memoryType == 0);
-        auto request = std::make_shared<Request>(address, sizeof(uint64_t),
-                                                 flags, requestor);
-        auto packet = std::make_unique<Packet>(request, MemCmd::ReadReq);
+        if (update)
+            flags.set(Request::ATOMIC_RETURN_OP);
+        auto request = std::make_shared<Request>(
+            update ? update->address : address, sizeof(uint64_t), flags,
+            requestor);
+        if (update) {
+            request->setAtomicOpFunctor(
+                std::make_unique<paging::ConditionalUpdate<uint64_t>>(
+                    update->observed, update->bits));
+            request->setExtraData(update->observed);
+        }
+        auto packet = std::make_unique<Packet>(request,
+            update ? MemCmd::SwapReq : MemCmd::ReadReq);
         packet->allocate();
         return packet;
     }
@@ -69,19 +94,46 @@ struct WalkState
     consume(const Packet &packet)
     {
         WalkResult terminal;
-        terminal.level = level;
-        terminal.entryAddress = address;
+        terminal.level = update ? update->level : level;
+        terminal.entryAddress = update ? update->address : address;
         if (packet.isError()) {
             terminal.status = WalkStatus::MemoryError;
+            update.reset();
             result = terminal;
             return;
         }
 
+        if (update) {
+            const bool replaced = packet.getLE<uint64_t>() != update->observed;
+            update.reset();
+            if (replaced) {
+                // Never use a child pointer, rights or leaf from the old
+                // observation. Already-completed A updates remain sticky.
+                level = input.config.walkLength;
+                address = *rootEntryAddress(input, physicalBits);
+                permissions = 7;
+                result.reset();
+            }
+            return;
+        }
+
         terminal.entry = packet.getLE<uint64_t>();
+        const EptAccess access = input.config.accessedDirty &&
+            input.pagingStructure ? EptAccess::Write : input.access;
         const auto decoded = decodeEntry(terminal.entry, level, physicalBits,
-                                         capability, permissions,
-                                         input.access);
+                                         capability, permissions, access);
         panic_if(!decoded, "EPT walk supplied invalid decoder inputs");
+        if (input.config.accessedDirty && !functional &&
+            (terminal.entry & 7) &&
+            decoded->kind != EntryKind::Misconfiguration) {
+            // A records each valid entry used, including walks that later
+            // fault. D is set only for an allowed write to a leaf mapping.
+            const uint64_t wanted = (1ULL << 8) |
+                (decoded->kind == EntryKind::Mapping &&
+                 access == EptAccess::Write ? 1ULL << 9 : 0);
+            if (const auto missing = wanted & ~terminal.entry; missing)
+                update = Update{address, level, terminal.entry, missing};
+        }
         switch (decoded->kind) {
           case EntryKind::NextTable: {
             const auto next = nextEntryAddress(input, *decoded, level,
@@ -136,13 +188,13 @@ struct TimingWalk : std::enable_shared_from_this<TimingWalk>
         // Obsolete results must not escape, including errors and preflight
         // failures. Cancellation is independent of architectural decoding.
         if (!valid())
-            state.result = WalkResult{WalkStatus::Cancelled};
-        if (state.result) {
+            state.cancel();
+        if (state.done()) {
             auto done = std::move(completion);
             done(*state.result);
             return;
         }
-        port.submit(state.readPacket(requestor).release(), valid,
+        port.submit(state.nextPacket(requestor).release(), valid,
             [self = shared_from_this()](PacketPtr packet, bool cancelled) {
                 self->receive(packet, cancelled);
             });
@@ -152,10 +204,10 @@ struct TimingWalk : std::enable_shared_from_this<TimingWalk>
     receive(PacketPtr response, bool cancelled)
     {
         // A queued cancellation returns a request, not a data response. An
-        // already-issued read cannot be withdrawn: retain it until here.
+        // already-issued request cannot be withdrawn: retain it until here.
         std::unique_ptr<Packet> packet(response);
         if (cancelled || !valid())
-            state.result = WalkResult{WalkStatus::Cancelled};
+            state.cancel();
         else
             state.consume(*packet);
         packet.reset();
@@ -184,7 +236,8 @@ lookupFault(const WalkResult &result, const LookupInput &input,
     info.guestPhysicalAddress = input.guestPhysical;
     if (result.status == WalkStatus::Violation) {
         info.hasQualification = true;
-        info.qualification = 1ULL << unsigned(input.access);
+        info.qualification = input.config.accessedDirty && input.pagingStructure ?
+            3 : 1ULL << unsigned(input.access);
         info.qualification |= uint64_t(result.permissions) << 3;
         info.qualification |= 1ULL << 7; // Guest linear address is valid.
         if (finalAccess)
@@ -201,8 +254,8 @@ walkAtomic(PagingPort &port, RequestorID requestor, const LookupInput &input,
 {
     WalkState state(input, hostPhysicalBits, capability);
     Tick latency = 0;
-    while (!state.result) {
-        auto packet = state.readPacket(requestor);
+    while (!state.done()) {
+        auto packet = state.nextPacket(requestor);
         latency += port.sendAtomic(packet.get());
         state.consume(*packet);
     }
@@ -214,9 +267,9 @@ walkFunctional(PagingPort &port, RequestorID requestor,
                const LookupInput &input, unsigned hostPhysicalBits,
                uint64_t capability)
 {
-    WalkState state(input, hostPhysicalBits, capability);
-    while (!state.result) {
-        auto packet = state.readPacket(requestor);
+    WalkState state(input, hostPhysicalBits, capability, true);
+    while (!state.done()) {
+        auto packet = state.nextPacket(requestor);
         port.sendFunctional(packet.get());
         state.consume(*packet);
     }

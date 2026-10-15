@@ -100,13 +100,20 @@ class PagingTester : public SimObject, public BaseMMU::Translation
                          TableRead, TableUpdate, DirtyUpdate, DataMisconfig,
                          TableMisconfig, GuestFault, Replace, Remap,
                          InheritedWrite, Rmw };
-    void setupEpt(bool presetAD);
+    void setupEpt(bool presetAD, bool eptAD = false);
     void finishEpt();
     void eptMmuCases();
     void eptMmuAccess(BaseMMU::Mode mode, bool functional, bool warm,
                       EptTest test, unsigned level = 0, bool primed = false);
     void eptMmuTiming(unsigned point, Injection inject, bool warm = false,
                       bool primed = false);
+    enum class EptAdTest { Read, Write, Execute, Large2M, Large1G, FiveLevel,
+                           AlreadySet, Replace, Revoke, Denied, Absent,
+                           Misconfig, UpdateError,
+                           Retry, CancelQueued, CancelIssued };
+    void eptAdCase(EptAdTest test);
+    void eptAdGuest(bool denied, bool functional, bool writing = false,
+                    bool presetAD = true);
     void eptTimingLifecycle(bool retry, bool cancel, unsigned stop);
     void eptTimingConcurrent();
     void next();

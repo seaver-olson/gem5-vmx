@@ -149,7 +149,8 @@ hierarchy. Tests cover four- and
 five-level walks, 4 KiB/2 MiB/1 GiB leaves, permission accumulation, violation
 versus misconfiguration ordering, leaf attributes, UC/WB requests, unchanged
 tables, physical read errors, and exact accumulated atomic memory latency.
-Invalid inputs and A/D-enabled configurations fail before any memory request.
+Invalid inputs, including EPT A/D without its capability bit, fail before
+any memory request.
 Returned HPAs deliberately lie outside fixture RAM to verify that the walker
 does not access translated data. Additional timing cases exercise retries,
 cancellation before admission, at rejection and after issue (including a
@@ -160,6 +161,17 @@ response-driven completion time and release of callback-held state after
 retirement. Cancellation of an issued read waits for its response; it does
 not withdraw the packet from memory.
 
+Focused EPT A/D cases enable EPTP bit 6 and issue real eight-byte conditional
+updates at the entry HPAs through `PagingPort`. They check accessed bits at
+every used valid level and dirty bits only on allowed leaf writes, including
+large pages and five-level walks. Exact word comparisons check that addresses,
+permissions, software and ignored bits survive. A changed entry fails its
+compare and restarts at the captured root; replacement cases also revoke root
+write permission to detect stale accumulated rights. Tests cover already-set
+bits, absent/malformed/denied entries, failed updates, retry and cancellation.
+An issued update can commit despite cancellation or an error response;
+rejected cancelled updates cannot. Functional walks remain read-only.
+
 The same suite also calls the public MMU atomic, functional and timing APIs
 with a suspended CPU and a captured EPT configuration. Guest virtual addresses,
 guest physical addresses and backing host physical addresses all differ.
@@ -169,6 +181,11 @@ or writes through `PagingPort`, including execute-mode instruction-byte reads.
 Cold and warm I/D TLB cases verify that cached entries retain GPAs and still
 apply EPT permissions and HPA remapping on each final access. Functional cases
 must preserve guest A/D bits, EPT tables and simulated time.
+With EPT A/D enabled, normal guest page-table reads require EPT write
+permission and dirty their EPT leaf even when guest A/D bits are already set.
+The tests check both read/write qualification bits on denial, combined guest
+and EPT A/D updates, and a warm-TLB final write setting the EPT data leaf's D
+bit without rewalking guest tables.
 
 Fault cases inspect the VM-exit fault's reason, qualification, GPA and GLA,
 including table reads and A/D writes at each guest paging level, a separate
