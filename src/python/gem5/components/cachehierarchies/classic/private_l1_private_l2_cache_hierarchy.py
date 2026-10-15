@@ -57,8 +57,8 @@ from .abstract_classic_cache_hierarchy import AbstractClassicCacheHierarchy
 from .caches.l1dcache import L1DCache
 from .caches.l1icache import L1ICache
 from .caches.l2cache import L2Cache
-
 from .walker_ports import connect_x86_walker_caches
+
 
 class PrivateL1PrivateL2CacheHierarchy(
     AbstractClassicCacheHierarchy, AbstractTwoLevelCacheHierarchy
@@ -87,7 +87,7 @@ class PrivateL1PrivateL2CacheHierarchy(
         l1d_size: str,
         l1i_size: str,
         l2_size: str,
-        membus: Optional[BaseXBar] = None,
+        membus: BaseXBar | None = None,
     ) -> None:
         """
         :param l1d_size: The size of the L1 Data Cache (e.g., "32KiB").
@@ -167,7 +167,9 @@ class PrivateL1PrivateL2CacheHierarchy(
             self._setup_io_cache(board)
 
     def _connect_table_walker(self, cpu_id: int, cpu: BaseCPU) -> None:
-        if connect_x86_walker_caches(self, cpu_id, cpu, self.l2buses[cpu_id].cpu_side_ports):
+        if connect_x86_walker_caches(
+            self, cpu_id, cpu, self.l2buses[cpu_id].cpu_side_ports
+        ):
             return
 
         cpu.connect_walker_ports(

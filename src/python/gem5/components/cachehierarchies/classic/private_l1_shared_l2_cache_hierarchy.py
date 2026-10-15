@@ -46,8 +46,8 @@ from .abstract_classic_cache_hierarchy import AbstractClassicCacheHierarchy
 from .caches.l1dcache import L1DCache
 from .caches.l1icache import L1ICache
 from .caches.l2cache import L2Cache
-
 from .walker_ports import connect_x86_walker_caches
+
 
 class PrivateL1SharedL2CacheHierarchy(
     AbstractClassicCacheHierarchy, AbstractTwoLevelCacheHierarchy
@@ -82,7 +82,7 @@ class PrivateL1SharedL2CacheHierarchy(
         l1d_assoc: int = 8,
         l1i_assoc: int = 8,
         l2_assoc: int = 16,
-        membus: Optional[BaseXBar] = None,
+        membus: BaseXBar | None = None,
     ) -> None:
         """
         :param l1d_size: The size of the L1 Data Cache (e.g., "32KiB").
@@ -173,7 +173,9 @@ class PrivateL1SharedL2CacheHierarchy(
         if len(walker_ports) == 0:
             return
 
-        if connect_x86_walker_caches(self, cpu_id, cpu, self.l2bus.cpu_side_ports):
+        if connect_x86_walker_caches(
+            self, cpu_id, cpu, self.l2bus.cpu_side_ports
+        ):
             return
 
         cpu.connect_walker_ports(

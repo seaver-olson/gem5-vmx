@@ -154,9 +154,14 @@ class LoopPredictor : public SimObject
         bool predTaken;
 
         BranchInfo()
-            : loopTag(0), currentIter(0),
+            : loopTag(0),
+              currentIter(0),
               loopPred(false),
-              loopPredValid(false), loopIndex(0), loopIndexB(0), loopHit(0),
+              loopPredValid(false),
+              loopPredUsed(false),
+              loopIndex(0),
+              loopIndexB(0),
+              loopHit(0),
               predTaken(false)
         {}
     };

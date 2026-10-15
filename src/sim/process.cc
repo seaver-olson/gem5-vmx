@@ -112,7 +112,8 @@ normalize(const std::string& directory)
 
 Process::Process(const ProcessParams &params, EmulationPageTable *pTable,
                  loader::ObjectFile *obj_file)
-    : SimObject(params), system(params.system),
+    : SimObject(params),
+      system(params.system),
       seWorkload(dynamic_cast<SEWorkload *>(system->workload)),
       useArchPT(params.useArchPT),
       kvmInSE(params.kvmInSE),
@@ -120,17 +121,23 @@ Process::Process(const ProcessParams &params, EmulationPageTable *pTable,
       zeroPages(params.zeroPages),
       pTable(pTable),
       objFile(obj_file),
-      argv(params.cmd), envp(params.env),
+      argv(params.cmd),
+      envp(params.env),
       executable(params.executable == "" ? params.cmd[0] : params.executable),
       tgtCwd(normalize(params.cwd)),
       hostCwd(checkPathRedirect(tgtCwd)),
       release(params.release),
-      _uid(params.uid), _euid(params.euid),
-      _gid(params.gid), _egid(params.egid),
-      _pid(params.pid), _ppid(params.ppid),
-      _pgid(params.pgid), drivers(params.drivers),
-      fds(std::make_shared<FDArray>(
-                  params.input, params.output, params.errout)),
+      _secondsSinceEpoch(params.seconds_since_epoch),
+      _uid(params.uid),
+      _euid(params.euid),
+      _gid(params.gid),
+      _egid(params.egid),
+      _pid(params.pid),
+      _ppid(params.ppid),
+      _pgid(params.pgid),
+      drivers(params.drivers),
+      fds(std::make_shared<FDArray>(params.input, params.output,
+                                    params.errout)),
       childClearTID(0),
       ADD_STAT(numSyscalls, statistics::units::Count::get(),
                "Number of system calls")
@@ -367,10 +374,10 @@ Process::deallocateMem(Addr vaddr, int64_t size)
                 // achieve the same result, but would be more expensive
                 // because it would unnecessarily zero out pages that
                 // were allocated for the first time.
-                SETranslatingPortProxy virt_mem(
-                    system->threads[0], SETranslatingPortProxy::Always);
-                const std::vector<uint8_t> zero_page(page_size, 0);
-                virt_mem.writeBlob(page_vaddr, zero_page.data(), page_size);
+                // Write through the physical address: a virtual write
+                // would need a thread context of this process, and
+                // system->threads[0] may belong to another process.
+                system->physProxy.memsetBlob(page_paddr, 0, page_size);
             }
 
             // Unmap the virtual page.

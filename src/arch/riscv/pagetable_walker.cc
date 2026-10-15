@@ -416,12 +416,13 @@ Walker::WalkerState::walk()
         Addr paddr;
         walkType = WalkType::GstageOnly;
         fault = walkGStage(vaddr, paddr);
-    }
-    else if (memaccess.virt) {
+    } else if (memaccess.virt && hgatp.mode != AddrXlateMode::BARE) {
         walkType = WalkType::TwoStage;
         fault = walkTwoStage(vaddr);
-    }
-    else {
+    } else {
+        // Either the access is not virtual, or it is virtual with
+        // hgatp.mode == Bare. In the latter case G-stage translation is not
+        // performed at all.
         walkType = WalkType::OneStage;
         fault = walkOneStage(vaddr);
     }
@@ -636,7 +637,7 @@ Walker::WalkerState::guestToHostPage(Addr vaddr)
 Fault
 Walker::WalkerState::startFunctional(Addr &addr, unsigned &logBytes)
 {
-    // Pass the addess to entry here
+    // Pass the address to entry here
     // initState cannot because there is no req object
     entry.vaddr = addr;
     // just call walk
@@ -650,7 +651,7 @@ Walker::WalkerState::startFunctional(Addr &addr, unsigned &logBytes)
 }
 
 Fault
-Walker::WalkerState::checkPTEPermissions(PTE pte, WalkFlags &stepWalkFlags,
+Walker::WalkerState::checkPTEPermissions(PTE &pte, WalkFlags &stepWalkFlags,
                                          int level)
 {
     // If valid bit is off OR

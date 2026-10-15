@@ -25,7 +25,6 @@ from gem5.simulate.exit_event import ExitEvent
 from gem5.simulate.simulator import Simulator
 from gem5.utils.requires import requires
 
-
 TEST_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TEST_DIR.parents[2]
 DEFAULT_RESOURCE_DIR = REPO_ROOT / "resources"
@@ -120,12 +119,14 @@ def guest_script(include_checkpoint: bool, switch_from_kvm: bool) -> str:
 
 if args.no_kvm:
     processor = SimpleProcessor(
+        clk_freq="3GHz",
         cpu_type=CPUTypes.ATOMIC,
         isa=ISA.X86,
         num_cores=1,
     )
 else:
     processor = SimpleSwitchableProcessor(
+        clk_freq="3GHz",
         starting_core_type=CPUTypes.KVM,
         switch_core_type=CPUTypes.ATOMIC,
         isa=ISA.X86,
@@ -219,11 +220,17 @@ if args.take_checkpoint or args.take_boot_checkpoint:
 
 simulator = Simulator(board=board, on_exit_event=on_exit_event)
 mode = (
-    "boot-checkpoint" if args.take_boot_checkpoint
-    else "restore-boot" if args.restore_boot
-    else "restore" if args.restore
-    else "checkpoint" if args.take_checkpoint
-    else "normal"
+    "boot-checkpoint"
+    if args.take_boot_checkpoint
+    else (
+        "restore-boot"
+        if args.restore_boot
+        else (
+            "restore"
+            if args.restore
+            else "checkpoint" if args.take_checkpoint else "normal"
+        )
+    )
 )
 print(f"vmx-smoke-harness: starting {mode} run")
 simulator.run()
