@@ -32,6 +32,8 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     static constexpr Addr Tables = 0x1000000;
     System *system;
     const bool transportCases;
+    const bool eptOnly;
+    Tick observedAtomicLatency = 0;
     class Upstream : public ResponsePort
     {
       private:
@@ -66,6 +68,7 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     std::function<void()> startPeer;
     std::function<void()> squash;
     std::function<void(PacketPtr)> inspectAttributes;
+    std::function<void(PacketPtr)> inspectResponse;
     EventFunctionWrapper retryEvent;
     ThreadContext *tc = nullptr;
     MMU *mmu = nullptr;
@@ -91,6 +94,9 @@ class PagingTester : public SimObject, public BaseMMU::Translation
                    const Fault &fault = NoFault, bool functional = false,
                    std::function<void()> check = {});
     void buildCases();
+    void eptCases();
+    void eptTimingLifecycle(bool retry, bool cancel, unsigned stop);
+    void eptTimingConcurrent();
     void next();
     void replace(PacketPtr packet);
     bool sendTiming(PacketPtr packet);

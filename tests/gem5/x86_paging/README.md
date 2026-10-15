@@ -9,6 +9,13 @@ Run the CPU/memory/checkpoint/takeover matrix with
 and simulator statistics under `m5out-paging-matrix`. CI runs this job without
 `continue-on-error`; it is independent of the Linux boot job.
 
+The matrix has 58 cases: the original 56 plus cached and uncached MinorCPU
+IA-32e paging runs. Those Minor cases include cold/warm NX at each level,
+nonpresent and reserved-entry fetch faults, CR2/error-code checks, and return
+from the real exception handler. They do not add Minor Ruby or legacy-mode
+coverage. Regenerate measurement baselines for this test set; the ordered
+load before the host-side functional export also changes guest counters.
+
 For a reproducible no-EPT baseline, build the simulator and guests, capture
 provenance into a fresh output directory, run the matrix, and record its
 signature before further architectural changes:
@@ -107,8 +114,8 @@ own coherent port, then verifies that the old conditional update fails and
 rewalks without losing dirty or software bits. Add `--classic l1`,
 `--classic private-l2`, or `--classic shared-l2` for Classic coherence.
 
-The shared transport and lifecycle extensions run separately so that adding
-fixture cases does not change the original 56-case measurement set:
+The shared transport and lifecycle extensions run separately from the
+CPU/paging measurement set:
 
 ```
 python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
@@ -125,6 +132,36 @@ retain requests until their callbacks/responses retire. These tests exercise
 the physical transport interface; actual nested EPT continuations remain EPT
 implementation work.
 
+The memory-backed EPT walker has an isolated atomic/functional/timing fixture:
+
+```
+python3 tests/gem5/x86_paging/run.py --ept-only --outdir /tmp/ept-walker-tests
+```
+
+It runs with and without a Classic walker cache, in atomic and timing system
+configurations. Atomic configurations compare atomic and functional results
+for all 109 scenarios (218 lookups); timing configurations replay the same
+scenarios asynchronously and compare against their functional results.
+Functional lookups must leave simulated time and table contents unchanged.
+Tables are initialized by the fixture, then every EPT entry is read as an
+eight-byte physical request through the existing `PagingPort` and memory
+hierarchy. Tests cover four- and
+five-level walks, 4 KiB/2 MiB/1 GiB leaves, permission accumulation, violation
+versus misconfiguration ordering, leaf attributes, UC/WB requests, unchanged
+tables, physical read errors, and exact accumulated atomic memory latency.
+Invalid inputs and A/D-enabled configurations fail before any memory request.
+Returned HPAs deliberately lie outside fixture RAM to verify that the walker
+does not access translated data. Additional timing cases exercise retries,
+cancellation before admission, at rejection and after issue (including a
+failed response), functional lookup while a timing read is queued, independent
+EPT roots with different UC/WB attributes, and callback reentry. They verify
+one outstanding read per lookup, exactly-once completion, unchanged tables,
+response-driven completion time and release of callback-held state after
+retirement. Cancellation of an issued read waits for its response; it does
+not withdraw the packet from memory. The standalone walker is complete in
+all three modes, but EPT remains disabled at VM entry until guest-MMU
+integration and architectural exit delivery are implemented.
+
 The native VMX operand guest runs independently of VM entry/exit and EPT:
 
 ```
@@ -138,6 +175,61 @@ Ruby MESI Two Level. Checks include indexed/RIP-relative addressing, high
 faults, unsupported/read-only fields, and precheck-versus-operand fault
 priority. This is operand execution coverage; full timing/O3 VM entry/exit and
 event delivery remain separate EPT integration gates.
+
+The focused VM entry regression adds a minimal no-EPT launch/resume/VMCALL
+round trip, plus #UD, VMfailInvalid and VMfailValid checks for both entry
+instructions:
+
+```
+python3 tests/gem5/x86_paging/vmresume.py --outdir /tmp/vmresume-tests
+```
+
+It checks architectural behavior on AtomicSimple, TimingSimple and MinorCPU,
+then O3 with its production defaults and independent synthetic launch/resume
+`opLat` values of 1, 21 and 41. The O3 trace checks both operation classes,
+existing serialization/control flags, exact issue-to-execution intervals,
+two successful launches and four successful resumes. The guest checks exit reason,
+saved RIP and instruction length, and a guest-memory counter detects skipped
+or repeated execution. A failed second launch must preserve launch state so
+subsequent resumes still succeed. After the ordinary round trips, a second launch
+injects #UD and a resume injects #GP with an error code. The handlers verify the
+saved guest RIP, status flags and error code and exit directly through VMCALL;
+the normal guest entry must not run before either handler. Clearing injection
+then exercises ordinary resume again. This guards O3's executing-instruction
+PC redirect as well as the shared ROM delivery path. These focused injection
+checks do not cover IRET, all event types or EPT.
+
+CI builds the disk-free guests before compiling gem5, so guest C/assembly
+errors fail early rather than preventing every regression after a long build.
+
+All four CPU models run the same guest, including the pre-VMXON #UD checks
+for VMRESUME, VMLAUNCH, VMCALL and VMXOFF, plus a UD2 macro-op fault. Minor's
+trace checks that each VMX opcode faults exactly once, guarding against
+reexecuting it instead of dispatching exception-ROM microcode. The guest
+checks the delivered vector, return to the probe and preserved status flags.
+This is focused exception coverage, not a complete VMX exception suite.
+Minor also dispatches ROM after an instruction-fetch #PF, without requiring
+bytes from the faulting PC. A byte-free continuation uses the normal pipeline
+buffers and backpressure; ROM completion redirects normal instruction fetch
+to the handler. The handler's code/data accesses still use the real MMU and
+memory ports. The two Minor paging matrix cases guard this path.
+
+The configurable latencies target O3. Its default x86 `VmxResumeUnit` and
+`VmxLaunchUnit` are separate non-pipelined units with **uncalibrated** one-cycle
+`opLat` defaults. The two `opLat=1` lines marked `Skylake` in
+`src/cpu/o3/FuncUnitConfig.py` are the calibration points. Replace those values
+with calibrated execution costs in simulated CPU cycles, excluding measurement
+overhead and costs already modeled by gem5. Do not change the synthetic test
+values; the default-case checks read back the configured production latencies.
+
+This config exposes `--vmresume-latency N` and `--vmlaunch-latency N` for
+per-run O3 overrides. MinorCPU's default miscellaneous unit recognizes both
+operation classes at its existing one-cycle latency; this is compatibility,
+not a Skylake timing model. Custom functional-unit pools must support both
+classes. AtomicSimple and TimingSimple do not use these O3 latencies.
+Each opcode currently has one execution latency for all outcomes, including
+failures; VMCALL timing is unchanged. These settings reuse O3's existing
+scheduler. Hardware calibration and outcome-dependent timing remain future work.
 
 The separate debugger test sends real GDB remote-protocol packets over a local
 Unix socket. It checks nonidentity data, successful cross-page reads, a missing
@@ -182,7 +274,8 @@ PCIDE transition and CR3 no-flush operand checks; the default profile is unchang
 Failure codes: 10–23 cold NX; 30–43 NX data read; 50–63 warm NX; 70–79 read and
 A; 80–89 D; 100–113 address width; 120 large-page alignment; 121–122 restrictive
 PDE/write and D; 123–125 NXE/reserved and nonpresent priority; 126 canonicality;
-130–134 functional nonidentity read/write with no A/D changes; 140–143 INVLPG
+130–134 functional nonidentity read/write with no A/D changes; 135 ordered
+source load before functional export; 140–143 INVLPG
 permission and PFN replacement; 150–151 EFER.NXE changes; 160 unsupported
 PCIDE; 161–176 CR3 reserved address bits; 177 ignored low bits; 178–181 PCIDE
 transition and no-flush operand semantics; 182 clearing PG in 64-bit code;

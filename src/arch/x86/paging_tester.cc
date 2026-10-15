@@ -45,6 +45,7 @@ class TestContinuation : public BaseMMU::Translation
 
 PagingTester::PagingTester(const X86PagingTesterParams &p)
     : SimObject(p), system(p.system), transportCases(p.transport_cases),
+      eptOnly(p.ept_only),
       upstream(*this), downstream(*this),
       retryEvent([this] { upstream.sendRetryReq(); }, name() + ".retry"),
       nextEvent([this] { next(); }, name() + ".next")
@@ -81,8 +82,13 @@ PagingTester::Upstream::recvAtomic(PacketPtr pkt)
 {
     if (owner.inspectAttributes)
         owner.inspectAttributes(pkt);
+    // The EPT fixture may inject an error response, never fabricated data.
+    if (pkt->isError())
+        return 0;
     owner.replace(pkt);
-    return owner.downstream.sendAtomic(pkt);
+    const Tick latency = owner.downstream.sendAtomic(pkt);
+    owner.observedAtomicLatency += latency;
+    return latency;
 }
 
 void
@@ -90,6 +96,9 @@ PagingTester::Upstream::recvFunctional(PacketPtr pkt)
 {
     if (owner.inspectAttributes)
         owner.inspectAttributes(pkt);
+    // Match atomic error injection without forwarding the injected response.
+    if (pkt->isError())
+        return;
     owner.downstream.sendFunctional(pkt);
 }
 
@@ -110,6 +119,8 @@ PagingTester::Downstream::recvTimingResp(PacketPtr pkt)
 {
     panic_if(!owner.pendingPackets, "Unowned fixture response");
     --owner.pendingPackets;
+    if (owner.inspectResponse)
+        owner.inspectResponse(pkt);
     if (pkt->req->isAtomicReturn()) {
         const uint64_t previous = pkt->getSize() == 8 ?
             pkt->getLE<uint64_t>() : pkt->getLE<uint32_t>();
@@ -221,7 +232,14 @@ PagingTester::startup()
         thread->suspend();
     mmu = static_cast<MMU *>(tc->getMMUPtr());
     tlb = static_cast<TLB *>(mmu->dtb);
-    buildCases();
+    if (eptOnly) {
+        cases.emplace_back([this] {
+            eptCases();
+            schedule(nextEvent, curTick() + 1);
+        });
+    } else {
+        buildCases();
+    }
     schedule(nextEvent, curTick());
 }
 
@@ -383,7 +401,10 @@ PagingTester::next()
         exitSimLoop("paging fixture passed");
         return;
     }
-    cases[index++]();
+    // A case may append generated follow-up cases. Keep its callable alive
+    // even if that grows/reallocates the vector during execution.
+    auto test = cases[index++];
+    test();
 }
 
 void

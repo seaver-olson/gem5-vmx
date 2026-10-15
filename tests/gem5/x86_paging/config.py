@@ -3,19 +3,21 @@ import argparse
 from pathlib import Path
 import m5
 from m5.objects import (
-    AddrRange, AtomicSimpleCPU, TimingSimpleCPU, DerivO3CPU,
+    AddrRange, AtomicSimpleCPU, TimingSimpleCPU, DerivO3CPU, X86MinorCPU,
     Root, SrcClockDomain, System, SystemXBar, VoltageDomain,
     SimpleMemory, X86FsWorkload, Cache,
 )
 
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--cpu', choices=['atomic', 'timing', 'o3'], default='atomic')
+parser.add_argument('--cpu', choices=['atomic', 'timing', 'o3', 'minor'], default='atomic')
 parser.add_argument('--caches', action='store_true')
 parser.add_argument('--pcid', action='store_true',
                     help='Advertise PCID for control-register tests')
 parser.add_argument('--guest', choices=['vmx_operands', 'vmresume', 'paging', 'legacy', 'pae', 'gdb'], default='paging')
 parser.add_argument('--vmresume-latency', type=int,
                     help='Uncalibrated O3 VMRESUME execution latency in cycles')
+parser.add_argument('--vmlaunch-latency', type=int,
+                    help='Uncalibrated O3 VMLAUNCH execution latency in cycles')
 parser.add_argument('--gdb-socket', help='Wait for a debugger on this Unix socket')
 parser.add_argument('--fixture', action='store_true',
                     help='Inspect MMU results directly using a suspended CPU')
@@ -28,11 +30,20 @@ parser.add_argument('--switch-to', choices=['atomic', 'timing', 'o3'])
 parser.add_argument('--switch-at', type=int, default=6025000)
 parser.add_argument('--transport', action='store_true',
                     help='Include shared transport and lifecycle fixture cases')
+parser.add_argument('--ept-only', action='store_true',
+                    help='Run standalone EPT walker tests in all memory modes')
 args = parser.parse_args()
-if args.vmresume_latency is not None and (
-        args.cpu != 'o3' or args.switch_to or args.vmresume_latency < 1):
-    parser.error('--vmresume-latency requires O3, no CPU switch, and >= 1 cycle')
-args.fixture |= args.transport
+if args.ept_only and (args.cpu not in ('atomic', 'timing') or args.transport or
+                     args.switch_to or args.restore or args.checkpoint_at):
+    parser.error('--ept-only requires an atomic or timing context without '
+                 'transport, CPU switching, or checkpoints')
+for instruction in ('vmresume', 'vmlaunch'):
+    latency = getattr(args, instruction + '_latency')
+    if latency is not None and (
+            args.cpu != 'o3' or args.switch_to or latency < 1):
+        parser.error(f'--{instruction}-latency requires O3, no CPU switch, '
+                     'and >= 1 cycle')
+args.fixture |= args.transport or args.ept_only
 root = Root(full_system=True)
 root.system = system = System()
 system.clk_domain = SrcClockDomain(clock='2GHz', voltage_domain=VoltageDomain())
@@ -43,12 +54,15 @@ system.memory = SimpleMemory(range=system.mem_ranges[0], latency='30ns')
 system.memory.port = system.membus.mem_side_ports
 system.system_port = system.membus.cpu_side_ports
 system.cpu = {'atomic': AtomicSimpleCPU, 'timing': TimingSimpleCPU,
-              'o3': DerivO3CPU}[args.cpu]()
-if args.vmresume_latency is not None:
+              'o3': DerivO3CPU, 'minor': X86MinorCPU}[args.cpu]()
+if args.cpu == 'o3':
+    latencies = {'VmxResume': args.vmresume_latency,
+                 'VmxLaunch': args.vmlaunch_latency}
     for unit in system.cpu.instQueues[0].fuPool.FUList:
         for op in unit.opList:
-            if str(op.opClass) == 'VmxResume':
-                op.opLat = args.vmresume_latency
+            latency = latencies.get(str(op.opClass))
+            if latency is not None:
+                op.opLat = latency
 if args.caches:
     for name in ('icache', 'dcache'):
         cache = Cache(size='16KiB', assoc=2, tag_latency=2,
@@ -99,10 +113,11 @@ input_file = Path(m5.options.outdir) / 'functional-input.bin'
 input_file.write_bytes(bytes.fromhex('0011223344556677'))
 system.readfile = str(input_file)
 if args.fixture:
-    if args.cpu == 'o3':
+    if args.cpu not in ('atomic', 'timing'):
         parser.error('The direct fixture uses an atomic or timing context')
     from m5.objects import X86PagingTester
-    system.paging_tester = X86PagingTester(system=system, transport_cases=args.transport)
+    system.paging_tester = X86PagingTester(
+        system=system, transport_cases=args.transport, ept_only=args.ept_only)
     system.cpu.mmu.dtb.walker.port.splice(
         system.paging_tester.cpu_side, system.paging_tester.mem_side)
 m5.instantiate(str(args.restore) if args.restore else None)

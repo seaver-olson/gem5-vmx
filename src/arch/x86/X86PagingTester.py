@@ -12,5 +12,6 @@ class X86PagingTester(SimObject):
     cxx_class = "gem5::X86ISA::PagingTester"
     system = Param.System(Parent.any, "System containing the idle test CPU")
     transport_cases = Param.Bool(False, "Run additional shared transport cases")
+    ept_only = Param.Bool(False, "Run standalone memory-backed EPT cases only")
     cpu_side = ResponsePort("Guest walker interception point")
     mem_side = RequestPort("Original walker memory endpoint")

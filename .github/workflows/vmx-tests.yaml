@@ -17,6 +17,7 @@ on:
             - 'src/cpu/FuncUnit.py'
             - 'src/cpu/op_class.hh'
             - 'src/cpu/o3/**'
+            - 'src/cpu/minor/**'
             - 'tests/gem5/vmx/**'
             - 'tests/gem5/x86_paging/**'
             - 'src/python/gem5/components/cachehierarchies/classic/**'
@@ -29,6 +30,7 @@ on:
             - 'src/cpu/FuncUnit.py'
             - 'src/cpu/op_class.hh'
             - 'src/cpu/o3/**'
+            - 'src/cpu/minor/**'
             - 'tests/gem5/vmx/**'
             - 'tests/gem5/x86_paging/**'
             - 'src/python/gem5/components/cachehierarchies/classic/**'
@@ -89,6 +91,8 @@ jobs:
         timeout-minutes: 90
         steps:
             - uses: actions/checkout@v7
+            - name: Build disk-free test guests
+              run: make -C tests/gem5/x86_paging
             - name: Build gem5
               run: scons build/X86/gem5.opt -j "$(nproc)"
             - name: Capture no-EPT source and binary provenance
@@ -97,15 +101,16 @@ jobs:
               # The signature step below still requires successful capture.
               continue-on-error: true
               run: |
-                  make -C tests/gem5/x86_paging
                   python3 tests/gem5/x86_paging/baseline.py capture --results-dir m5out-paging-matrix
             - name: Run paging regressions
               run: python3 tests/gem5/x86_paging/run.py
             - name: Run shared paging transport and lifecycle regressions
               run: python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
+            - name: Run memory-backed EPT walker regressions
+              run: python3 tests/gem5/x86_paging/run.py --ept-only --outdir m5out-ept-walker
             - name: Run native VMX operand regressions
               run: python3 tests/gem5/x86_paging/run.py --vmx-operands-only --outdir m5out-vmx-operands
-            - name: Run VMRESUME O3 latency and entry/exit regressions
+            - name: Run VM entry latency and Minor compatibility regressions
               run: python3 tests/gem5/x86_paging/vmresume.py
             - name: Run debugger paging regressions
               run: |
@@ -127,6 +132,7 @@ jobs:
                       m5out-paging-matrix/results.json
                       m5out-paging-matrix/source.tar.gz
                       m5out-paging-transport/
+                      m5out-ept-walker/
                       m5out-vmx-operands/
                       m5out-vmresume/
                       m5out-paging-matrix/provenance.json

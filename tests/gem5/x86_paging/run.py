@@ -16,7 +16,11 @@ def main():
     parser.add_argument('--transport-only', action='store_true',
                         help='Run expanded transport fixtures separately from baseline')
     parser.add_argument('--vmx-operands-only', action='store_true')
+    parser.add_argument('--ept-only', action='store_true',
+                        help='Run standalone EPT walker fixtures')
     args = parser.parse_args()
+    if sum((args.transport_only, args.vmx_operands_only, args.ept_only)) > 1:
+        parser.error('Select only one focused suite')
     suite = Path(__file__).resolve().parent
     subprocess.run(['make', '-C', str(suite)], check=True)
     args.outdir.mkdir(parents=True, exist_ok=True)
@@ -30,6 +34,13 @@ def main():
             if cpu != 'atomic':
                 cases.append((f'{guest}-{cpu}-ruby', 'ruby.py',
                               ['--cpu', cpu, '--guest', guest]))
+    # Minor must deliver instruction-fetch faults without refetching the
+    # inaccessible PC while dispatching exception ROM. Reuse the same guest's
+    # cold/warm NX, nonpresent/reserved-entry, CR2 and handler-return checks.
+    for caches in (False, True):
+        cases.append((f'paging-minor-classic-{int(caches)}', 'config.py',
+                      ['--cpu', 'minor', '--guest', 'paging'] +
+                      (['--caches'] if caches else [])))
     for hierarchy in ('l1', 'private-l2', 'shared-l2'):
         for cpu in ('atomic', 'timing', 'o3'):
             cases.append((f'stdlib-{hierarchy}-{cpu}', 'ruby.py',
@@ -89,6 +100,13 @@ def main():
             if cpu != 'atomic':
                 cases.append((f'vmx-operands-{cpu}-ruby', 'ruby.py',
                               ['--cpu', cpu, '--guest', 'vmx_operands']))
+    if args.ept_only:
+        # Each context compares its memory mode against functional lookup.
+        # Timing also checks retries, cancellation, concurrency and reentry.
+        cases = [(f'ept-{cpu}-classic-{int(caches)}', 'config.py',
+                  ['--cpu', cpu, '--ept-only'] +
+                  (['--caches'] if caches else []))
+                 for cpu in ('atomic', 'timing') for caches in (False, True)]
     for name, script, options in cases:
         output = args.outdir / name
         output.mkdir(parents=True, exist_ok=True)
