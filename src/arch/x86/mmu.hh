@@ -63,13 +63,16 @@ class MMU : public BaseMMU
     Fault translateInt(bool read, RequestPtr req, ThreadContext *tc);
     Fault translate(const RequestPtr &req, ThreadContext *tc,
                     Translation *translation, Mode mode,
-                    bool &delayedResponse, bool timing, bool functional,
+                    bool &delayedResponse, bool &completedInline,
+                    bool timing, bool functional,
                     TLB &cache);
     TranslationContextPtr captureContext(const RequestPtr &req,
         ThreadContext *tc, TLB &cache, Mode access, Mode original,
         Addr linear, Addr faultAddress, bool supervisor = false) const;
     Fault finishWalk(const RequestPtr &req, const TranslationContext &context,
-                     const TlbEntry &entry);
+                     const TlbEntry &entry, bool functional);
+    Fault resolveEpt(const RequestPtr &req, const TranslationContext &context,
+                     bool functional);
     Fault finalizePhysical(const RequestPtr &req, Mode mode,
                            LocalApicBase apicBase, ContextID thread) const;
 

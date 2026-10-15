@@ -279,7 +279,10 @@ class MinorDefaultMemFU(MinorFU):
 
 
 class MinorDefaultMiscFU(MinorFU):
-    opClasses = minorMakeOpClassSet(["InstPrefetch", "System"])
+    # Keep VMX executable on Minor; O3's VMX calibration is separate.
+    opClasses = minorMakeOpClassSet(
+        ["InstPrefetch", "System", "VmxResume", "VmxLaunch"]
+    )
     opLat = 1
 
 

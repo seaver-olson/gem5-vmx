@@ -17,7 +17,7 @@ def main():
                         help='Run expanded transport fixtures separately from baseline')
     parser.add_argument('--vmx-operands-only', action='store_true')
     parser.add_argument('--ept-only', action='store_true',
-                        help='Run standalone EPT walker fixtures')
+                        help='Run EPT walker and guest-MMU fixtures')
     args = parser.parse_args()
     if sum((args.transport_only, args.vmx_operands_only, args.ept_only)) > 1:
         parser.error('Select only one focused suite')
@@ -102,7 +102,7 @@ def main():
                               ['--cpu', cpu, '--guest', 'vmx_operands']))
     if args.ept_only:
         # Each context compares its memory mode against functional lookup.
-        # Timing also checks retries, cancellation, concurrency and reentry.
+        # Also exercise guest-MMU access/fault paths and nested lifecycle.
         cases = [(f'ept-{cpu}-classic-{int(caches)}', 'config.py',
                   ['--cpu', cpu, '--ept-only'] +
                   (['--caches'] if caches else []))

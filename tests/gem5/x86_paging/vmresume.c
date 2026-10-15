@@ -1,4 +1,4 @@
-// Minimal no-EPT VMRESUME regression, using actual privileged instructions.
+// No-EPT launch/resume regression, using actual privileged instructions.
 #include <stdint.h>
 
 static uint32_t on_region[1024] __attribute__((aligned(4096)));
@@ -7,8 +7,10 @@ static uint64_t idt[512] __attribute__((aligned(16)));
 static uint8_t guest_stack[4096] __attribute__((aligned(16)));
 volatile uint64_t resume_ip, fault_error, fault_vector, rip_pointer,
     guest_runs;
+volatile uint64_t injected_events, injected_rip, injected_flags, injected_error;
 extern void ud_entry(void), gp_entry(void), fault_entry(void);
 extern void guest_entry(void), guest_exit(void);
+extern void injected_ud(void), injected_gp(void), injected_exit(void);
 extern uint64_t enter_guest(uint64_t);
 extern uint64_t read_field(uint64_t);
 #define PROBE(name) extern uint64_t name(uint64_t, uint64_t, uint64_t)
@@ -18,6 +20,9 @@ PROBE(op_vmptrld);
 PROBE(op_vmxoff);
 PROBE(op_vmwrite_reg);
 PROBE(op_vmresume);
+PROBE(op_vmlaunch);
+PROBE(op_vmcall);
+PROBE(op_ud2);
 
 static void
 check(int ok, uint64_t code)
@@ -72,6 +77,16 @@ paging_test(void)
     __asm__ volatile("sgdt %0" : "=m"(gdtr));
     check((op_vmresume(0, 0, 0) & 0x8d5) == 0x8d5 && fault_vector == 6, 1);
     fault_vector = 0;
+    check((op_vmlaunch(0, 0, 0) & 0x8d5) == 0x8d5 && fault_vector == 6, 61);
+    fault_vector = 0;
+    // Exercise single instructions without dedicated timing classes too,
+    // then a macro-op fault to keep both ROM dispatch paths covered.
+    check((op_vmcall(0, 0, 0) & 0x8d5) == 0x8d5 && fault_vector == 6, 66);
+    fault_vector = 0;
+    check((op_vmxoff(0, 0, 0) & 0x8d5) == 0x8d5 && fault_vector == 6, 67);
+    fault_vector = 0;
+    check((op_ud2(0, 0, 0) & 0x8d5) == 0x8d5 && fault_vector == 6, 68);
+    fault_vector = 0;
 
     uint64_t cr0, cr3, cr4;
     __asm__ volatile("mov %%cr0, %0; mov %%cr3, %1; mov %%cr4, %2"
@@ -84,6 +99,7 @@ paging_test(void)
     uint64_t pointer = (uint64_t)on_region;
     check(!(op_vmxon((uint64_t)&pointer, 0, 0) & 0x41), 2);
     check((op_vmresume(0, 0, 0) & 0x8d5) == 1 && !fault_vector, 3);
+    check((op_vmlaunch(0, 0, 0) & 0x8d5) == 1 && !fault_vector, 62);
     pointer = (uint64_t)vmcs_region;
     check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 4);
     check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 5);
@@ -135,7 +151,55 @@ paging_test(void)
         check(read_field(0x4402) == 18, 30 + i); /* VMCALL exit */
         check(read_field(0x681e) == (uint64_t)guest_exit, 40 + i);
         check(read_field(0x440c) == 3, 50 + i); /* instruction length */
+        if (i == 0) {
+            // A failed second launch must not re-enter or clear launch state;
+            // the following two successful resumes verify it remains usable.
+            check((op_vmlaunch(0, 0, 0) & 0x8d5) == 0x40 && !fault_vector, 63);
+            check(read_field(0x4400) == 4, 64); // VMLAUNCH with launched VMCS
+            check(guest_runs == 1, 65);
+        }
     }
+
+    /* A second launch and a resume must deliver their injected exceptions
+     * before executing guest_entry. Exit directly from the handlers so this
+     * checks entry dispatch independently of IRET emulation. */
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 70);
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 71);
+    for (unsigned i = 0; i < 2; ++i) {
+        unsigned vector = i ? 13 : 6;
+        uint64_t target = (uint64_t)(i ? injected_gp : injected_ud);
+        idt[vector * 2] = (target & 0xffff) | (8ull << 16) | (0x8eull << 40) |
+                          ((target & 0xffff0000) << 32);
+        idt[vector * 2 + 1] = target >> 32;
+        // Reset state changed by the preceding guest or exception delivery.
+        field(0x4816, 0xa09b); // Guest CS access rights
+        field(0x4818, 0xc093); // Guest SS access rights
+        field(0x804, 16);      // Guest SS selector
+        field(0x681c, (uint64_t)(guest_stack + sizeof(guest_stack)));
+        field(0x681e, (uint64_t)guest_entry);
+        field(0x6820, 0x8d7); // Status flags must survive in the saved frame.
+        field(0x4016, (1u << 31) | (3u << 8) | (i ? 1u << 11 : 0) | vector);
+        field(0x4018, i ? 0x28 : 0); // VM-entry exception error code
+        check(enter_guest(i != 0) == 0, 72 + i);
+        check(injected_events == i + 1 && guest_runs == 3, 74 + i);
+        check(injected_rip == (uint64_t)guest_entry, 76 + i);
+        check((injected_flags & 0x8d5) == 0x8d5, 78 + i);
+        check(injected_error == (i ? 0x28 : 0), 80 + i);
+        check(read_field(0x4402) == 18, 82 + i);
+        check(read_field(0x681e) == (uint64_t)injected_exit, 84 + i);
+        check(read_field(0x440c) == 3, 86 + i);
+    }
+    // Clearing injection must restore the ordinary redirect on this VMCS.
+    field(0x4016, 0);
+    field(0x4816, 0xa09b);
+    field(0x4818, 0xc093);
+    field(0x804, 16);
+    field(0x681c, (uint64_t)(guest_stack + sizeof(guest_stack)));
+    field(0x681e, (uint64_t)guest_entry);
+    check(enter_guest(1) == 0, 88);
+    check(guest_runs == 4 && injected_events == 2, 89);
+    check(read_field(0x4402) == 18 &&
+          read_field(0x681e) == (uint64_t)guest_exit, 90);
     check(!(op_vmxoff(0, 0, 0) & 0x41), 60);
     __asm__ volatile(".byte 0x0f, 0x04; .word 0x22" ::"D"(0ull), "S"(0ull)
                      : "memory");

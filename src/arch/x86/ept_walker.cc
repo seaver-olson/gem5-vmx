@@ -3,6 +3,7 @@
 
 #include <memory>
 
+#include "arch/x86/insts/vmx.hh"
 #include "arch/x86/paging_port.hh"
 #include "base/logging.hh"
 #include "mem/packet_access.hh"
@@ -102,6 +103,7 @@ struct WalkState
             break;
           case EntryKind::Violation:
             terminal.status = WalkStatus::Violation;
+            terminal.permissions = decoded->permissions;
             break;
           case EntryKind::Misconfiguration:
             terminal.status = WalkStatus::Misconfiguration;
@@ -162,6 +164,36 @@ struct TimingWalk : std::enable_shared_from_this<TimingWalk>
 };
 
 } // anonymous namespace
+
+Fault
+lookupFault(const WalkResult &result, const LookupInput &input,
+            Addr guestLinear, bool finalAccess)
+{
+    if (result.status == WalkStatus::Mapping)
+        return NoFault;
+    if (result.status == WalkStatus::Cancelled)
+        return std::make_shared<ReExec>();
+    panic_if(result.status != WalkStatus::Violation &&
+             result.status != WalkStatus::Misconfiguration,
+             "EPT lookup failed internally: %d", int(result.status));
+
+    VmxExitInfo info;
+    info.reason = result.status == WalkStatus::Violation ?
+        VmxExitReason::EptViolation : VmxExitReason::EptMisconfiguration;
+    info.hasGuestPhysicalAddress = true;
+    info.guestPhysicalAddress = input.guestPhysical;
+    if (result.status == WalkStatus::Violation) {
+        info.hasQualification = true;
+        info.qualification = 1ULL << unsigned(input.access);
+        info.qualification |= uint64_t(result.permissions) << 3;
+        info.qualification |= 1ULL << 7; // Guest linear address is valid.
+        if (finalAccess)
+            info.qualification |= 1ULL << 8;
+        info.hasGuestLinearAddress = true;
+        info.guestLinearAddress = guestLinear;
+    }
+    return std::make_shared<VmxExitFault>(info);
+}
 
 AtomicResult
 walkAtomic(PagingPort &port, RequestorID requestor, const LookupInput &input,

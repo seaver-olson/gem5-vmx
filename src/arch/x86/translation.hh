@@ -20,13 +20,13 @@ class PagingPort;
 // Captured by the MMU before handing a request to asynchronous work. Every
 // consumer retains a const view; restart and finalization use this snapshot,
 // never live control registers or a subsequently modified CPU request.
-// The EPT configuration is captured now; EPT generation tracking and the
-// second-stage walk will extend this contract when implemented.
+// The EPT configuration and capabilities are captured with the guest state.
 struct TranslationContext
 {
     TlbContext tag;
     uint64_t generation;
     std::optional<EptConfig> ept;
+    uint64_t eptCapabilities = 0;
     CR0 cr0;
     CR3 cr3;
     CR4 cr4;

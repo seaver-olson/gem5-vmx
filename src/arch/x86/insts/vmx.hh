@@ -175,6 +175,7 @@ class VmxExitFault : public FaultBase
   public:
     explicit VmxExitFault(const VmxExitInfo &info) : exitInfo(info) {}
 
+    const VmxExitInfo &info() const { return exitInfo; }
     const char *name() const override { return "vmx_exit"; }
     void invoke(ThreadContext *tc, const StaticInstPtr &inst =
             nullStaticInstPtr) override;
@@ -253,6 +254,9 @@ struct VmxResult
 class VmxState
 {
   private:
+    // The suspended-CPU fixture seeds captured EPT state before VM entry
+    // supports EPT. No guest-visible setter or capability is introduced.
+    friend class PagingTester;
     using VmcsMap = std::map<Addr, Vmcs>;
     static constexpr Addr InvalidVmcsPointer = ~Addr(0);
 

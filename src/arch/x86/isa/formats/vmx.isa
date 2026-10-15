@@ -225,13 +225,15 @@ output exec {{
     {
         if (result.redirectsNextPc) {
             redirectNextPc(xc, result.nextPc);
-        } else if (!result.pcAlreadyRedirected) {
+        } else if (result.pcAlreadyRedirected) {
+            // Event delivery selected a ROM PC in ThreadContext. O3 resolves
+            // the branch and commits from the executing instruction's PC;
+            // copy the full state, including the first ROM micro-PC, there.
+            // Do not advance it here or overwrite the loaded guest RFLAGS.
+            xc->pcState(xc->tcBase()->pcState());
+        } else {
             setVmxResult(xc->tcBase(), result);
         }
-        // If pcAlreadyRedirected is set, the callee (VM-entry event
-        // injection) has already pointed the CPU's PCState at a microcode
-        // ROM entry; touching RFLAGS or PCState again here would clobber
-        // that in-flight dispatch before it runs.
     }
 
     } // namespace
@@ -285,7 +287,10 @@ def template VmxNoOperandExecute {{
 def format VmxNoOperandInst() {{
     iop = InstObjParams(name, Name, 'VmxNoOperandInst', '', [])
     iop.base_mnemonic = Name.lower()
-    iop.op_class = 'VmxResumeOp' if iop.base_mnemonic == 'vmresume' else 'No_OpClass'
+    iop.op_class = {
+        'vmresume': 'VmxResumeOp',
+        'vmlaunch': 'VmxLaunchOp',
+    }.get(iop.base_mnemonic, 'No_OpClass')
     header_output = VmxNoOperandDeclare.subst(iop)
     decoder_output = VmxNoOperandConstruct.subst(iop)
     decode_block = BasicDecode.subst(iop)

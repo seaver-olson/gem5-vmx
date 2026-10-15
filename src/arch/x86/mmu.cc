@@ -40,6 +40,7 @@
 #include <cstring>
 #include <memory>
 
+#include "arch/x86/ept_walker.hh"
 #include "arch/x86/faults.hh"
 #include "arch/x86/isa.hh"
 #include "arch/x86/insts/microldstop.hh"
@@ -92,6 +93,8 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     context->generation = cache.generation(context->tag.thread);
     auto *isa = static_cast<ISA *>(tc->getIsaPtr());
     context->ept = isa->vmxState().eptConfig();
+    context->eptCapabilities =
+        isa->readMiscRegNoEffect(misc_reg::VmxEptVpidCap);
     context->paePdpte = isa->paePdpte();
     CpuidResult cpuid;
     fatal_if(!isa->cpuid->doCpuid(tc, 0x80000008, 0, cpuid),
@@ -110,7 +113,9 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     return context;
 }
 
-class MMU::WalkContinuation : public Walker::Completion
+class MMU::WalkContinuation :
+    public Walker::Completion,
+    public std::enable_shared_from_this<WalkContinuation>
 {
   private:
     MMU &mmu;
@@ -144,25 +149,70 @@ class MMU::WalkContinuation : public Walker::Completion
         return completed || translation->squashed();
     }
 
-    void finish(const Fault &fault, const Walker::Result *result) override
+    bool done() const { return completed; }
+
+    void startFinal(Addr guestPhysical)
+    {
+        req->setPaddr(guestPhysical);
+        if (!snapshot->ept) {
+            complete(mmu.finalizePhysical(req, snapshot->accessMode,
+                snapshot->apicBase, snapshot->tag.thread));
+            return;
+        }
+        const EptAccess access = snapshot->accessMode == BaseMMU::Execute ?
+            EptAccess::Execute :
+            (snapshot->accessMode == BaseMMU::Write ||
+             (snapshot->flags & Request::READ_MODIFY_WRITE)) ?
+            EptAccess::Write : EptAccess::Read;
+        const ept::LookupInput input(guestPhysical, access, *snapshot->ept);
+        ept::walkTiming(*snapshot->port, req->requestorId(), input,
+            snapshot->physicalBits, snapshot->eptCapabilities,
+            [self = shared_from_this()] {
+                return !self->squashed() &&
+                    self->snapshot->generation == self->cache.generation(
+                        self->snapshot->tag.thread);
+            },
+            [self = shared_from_this(), input](const ept::WalkResult &result) {
+                if (result.status != ept::WalkStatus::Mapping) {
+                    self->complete(ept::lookupFault(result, input,
+                        self->snapshot->linearAddress, true));
+                    return;
+                }
+                self->req->setPaddr(result.hostPhysical);
+                if (result.memoryType == 0)
+                    self->req->setFlags(Request::UNCACHEABLE |
+                                        Request::STRICT_ORDER);
+                self->complete(self->mmu.finalizePhysical(self->req,
+                    self->snapshot->accessMode, self->snapshot->apicBase,
+                    self->snapshot->tag.thread));
+            });
+    }
+
+    void complete(const Fault &fault)
     {
         assert(!completed);
         completed = true;
-        Fault finalFault = fault;
-        if (finalFault == NoFault) {
+        translation->finish(fault, req, tc, snapshot->originalMode);
+    }
+
+    void finish(const Fault &fault, const Walker::Result *result) override
+    {
+        assert(!completed);
+        if (fault == NoFault) {
             assert(result);
             if (result->generation !=
                     cache.generation(snapshot->tag.thread)) {
-                finalFault = std::make_shared<ReExec>();
+                complete(std::make_shared<ReExec>());
             } else {
                 cache.insert(result->entry.vaddr, result->entry, result->context);
-                finalFault = mmu.finishWalk(req, *snapshot, result->entry);
+                if (result->entry.uncacheable)
+                    req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+                startFinal(result->entry.paddr |
+                    (snapshot->linearAddress & mask(result->entry.logBytes)));
             }
+        } else {
+            complete(fault);
         }
-        // Only the coordinator completes the CPU request. A future second
-        // stage can retain this request here and complete asynchronously;
-        // the guest walker neither re-enters translation nor assumes a hit.
-        translation->finish(finalFault, req, tc, snapshot->originalMode);
     }
 };
 
@@ -343,7 +393,8 @@ MMU::finalizePhysical(const RequestPtr &req, Mode mode,
 Fault
 MMU::translate(const RequestPtr &req,
         ThreadContext *tc, BaseMMU::Translation *translation,
-        BaseMMU::Mode mode, bool &delayedResponse, bool timing, bool functional, TLB &cache)
+        BaseMMU::Mode mode, bool &delayedResponse, bool &completedInline,
+        bool timing, bool functional, TLB &cache)
 {
     const auto completionMode = mode;
     if (req->isCacheClean())
@@ -353,6 +404,7 @@ MMU::translate(const RequestPtr &req,
     bool storeCheck = flags & Request::READ_MODIFY_WRITE;
 
     delayedResponse = false;
+    completedInline = false;
 
     if (flags & Request::PHYSICAL) {
         req->setPaddr(req->getVaddr());
@@ -506,7 +558,7 @@ MMU::translate(const RequestPtr &req,
                         functionalEntry);
                     if (fault != NoFault)
                         return fault;
-                    return finishWalk(req, *snapshot, functionalEntry);
+                    return finishWalk(req, *snapshot, functionalEntry, true);
                 } else if (FullSystem) {
                     Walker::Result result;
                     std::shared_ptr<Walker::Completion> continuation;
@@ -529,7 +581,7 @@ MMU::translate(const RequestPtr &req,
                     // Complete from the walk result, as the timing path does;
                     // the cache may hold another page size for this range.
                     cache.insert(result.entry.vaddr, result.entry, result.context);
-                    return finishWalk(req, *snapshot, result.entry);
+                    return finishWalk(req, *snapshot, result.entry, false);
                 } else {
                     Process *p = tc->getProcessPtr();
                     const EmulationPageTable::Entry *pte =
@@ -597,12 +649,26 @@ MMU::translate(const RequestPtr &req,
         req->setPaddr(vaddr);
     }
 
+    if (FullSystem &&
+        static_cast<ISA *>(tc->getIsaPtr())->vmxState().eptConfig()) {
+        auto snapshot = captureContext(req, tc, cache, mode, completionMode,
+                                       vaddr, vaddr, debugAccess);
+        if (timing) {
+            auto continuation = std::make_shared<WalkContinuation>(
+                *this, cache, req, tc, translation, snapshot);
+            continuation->startFinal(req->getPaddr());
+            completedInline = continuation->done();
+            delayedResponse = !completedInline;
+            return NoFault;
+        }
+        return resolveEpt(req, *snapshot, functional);
+    }
     return finalizePhysical(req, tc, mode);
 }
 
 Fault
 MMU::finishWalk(const RequestPtr &req, const TranslationContext &context,
-                const TlbEntry &entry)
+                const TlbEntry &entry, bool functional)
 {
     // The walker returns an explicit stage-one result with permissions
     // checked against its captured context. Completion never re-enters
@@ -610,6 +676,31 @@ MMU::finishWalk(const RequestPtr &req, const TranslationContext &context,
     req->setPaddr(entry.paddr | (context.linearAddress & mask(entry.logBytes)));
     if (entry.uncacheable)
         req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+    return resolveEpt(req, context, functional);
+}
+
+Fault
+MMU::resolveEpt(const RequestPtr &req, const TranslationContext &context,
+                bool functional)
+{
+    if (context.ept) {
+        const EptAccess access = context.accessMode == BaseMMU::Execute ?
+            EptAccess::Execute :
+            (context.accessMode == BaseMMU::Write ||
+             (context.flags & Request::READ_MODIFY_WRITE)) ?
+            EptAccess::Write : EptAccess::Read;
+        const ept::LookupInput input(req->getPaddr(), access, *context.ept);
+        const auto result = functional ?
+            ept::walkFunctional(*context.port, req->requestorId(), input,
+                context.physicalBits, context.eptCapabilities) :
+            ept::walkAtomic(*context.port, req->requestorId(), input,
+                context.physicalBits, context.eptCapabilities).result;
+        if (result.status != ept::WalkStatus::Mapping)
+            return ept::lookupFault(result, input, context.linearAddress, true);
+        req->setPaddr(result.hostPhysical);
+        if (result.memoryType == 0)
+            req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+    }
     return finalizePhysical(req, context.accessMode, context.apicBase,
                             context.tag.thread);
 }
@@ -620,7 +711,9 @@ MMU::translateAtomic(const RequestPtr &req, ThreadContext *tc,
 {
     TLB &cache = *static_cast<TLB *>(getTlb(mode));
     bool delayedResponse;
-    return translate(req, tc, nullptr, mode, delayedResponse, false, false, cache);
+    bool completedInline;
+    return translate(req, tc, nullptr, mode, delayedResponse,
+                     completedInline, false, false, cache);
 }
 
 Fault
@@ -630,7 +723,9 @@ MMU::translateFunctional(const RequestPtr &req, ThreadContext *tc,
     TLB &cache = *static_cast<TLB *>(getTlb(mode));
     if (FullSystem) {
         bool delayed;
-        return translate(req, tc, nullptr, mode, delayed, false, true, cache);
+        bool completedInline;
+        return translate(req, tc, nullptr, mode, delayed, completedInline,
+                         false, true, cache);
     }
     if (req->isCacheClean())
         mode = BaseMMU::Read;
@@ -663,10 +758,14 @@ MMU::translateTiming(const RequestPtr &req, ThreadContext *tc,
     BaseMMU::Translation *translation, BaseMMU::Mode mode)
 {
     bool delayedResponse;
+    bool completedInline;
     assert(translation);
     Fault fault =
-        translate(req, tc, translation, mode, delayedResponse, true, false,
+        translate(req, tc, translation, mode, delayedResponse,
+                  completedInline, true, false,
                   *static_cast<TLB *>(getTlb(mode)));
+    if (completedInline)
+        return;
     if (!delayedResponse)
         translation->finish(fault, req, tc, mode);
     else

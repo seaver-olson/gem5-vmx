@@ -134,6 +134,7 @@ class OpClass(Enum):
         "Bf16Cvt",
         "System",
         "VmxResume",
+        "VmxLaunch",
     ]
 
 

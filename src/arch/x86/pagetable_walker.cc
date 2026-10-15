@@ -51,6 +51,7 @@
 
 #include <memory>
 
+#include "arch/x86/ept_walker.hh"
 #include "arch/x86/faults.hh"
 #include "arch/x86/isa.hh"
 #include "arch/x86/ldstflags.hh"
@@ -159,6 +160,63 @@ Walker::sendTiming(WalkerState *state, PacketPtr pkt)
                                        state->readAttributes);
 }
 
+void
+Walker::failEptTiming(WalkerState *state, PacketPtr pkt, const Fault &fault)
+{
+    delete pkt;
+    assert(state->inflight == 1);
+    state->inflight = 0;
+    delete state->read;
+    state->read = nullptr;
+    for (auto *write : state->writes)
+        delete write;
+    state->writes.clear();
+    state->completion->finish(fault, nullptr);
+    currStates.remove(state);
+    delete state;
+    if (!currStates.empty() && !currStates.front()->wasStarted() &&
+        !startWalkWrapperEvent.scheduled())
+        schedule(startWalkWrapperEvent, clockEdge());
+    checkDrain();
+}
+
+void
+Walker::sendEptTiming(WalkerState *state, PacketPtr pkt)
+{
+    const Addr gpa = pkt->getAddr();
+    const EptAccess access = pkt->req->isAtomicReturn() ?
+        EptAccess::Write : EptAccess::Read;
+    const ept::LookupInput input(gpa, access, *state->snapshot->ept);
+    // A rejected preflight can call back inline. Defer only that case: the
+    // caller may still be inside recvPacket()/sendPackets() on this state.
+    auto issuing = std::make_shared<bool>(true);
+    ept::walkTiming(*state->snapshot->port, requestorId, input,
+        state->snapshot->physicalBits, state->snapshot->eptCapabilities,
+        [state] { return !state->obsolete() &&
+                         !state->completion->squashed(); },
+        [this, state, pkt, input, issuing](const ept::WalkResult &result) {
+            auto deliver = [this, state, pkt, input, result] {
+                if (result.status != ept::WalkStatus::Mapping) {
+                    failEptTiming(state, pkt, ept::lookupFault(result, input,
+                        state->snapshot->linearAddress, false));
+                    return;
+                }
+                pkt->req->setPaddr(result.hostPhysical);
+                pkt->setAddr(result.hostPhysical);
+                if (result.memoryType == 0)
+                    pkt->req->setFlags(Request::UNCACHEABLE);
+                sendTiming(state, pkt);
+            };
+            if (*issuing) {
+                schedule(new EventFunctionWrapper(deliver, name(), true),
+                         clockEdge(Cycles(1)));
+            } else {
+                deliver();
+            }
+        });
+    *issuing = false;
+}
+
 Port &
 Walker::getPort(const std::string &if_name, PortID idx)
 {
@@ -249,6 +307,11 @@ Walker::WalkerState::startWalk()
         sendPackets();
     } else {
         do {
+            fault = translatePacket(read, EptAccess::Read);
+            if (fault != NoFault) {
+                endWalk();
+                break;
+            }
             snapshot->port->sendAtomic(read, readAttributes);
             PacketPtr write = NULL;
             fault = stepWalk(write);
@@ -256,9 +319,16 @@ Walker::WalkerState::startWalk()
             state = nextState;
             nextState = Ready;
             if (write) {
-                snapshot->port->sendAtomic(write, updateAttributes);
-                finishUpdate(write);
+                fault = translatePacket(write, EptAccess::Write);
+                if (fault == NoFault) {
+                    snapshot->port->sendAtomic(write, updateAttributes);
+                    finishUpdate(write);
+                }
                 delete write;
+                if (fault != NoFault) {
+                    endWalk();
+                    break;
+                }
             }
         } while (read);
         if (fault == NoFault && obsolete())
@@ -280,6 +350,11 @@ Walker::WalkerState::startFunctional(Addr &addr, unsigned &logBytes)
         return fault;
 
     do {
+        fault = translatePacket(read, EptAccess::Read);
+        if (fault != NoFault) {
+            endWalk();
+            break;
+        }
         snapshot->port->sendFunctional(read, readAttributes);
         // On a functional access (page table lookup), writes should
         // not happen so this pointer is ignored after stepWalk
@@ -556,7 +631,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     // publishing the leaf. This also gives a failed compare a clean restart.
     if (doWrite && fault == NoFault && !functional) {
         updateAttributes = readAttributes;
-        RequestPtr update = std::make_shared<Request>(read->getAddr(),
+        RequestPtr update = std::make_shared<Request>(entryGpa,
             dataSize, read->req->getFlags() | Request::ATOMIC_RETURN_OP,
             walker->requestorId);
         if (dataSize == 8)
@@ -582,6 +657,7 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
             nextRead, dataSize, flags, walker->requestorId);
         read = new Packet(request, MemCmd::ReadReq);
         read->allocate();
+        entryGpa = nextRead;
     }
     return fault;
 }
@@ -650,6 +726,27 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     read = new Packet(request, MemCmd::ReadReq);
     read->allocate();
+    entryGpa = topAddr;
+    return NoFault;
+}
+
+Fault
+Walker::WalkerState::translatePacket(PacketPtr packet, EptAccess access)
+{
+    if (!snapshot->ept)
+        return NoFault;
+    const ept::LookupInput input(packet->getAddr(), access, *snapshot->ept);
+    const auto result = functional ?
+        ept::walkFunctional(*snapshot->port, walker->requestorId, input,
+            physicalBits, snapshot->eptCapabilities) :
+        ept::walkAtomic(*snapshot->port, walker->requestorId, input,
+            physicalBits, snapshot->eptCapabilities).result;
+    if (result.status != ept::WalkStatus::Mapping)
+        return ept::lookupFault(result, input, snapshot->linearAddress, false);
+    packet->req->setPaddr(result.hostPhysical);
+    packet->setAddr(result.hostPhysical);
+    if (result.memoryType == 0)
+        packet->req->setFlags(Request::UNCACHEABLE);
     return NoFault;
 }
 
@@ -728,7 +825,10 @@ Walker::WalkerState::sendPackets()
     if (!packet)
         return;
     ++inflight;
-    walker->sendTiming(this, packet);
+    if (snapshot->ept)
+        walker->sendEptTiming(this, packet);
+    else
+        walker->sendTiming(this, packet);
 
 }
 

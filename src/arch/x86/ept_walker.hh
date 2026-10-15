@@ -6,6 +6,7 @@
 
 #include "arch/x86/ept.hh"
 #include "mem/request.hh"
+#include "sim/faults.hh"
 
 namespace gem5::X86ISA
 {
@@ -26,8 +27,9 @@ struct WalkResult
 {
     WalkStatus status = WalkStatus::InvalidInput;
 
-    // Translation fields are valid only for Mapping. memoryType/ignorePat
-    // describe the EPT leaf, not the final PAT/MTRR-combined memory type.
+    // Translation fields are valid only for Mapping, except permissions,
+    // which also records effective R/W/X for a Violation's qualification.
+    // memoryType/ignorePat describe the EPT leaf, not the final memory type.
     Addr hostPhysical = 0;
     uint8_t permissions = 0;
     uint8_t pageShift = 0;
@@ -47,6 +49,12 @@ struct AtomicResult
     WalkResult result;
     Tick latency = 0;
 };
+
+// A failed second-stage lookup is never a guest page fault. The GPA is the
+// address that EPT tried to translate; finalAccess distinguishes data/fetch
+// from a guest paging-structure access in the VM-exit qualification.
+Fault lookupFault(const WalkResult &result, const LookupInput &input,
+                  Addr guestLinear, bool finalAccess);
 
 // Read-only lookup through the caller's physical paging port. All arguments
 // are captured, including the capability MSR and host address width. No live

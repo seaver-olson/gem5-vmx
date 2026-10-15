@@ -126,6 +126,7 @@ namespace X86ISA
             PagingAttributes readAttributes;
             PagingAttributes updateAttributes;
             PacketPtr read = nullptr;
+            Addr entryGpa = 0;
             std::vector<PacketPtr> writes;
             Fault timingFault;
             std::shared_ptr<Completion> completion;
@@ -169,6 +170,7 @@ namespace X86ISA
             Result result() const { return {entry, context, generation}; }
             bool reserved(PageTableEntry pte) const;
             Fault pageFault(bool present, bool reserved = false);
+            Fault translatePacket(PacketPtr packet, EptAccess access);
         };
 
         friend class WalkerState;
@@ -207,6 +209,9 @@ namespace X86ISA
         // Functions for dealing with packets.
         void recvPacket(WalkerState *state, PacketPtr pkt, bool cancelled);
         void sendTiming(WalkerState *state, PacketPtr pkt);
+        void sendEptTiming(WalkerState *state, PacketPtr pkt);
+        void failEptTiming(WalkerState *state, PacketPtr pkt,
+                           const Fault &fault);
         void checkDrain();
 
       public:

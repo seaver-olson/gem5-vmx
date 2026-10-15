@@ -158,9 +158,35 @@ EPT roots with different UC/WB attributes, and callback reentry. They verify
 one outstanding read per lookup, exactly-once completion, unchanged tables,
 response-driven completion time and release of callback-held state after
 retirement. Cancellation of an issued read waits for its response; it does
-not withdraw the packet from memory. The standalone walker is complete in
-all three modes, but EPT remains disabled at VM entry until guest-MMU
-integration and architectural exit delivery are implemented.
+not withdraw the packet from memory.
+
+The same suite also calls the public MMU atomic, functional and timing APIs
+with a suspended CPU and a captured EPT configuration. Guest virtual addresses,
+guest physical addresses and backing host physical addresses all differ.
+Guest table pages use separate 4 KiB EPT mappings; the final data page uses
+a 2 MiB EPT mapping. Successful translations are followed by real byte reads
+or writes through `PagingPort`, including execute-mode instruction-byte reads.
+Cold and warm I/D TLB cases verify that cached entries retain GPAs and still
+apply EPT permissions and HPA remapping on each final access. Functional cases
+must preserve guest A/D bits, EPT tables and simulated time.
+
+Fault cases inspect the VM-exit fault's reason, qualification, GPA and GLA,
+including table reads and A/D writes at each guest paging level, a separate
+dirty-bit update after a read-filled TLB entry, inherited EPT restrictions,
+read-modify-write access, and guest page-fault priority. A replaced guest leaf
+must fail its conditional update and rewalk without losing D or software bits.
+Timing cases inject retry, squash and invalidation during nested table reads,
+A/D lookups, conditional writes and final lookups on cold and warm TLB paths.
+They check exactly-once completion and drain ownership, including cancellation
+before admission and cancellation racing a failed memory response. An issued
+conditional write may update memory before cancellation; a rejected write must
+not. Retry cases also change the live EPT state and capabilities to verify that
+in-flight work uses its captured context.
+
+Only the existing suspended-CPU fixture can seed the private EPT state; it
+restores that state and the capability MSR after each test. EPT remains disabled
+at VM entry. These tests inspect faults without invoking a VM exit and do not
+claim pipeline execution or a bootable EPT guest.
 
 The native VMX operand guest runs independently of VM entry/exit and EPT:
 

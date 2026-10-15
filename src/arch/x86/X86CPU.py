@@ -83,6 +83,7 @@ class DefaultX86FUPool(FUPool):
         RdWrPort(),
         System_Unit(),
         VmxResumeUnit(),
+        VmxLaunchUnit(),
     ]
 
 

@@ -2,6 +2,9 @@
 #include "vmx_operands.S"
 .text
 vmx_probe op_vmresume, "vmresume"
+vmx_probe op_vmlaunch, "vmlaunch"
+vmx_probe op_vmcall, "vmcall"
+vmx_probe op_ud2, "ud2"
 
 // Return zero on a VM exit, or the VMfail flags on failed entry. The guest
 // uses no callee-saved registers; VM exit restores this call's host stack. 
@@ -30,5 +33,27 @@ host_return:
 guest_entry:
     incq guest_runs(%rip)
 guest_exit:
+    vmcall
+    ud2
+
+// Normalize the exception frame, record the injected payload, then exit.
+// No callee-saved registers are changed across enter_guest.
+.global injected_ud, injected_gp, injected_exit
+injected_ud:
+    pushq $0
+    jmp injected_common
+injected_gp:
+injected_common:
+    push %rax
+    mov 8(%rsp), %rax
+    mov %rax, injected_error(%rip)
+    mov 16(%rsp), %rax
+    mov %rax, injected_rip(%rip)
+    mov 32(%rsp), %rax
+    mov %rax, injected_flags(%rip)
+    incq injected_events(%rip)
+    pop %rax
+    add $8, %rsp
+injected_exit:
     vmcall
     ud2

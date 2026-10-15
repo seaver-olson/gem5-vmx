@@ -305,6 +305,9 @@ void paging_test(void)
     data[511] = 0x0123456789abcdefull;
     second[0] = 0xfedcba9876543210ull;
     __asm__ volatile("mfence" ::: "memory");
+    /* The host-side writefile below is not a guest memory access. Use an
+     * ordered load to wait for the fence before it reads the stored bytes. */
+    check(*(volatile uint64_t *)second == 0xfedcba9876543210ull, 135);
     static const char filename[] = "functional.bin";
     uint64_t written;
     __asm__ volatile(".byte 0x0f, 0x04; .word 0x4f"

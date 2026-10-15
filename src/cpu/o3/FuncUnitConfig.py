@@ -151,8 +151,25 @@ class System_Unit(FUDesc):
 
 class VmxResumeUnit(FUDesc):
     # Uncalibrated opcode latency, including failed VMRESUME attempts.
-    # Configure opLat in CPU cycles; this is not a Skylake timing claim.
-    opList = [OpDesc(opClass="VmxResume", opLat=1, pipelined=False)]
+    opList = [
+        OpDesc(
+            opClass="VmxResume",
+            opLat=1,  # Skylake: replace with calibrated O3 execution cycles.
+            pipelined=False,
+        )
+    ]
+    count = 1
+
+
+class VmxLaunchUnit(FUDesc):
+    # Uncalibrated opcode latency, including failed VMLAUNCH attempts.
+    opList = [
+        OpDesc(
+            opClass="VmxLaunch",
+            opLat=1,  # Skylake: replace with calibrated O3 execution cycles.
+            pipelined=False,
+        )
+    ]
     count = 1
 
 

@@ -80,6 +80,7 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     unsigned descriptorSize = 8;
     unsigned index = 0;
     bool awaiting = false;
+    uint64_t savedEptCapability = 0;
     RequestPtr request;
     Request::Flags accessFlags;
     BaseMMU::Mode expectedMode = BaseMMU::Read;
@@ -95,6 +96,17 @@ class PagingTester : public SimObject, public BaseMMU::Translation
                    std::function<void()> check = {});
     void buildCases();
     void eptCases();
+    enum class EptTest { Mapping, DeniedRead, DeniedWrite, DeniedExecute,
+                         TableRead, TableUpdate, DirtyUpdate, DataMisconfig,
+                         TableMisconfig, GuestFault, Replace, Remap,
+                         InheritedWrite, Rmw };
+    void setupEpt(bool presetAD);
+    void finishEpt();
+    void eptMmuCases();
+    void eptMmuAccess(BaseMMU::Mode mode, bool functional, bool warm,
+                      EptTest test, unsigned level = 0, bool primed = false);
+    void eptMmuTiming(unsigned point, Injection inject, bool warm = false,
+                      bool primed = false);
     void eptTimingLifecycle(bool retry, bool cancel, unsigned stop);
     void eptTimingConcurrent();
     void next();

@@ -237,6 +237,7 @@ PagingTester::startup()
             eptCases();
             schedule(nextEvent, curTick() + 1);
         });
+        eptMmuCases();
     } else {
         buildCases();
     }

@@ -4,6 +4,10 @@
 #include <array>
 
 #include "arch/x86/ept_walker.hh"
+#include "arch/x86/faults.hh"
+#include "arch/x86/isa.hh"
+#include "arch/x86/ldstflags.hh"
+#include "arch/x86/mmu.hh"
 #include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/tlb.hh"
 #include "base/logging.hh"
@@ -15,6 +19,43 @@ namespace gem5::X86ISA
 {
 namespace
 {
+
+constexpr Addr EptRoot = 0x2800000;
+constexpr Addr EptTableLeaves = EptRoot + 3 * 4096;
+constexpr Addr HostTables = 0x3000000;
+constexpr Addr HostData = 0x3200000;
+constexpr Addr OtherHostData = 0x3400000;
+constexpr Addr EptDataLeaf = EptRoot + 8192 + 8 * (0x2000000 >> 21);
+constexpr uint64_t NestedCaps = 1 | (1ULL << 6) | (1ULL << 8) |
+    (1ULL << 14) | (1ULL << 16);
+
+class EptTranslation : public BaseMMU::Translation
+{
+  public:
+    using Callback = std::function<void(const Fault &, const RequestPtr &,
+                                       ThreadContext *, BaseMMU::Mode)>;
+    explicit EptTranslation(Callback callback,
+                            std::shared_ptr<bool> cancelled = nullptr)
+        : callback(std::move(callback)), cancelled(std::move(cancelled)) {}
+    bool squashed() const override { return cancelled && *cancelled; }
+    void markDelayed() override
+    {
+        panic_if(finished || delayed, "EPT MMU marked delayed after completion");
+        delayed = true;
+    }
+    void finish(const Fault &fault, const RequestPtr &req,
+                ThreadContext *tc, BaseMMU::Mode mode) override
+    {
+        panic_if(finished, "EPT MMU completed a request twice");
+        finished = true;
+        callback(fault, req, tc, mode);
+    }
+  private:
+    Callback callback;
+    std::shared_ptr<bool> cancelled;
+    bool finished = false;
+    bool delayed = false;
+};
 
 void
 checkResult(const ept::WalkResult &actual, const ept::WalkResult &expected,
@@ -33,6 +74,437 @@ checkResult(const ept::WalkResult &actual, const ept::WalkResult &expected,
 }
 
 } // anonymous namespace
+
+void
+PagingTester::setupEpt(bool presetAD)
+{
+    setup(Long);
+    std::array<uint8_t, 4 * 4096> zero{};
+    system->physProxy.writeBlob(EptRoot, zero.data(), zero.size());
+    system->physProxy.writeBlob(HostTables, zero.data(), zero.size());
+    system->physProxy.write<uint64_t>(EptRoot,
+        (EptRoot + 4096) | 7, ByteOrder::little);
+    system->physProxy.write<uint64_t>(EptRoot + 4096,
+        (EptRoot + 8192) | 7, ByteOrder::little);
+    system->physProxy.write<uint64_t>(EptRoot + 8192 + 8 * (Tables >> 21),
+        EptTableLeaves | 7, ByteOrder::little);
+    system->physProxy.write<uint64_t>(EptDataLeaf,
+        HostData | 7 | (6ULL << 3) | 128, ByteOrder::little);
+    for (unsigned level = 0; level < descriptors.size(); ++level) {
+        const auto value = descriptor(level) | (presetAD ? 32 : 0) |
+            (presetAD && level == 3 ? 64 : 0);
+        const Addr host = HostTables + level * 4096 +
+            (descriptors[level] & 4095);
+        descriptor(level, 0); // Direct GPA reads must not accidentally work.
+        descriptors[level] = host;
+        descriptor(level, value);
+        system->physProxy.write<uint64_t>(EptTableLeaves + 8 * level,
+            (HostTables + level * 4096) | 7 | (6ULL << 3), ByteOrder::little);
+    }
+    const Addr offset = Virtual & 4095;
+    system->physProxy.write<uint8_t>(Physical + offset, 0xcc);
+    system->physProxy.write<uint8_t>(HostData + offset, 0x90);
+    system->physProxy.write<uint8_t>(HostData + 4096 + offset, 0xeb);
+    system->physProxy.write<uint8_t>(OtherHostData + offset, 0xeb);
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    panic_if(isa->vmxState().activeEptConfig,
+             "EPT fixture overwrote an active EPT context");
+    savedEptCapability = tc->readMiscRegNoEffect(misc_reg::VmxEptVpidCap);
+    tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, NestedCaps);
+    isa->vmxState().activeEptConfig =
+        *ept::decodeEptp(EptRoot | (3 << 3) | 6, NestedCaps, 48);
+}
+
+void
+PagingTester::finishEpt()
+{
+    static_cast<ISA *>(tc->getIsaPtr())->vmxState().activeEptConfig.reset();
+    tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, savedEptCapability);
+    inspectAttributes = {};
+    inspectResponse = {};
+    squash = {};
+    awaiting = false;
+    schedule(nextEvent, curTick() + 1);
+}
+
+void
+PagingTester::eptMmuCases()
+{
+    for (auto mode : {BaseMMU::Read, BaseMMU::Write, BaseMMU::Execute}) {
+        for (bool functional : {false, true}) {
+            for (bool warm : {false, true}) {
+                if (functional && warm) // Functional deliberately bypasses TLBs.
+                    continue;
+                for (auto test : {EptTest::Mapping, EptTest::DataMisconfig,
+                     mode == BaseMMU::Read ? EptTest::DeniedRead :
+                     mode == BaseMMU::Write ? EptTest::DeniedWrite :
+                                             EptTest::DeniedExecute}) {
+                    cases.emplace_back([=, this] {
+                        eptMmuAccess(mode, functional, warm, test);
+                    });
+                }
+            }
+        }
+    }
+    for (bool functional : {false, true}) {
+        for (unsigned level = 0; level < 4; ++level) {
+            for (auto test : {EptTest::TableRead, EptTest::TableMisconfig,
+                              EptTest::TableUpdate}) {
+                if (functional && test == EptTest::TableUpdate)
+                    continue;
+                cases.emplace_back([=, this] {
+                    eptMmuAccess(BaseMMU::Write, functional, false, test, level);
+                });
+            }
+        }
+        cases.emplace_back([=, this] {
+            eptMmuAccess(BaseMMU::Read, functional, false, EptTest::GuestFault);
+        });
+    }
+    cases.emplace_back([this] {
+        eptMmuAccess(BaseMMU::Write, false, false, EptTest::Replace);
+    });
+    cases.emplace_back([this] {
+        eptMmuAccess(BaseMMU::Read, false, true, EptTest::Remap);
+    });
+    for (bool warm : {false, true}) {
+        for (auto test : {EptTest::InheritedWrite, EptTest::DirtyUpdate,
+                          EptTest::Rmw}) {
+            cases.emplace_back([=, this] {
+                eptMmuAccess(test == EptTest::Rmw ? BaseMMU::Read :
+                    BaseMMU::Write, false, warm, test, 3);
+            });
+        }
+    }
+    if (system->isTimingMode()) {
+        for (unsigned point = 0; point < 4; ++point) {
+            for (auto inject : {RetryRead, SquashRetryRead, SquashRead,
+                                 InvalidateRead}) {
+                cases.emplace_back([=, this] { eptMmuTiming(point, inject); });
+            }
+        }
+        for (auto inject : {RetryRead, SquashRetryRead, SquashRead,
+                             InvalidateRead}) {
+            cases.emplace_back([=, this] { eptMmuTiming(2, inject, true); });
+        }
+        cases.emplace_back([this] { eptMmuTiming(4, SquashRead); });
+    }
+}
+
+void
+PagingTester::eptMmuAccess(BaseMMU::Mode mode, bool functional, bool warm,
+                          EptTest test, unsigned level, bool primed)
+{
+    if (!primed) {
+        setupEpt(!functional && test != EptTest::TableUpdate &&
+                               test != EptTest::Replace);
+        if (test == EptTest::DirtyUpdate)
+            descriptor(3, descriptor(3) & ~64ULL);
+    }
+    const bool priming = warm && !primed;
+    const auto operationMode = priming && test == EptTest::DirtyUpdate ?
+        BaseMMU::Read : mode;
+    auto *cache = static_cast<TLB *>(mode == BaseMMU::Execute ?
+                                    mmu->itb : mmu->dtb);
+    const TlbContext tag{tc->contextId(), 0};
+    panic_if(bool(cache->lookup(Virtual, false, tag)) != primed,
+             "EPT MMU test did not take the intended TLB hit/miss path");
+    if (primed && test != EptTest::DirtyUpdate) {
+        // Leave the TLB intact but poison the guest descriptors. This also
+        // catches an unexpected rewalk through the independent I-TLB port.
+        for (unsigned l = 0; l < 4; ++l)
+            descriptor(l, 0);
+    }
+    const auto changeRights = [this](Addr address, uint64_t rights) {
+        auto raw = system->physProxy.read<uint64_t>(address, ByteOrder::little);
+        system->physProxy.write<uint64_t>(address, (raw & ~7ULL) | rights,
+                                          ByteOrder::little);
+    };
+    const auto current = priming ? EptTest::Mapping : test;
+    const Addr tableLeaf = EptTableLeaves + 8 * level;
+    switch (current) {
+      case EptTest::DeniedRead: changeRights(EptDataLeaf, 4); break;
+      case EptTest::DeniedWrite: changeRights(EptDataLeaf, 5); break;
+      case EptTest::DeniedExecute: changeRights(EptDataLeaf, 3); break;
+      case EptTest::TableRead: changeRights(tableLeaf, 4); break;
+      case EptTest::TableUpdate: changeRights(tableLeaf, 5); break;
+      case EptTest::DirtyUpdate: changeRights(tableLeaf, 5); break;
+      case EptTest::Rmw: changeRights(EptDataLeaf, 5); break;
+      case EptTest::DataMisconfig: changeRights(EptDataLeaf, 2); break;
+      case EptTest::TableMisconfig: changeRights(tableLeaf, 2); break;
+      case EptTest::GuestFault:
+        descriptor(3, descriptor(3) & ~1ULL);
+        changeRights(EptDataLeaf, 2); // Guest #PF precedes the final EPT lookup.
+        break;
+      case EptTest::Replace:
+        replacement = (Physical + 4096) | 7 | 64 | 512;
+        injection = ReplaceLeaf;
+        break;
+      case EptTest::Remap:
+        system->physProxy.write<uint64_t>(EptDataLeaf,
+            OtherHostData | 7 | (6ULL << 3) | 128, ByteOrder::little);
+        break;
+      case EptTest::InheritedWrite:
+        changeRights(EptRoot, 5);
+        changeRights(EptDataLeaf, 3);
+        break;
+      default: break;
+    }
+    const bool tableAccess = current == EptTest::TableRead ||
+        current == EptTest::TableUpdate || current == EptTest::DirtyUpdate ||
+        current == EptTest::TableMisconfig;
+    const bool misconfig = current == EptTest::DataMisconfig ||
+        current == EptTest::TableMisconfig;
+    const bool success = current == EptTest::Mapping ||
+        current == EptTest::Replace || current == EptTest::Remap;
+    const Addr expectedHpa = (current == EptTest::Remap ? OtherHostData :
+        HostData + (current == EptTest::Replace ? 4096 : 0)) + (Virtual & 4095);
+    std::vector<uint64_t> before;
+    for (unsigned l = 0; l < 4; ++l)
+        before.push_back(descriptor(l));
+    auto eptBefore = std::make_shared<std::array<uint8_t, 4 * 4096>>();
+    system->physProxy.readBlob(EptRoot, eptBefore->data(), eptBefore->size());
+    auto tableRequests = std::make_shared<unsigned>(0);
+    inspectAttributes = [=](PacketPtr pkt) {
+        if (pkt->getAddr() >= HostTables && pkt->getAddr() < HostTables + 16384)
+            ++*tableRequests;
+    };
+    const Tick start = curTick();
+    auto flags = accessFlags;
+    if (current == EptTest::Rmw)
+        flags.set(Request::READ_MODIFY_WRITE);
+    if (mode == BaseMMU::Execute)
+        flags.set(Request::INST_FETCH);
+    auto req = std::make_shared<Request>(Virtual, 1, flags,
+        system->getRequestorId(this), Virtual, tc->contextId());
+    const auto retired = [=, this] {
+        std::array<uint8_t, 4 * 4096> eptAfter;
+        system->physProxy.readBlob(EptRoot, eptAfter.data(), eptAfter.size());
+        panic_if(eptAfter != *eptBefore, "Guest paging modified EPT entries");
+        panic_if(primed && current != EptTest::DirtyUpdate && *tableRequests,
+                 "EPT MMU TLB hit repeated a guest table access");
+        for (unsigned l = 0; l < 4; ++l) {
+            const Addr gpa = Tables + l * 4096 + (descriptors[l] & 4095);
+            panic_if(system->physProxy.read<uint64_t>(gpa, ByteOrder::little),
+                     "EPT MMU modified a GPA instead of its backing HPA");
+            if (functional)
+                panic_if(descriptor(l) != before[l],
+                         "Functional EPT MMU changed guest A/D bits");
+        }
+        panic_if(functional && curTick() != start,
+                 "Functional EPT MMU advanced simulated time");
+        if (current == EptTest::Replace) {
+            panic_if(injected != 1 || descriptor(3) != (replacement | 32) ||
+                     (system->isTimingMode() && failedUpdates != 1),
+                     "Nested A/D retry lost the new mapping, D or software bits");
+        }
+        if (current == EptTest::TableUpdate) {
+            for (unsigned l = 0; l < 4; ++l)
+                panic_if(bool(descriptor(l) & 32) != (l < level),
+                         "Denied nested A/D update modified the wrong level");
+        }
+        if (current == EptTest::DirtyUpdate)
+            panic_if(descriptor(3) & 64,
+                     "EPT-denied guest dirty update set D");
+        awaiting = false;
+        if (priming) {
+            schedule(new EventFunctionWrapper([=, this] {
+                eptMmuAccess(mode, functional, warm, test, level, true);
+            }, name() + ".ept_warm", true), curTick() + 1);
+        } else {
+            finishEpt();
+        }
+    };
+    const auto translated = [=, this](const Fault &fault, const RequestPtr &out,
+                                       ThreadContext *context,
+                                       BaseMMU::Mode returnedMode) {
+        panic_if(out != req || context != tc || returnedMode != operationMode,
+                 "EPT MMU changed the request, thread or original mode");
+        if (!success) {
+            panic_if((functional || tableAccess ||
+                      current == EptTest::GuestFault) &&
+                     cache->lookup(Virtual, false, tag),
+                     "Failed guest/functional walk filled the TLB");
+            if (current == EptTest::GuestFault) {
+                const auto *page = dynamic_cast<PageFault *>(fault.get());
+                panic_if(!page || page->describe() != PageFault(Virtual,
+                    false, mode, false, false).describe(),
+                    "Nested paging lost guest page-fault priority");
+            } else {
+                const auto *exit = dynamic_cast<VmxExitFault *>(fault.get());
+                panic_if(!exit, "EPT MMU failure was not a VM-exit fault");
+                const auto &info = exit->info();
+                const Addr gpa = tableAccess ? Tables + level * 4096 +
+                    (descriptors[level] & 4095) : Physical + (Virtual & 4095);
+                const uint64_t permissions = current == EptTest::DeniedRead ||
+                    current == EptTest::TableRead ? 4 :
+                    current == EptTest::DeniedExecute ? 3 :
+                    current == EptTest::InheritedWrite ? 1 : 5;
+                const uint64_t access = tableAccess ?
+                    (current == EptTest::TableUpdate ||
+                     current == EptTest::DirtyUpdate ? 2 : 1) :
+                    current == EptTest::Rmw ? 2 :
+                    mode == BaseMMU::Read ? 1 : mode == BaseMMU::Write ? 2 : 4;
+                const uint64_t qualification = access | (permissions << 3) |
+                    128 | (tableAccess ? 0 : 256);
+                panic_if(info.reason != (misconfig ?
+                         VmxExitReason::EptMisconfiguration :
+                         VmxExitReason::EptViolation) || info.vmEntryFailure ||
+                         !info.hasGuestPhysicalAddress ||
+                         info.guestPhysicalAddress != gpa ||
+                         info.hasQualification != !misconfig ||
+                         info.hasGuestLinearAddress != !misconfig ||
+                         info.hasInstructionLength || info.hasInstructionInfo ||
+                         info.hasInterruptionInfo || info.hasInterruptionErrorCode ||
+                         (!misconfig && (info.qualification != qualification ||
+                          info.guestLinearAddress != Virtual)),
+                         "EPT MMU reported wrong exit metadata");
+            }
+            retired();
+            return;
+        }
+        panic_if(fault || out->getPaddr() != expectedHpa,
+                 "EPT MMU returned wrong final HPA or fault");
+        if (!functional) {
+            const auto *entry = cache->lookup(Virtual, false, tag);
+            panic_if(!entry || entry->paddr != Physical +
+                     (current == EptTest::Replace ? 4096 : 0),
+                     "EPT MMU cached an HPA instead of a guest-physical page");
+        }
+        auto *packet = operationMode == BaseMMU::Write ?
+            Packet::createWrite(out) : Packet::createRead(out);
+        packet->allocate();
+        if (operationMode == BaseMMU::Write)
+            packet->setLE<uint8_t>(0xa5);
+        const auto dataDone = [=, this](PacketPtr response, bool cancelled) {
+            panic_if(cancelled || response->isError() ||
+                     (operationMode != BaseMMU::Write &&
+                      response->getLE<uint8_t>() !=
+                        (current == EptTest::Remap ? 0xeb : 0x90)),
+                     "EPT MMU accessed incorrect instruction/data bytes");
+            delete response;
+            panic_if(system->physProxy.read<uint8_t>(Physical +
+                     (Virtual & 4095)) != 0xcc ||
+                     (operationMode == BaseMMU::Write &&
+                      system->physProxy.read<uint8_t>(expectedHpa) != 0xa5),
+                     "EPT MMU final write reached the wrong physical page");
+            retired();
+        };
+        auto &port = tlb->getWalker()->pagingPort();
+        if (functional) {
+            port.sendFunctional(packet);
+            dataDone(packet, false);
+        } else if (system->isTimingMode()) {
+            port.submit(packet, [] { return true; }, dataDone);
+        } else {
+            port.sendAtomic(packet);
+            dataDone(packet, false);
+        }
+    };
+    awaiting = true;
+    if (functional) {
+        translated(mmu->translateFunctional(req, tc, operationMode), req, tc,
+                   operationMode);
+    } else if (system->isTimingMode()) {
+        auto callback = std::make_unique<EptTranslation>(translated);
+        auto *raw = callback.get();
+        continuations.push_back(std::move(callback));
+        mmu->translateTiming(req, tc, raw, operationMode);
+    } else {
+        translated(mmu->translateAtomic(req, tc, operationMode), req, tc,
+                   operationMode);
+    }
+}
+
+void
+PagingTester::eptMmuTiming(unsigned point, Injection inject, bool warm,
+                          bool primed)
+{
+    if (!primed)
+        setupEpt(point == 2);
+    // Points select nested table-read lookup, A/D-write lookup, final lookup,
+    // the conditional update packet, or cancellation before admission.
+    if (warm && !primed) {
+        auto req = std::make_shared<Request>(Virtual, 1, accessFlags,
+            system->getRequestorId(this), Virtual, tc->contextId());
+        auto callback = std::make_unique<EptTranslation>(
+            [=, this](const Fault &fault, const RequestPtr &, ThreadContext *,
+                       BaseMMU::Mode) {
+                panic_if(fault, "EPT lifecycle warm-up failed");
+                schedule(new EventFunctionWrapper([=, this] {
+                    eptMmuTiming(point, inject, warm, true);
+                }, name() + ".ept_lifecycle_warm", true), curTick() + 1);
+            });
+        auto *raw = callback.get();
+        continuations.push_back(std::move(callback));
+        awaiting = true;
+        mmu->translateTiming(req, tc, raw, BaseMMU::Read);
+        return;
+    }
+    const auto mode = point == 2 ? BaseMMU::Read : BaseMMU::Write;
+    auto cancelled = std::make_shared<bool>(point == 4);
+    squash = [cancelled] { *cancelled = true; };
+    auto roots = std::make_shared<unsigned>(0);
+    auto armed = std::make_shared<bool>(false);
+    const unsigned targetRoot = point == 1 ? 2 : point == 2 && !warm ? 5 : 1;
+    inspectAttributes = [=, this](PacketPtr pkt) {
+        if (pkt->getAddr() == EptRoot)
+            ++*roots;
+        const bool target = point == 3 ? pkt->req->isAtomicReturn() :
+            pkt->getAddr() == EptRoot && *roots == targetRoot;
+        if (*armed || !target)
+            return;
+        *armed = true;
+        injection = point != 3 ? inject :
+            inject == RetryRead ? RetryUpdate :
+            inject == SquashRetryRead ? SquashRetryUpdate :
+            inject == SquashRead ? SquashUpdate : InvalidateUpdate;
+        if (inject == RetryRead) {
+            // Every subsequent read must use the acceptance-time snapshot,
+            // including the final stage after guest paging completes.
+            static_cast<ISA *>(tc->getIsaPtr())->vmxState().activeEptConfig.reset();
+            tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, 0);
+        }
+    };
+    inspectResponse = [=](PacketPtr pkt) {
+        if (*cancelled && !pkt->req->isAtomicReturn())
+            pkt->setBadAddress(); // Cancellation must win over memory errors.
+    };
+    auto req = std::make_shared<Request>(Virtual, 1, accessFlags,
+        system->getRequestorId(this), Virtual, tc->contextId());
+    auto callback = std::make_unique<EptTranslation>(
+        [=, this](const Fault &fault, const RequestPtr &out,
+                   ThreadContext *context, BaseMMU::Mode returnedMode) {
+            panic_if(out != req || context != tc || returnedMode != mode ||
+                     injected != (point == 4 ? 0 : 1),
+                     "Nested EPT lifecycle callback or injection failed");
+            const bool retry = inject == RetryRead;
+            panic_if(retry ? bool(fault) || out->getPaddr() !=
+                         HostData + (Virtual & 4095) :
+                         !dynamic_cast<ReExec *>(fault.get()),
+                     "Nested EPT lifecycle returned wrong HPA/fault");
+            if (!retry) {
+                panic_if(!warm && tlb->lookup(Virtual, false,
+                    {tc->contextId(), 0}) && point != 2,
+                    "Cancelled guest walk published a TLB entry");
+                for (unsigned l = 0; l < 4; ++l) {
+                    const bool accessed = point == 2 ||
+                        (point == 3 && (inject == SquashRead ||
+                                       inject == InvalidateRead) && l == 0);
+                    panic_if(bool(descriptor(l) & 32) != accessed ||
+                             bool(descriptor(l) & 64) != (point == 2 && l == 3),
+                             "Nested EPT cancellation changed unexpected A/D bits");
+                }
+            }
+            finishEpt();
+        }, cancelled);
+    auto *raw = callback.get();
+    continuations.push_back(std::move(callback));
+    awaiting = true;
+    mmu->translateTiming(req, tc, raw, mode);
+    panic_if(mmu->drain() != DrainState::Draining,
+             "Nested EPT lost MMU ownership before retirement");
+}
 
 void
 PagingTester::eptCases()
@@ -153,9 +625,11 @@ PagingTester::eptCases()
                      result.ignorePat != bool(bits(before.back(), 6)),
                      "EPT %s: incorrect mapping or leaf attributes", label);
         } else {
-            panic_if(result.hostPhysical || result.permissions ||
+            panic_if(result.hostPhysical ||
+                     result.permissions !=
+                         (expected == WalkStatus::Violation ? permissions : 0) ||
                      result.pageShift || result.memoryType || result.ignorePat,
-                     "EPT %s: failure exposed a usable mapping", label);
+                     "EPT %s: failure exposed a mapping or wrong rights", label);
         }
         for (unsigned i = 0; i < before.size(); ++i)
             panic_if(descriptor(i) != before[i],
@@ -277,14 +751,14 @@ PagingTester::eptCases()
     descriptor(0, descriptor(0) & ~2ULL); // ancestor removes W
     descriptor(1, descriptor(1) & ~4ULL); // another removes X
     check("intersected read", WalkStatus::Mapping, 4, EptAccess::Read, 1);
-    check("denied write", WalkStatus::Violation, 4, EptAccess::Write);
-    check("denied execute", WalkStatus::Violation, 4, EptAccess::Execute);
+    check("denied write", WalkStatus::Violation, 4, EptAccess::Write, 1);
+    check("denied execute", WalkStatus::Violation, 4, EptAccess::Execute, 1);
     descriptor(3, (descriptor(3) & ~7ULL) | 4); // X-only leaf
-    check("empty intersection", WalkStatus::Violation, 4, EptAccess::Execute);
+    check("empty intersection", WalkStatus::Violation, 4, EptAccess::Execute, 0);
     for (unsigned i = 0; i < 4; ++i)
         descriptor(i, (descriptor(i) & ~7ULL) | 4);
     check("execute-only", WalkStatus::Mapping, 4, EptAccess::Execute, 4);
-    check("denied read", WalkStatus::Violation, 4, EptAccess::Read);
+    check("denied read", WalkStatus::Violation, 4, EptAccess::Read, 4);
     capability &= ~1ULL;
     check("unsupported execute-only", WalkStatus::Misconfiguration, 1);
 
@@ -293,7 +767,8 @@ PagingTester::eptCases()
             setup(levels);
             // Absent entries win over otherwise-reserved contents.
             descriptor(stop, (1ULL << 48) | 128 | (7 << 3));
-            check("absent", WalkStatus::Violation, stop + 1);
+            check("absent", WalkStatus::Violation, stop + 1,
+                  EptAccess::Read, 0);
             descriptor(stop, (descriptor(stop) & ~7ULL) | 2);
             check("W without R", WalkStatus::Misconfiguration, stop + 1);
         }
