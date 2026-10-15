@@ -94,8 +94,8 @@ paging_test(void)
     field(0x4002, controls(0x48e, 0));       // primary controls, no EPT
     field(0x400c, controls(0x48f, 1u << 9)); // 64-bit host
     field(0x4012, controls(0x490, 1u << 9)); // 64-bit guest
-    field(0x2800, ~0ull);
-    / VMCS link pointer field(0x6800, cr0);
+    field(0x2800, ~0ull); // VMCS link pointer
+    field(0x6800, cr0);
     field(0x6802, cr3);
     field(0x6804, cr4);
     field(0x681c, (uint64_t)(guest_stack + sizeof(guest_stack)));
