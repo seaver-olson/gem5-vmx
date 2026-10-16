@@ -200,10 +200,34 @@ conditional write may update memory before cancellation; a rejected write must
 not. Retry cases also change the live EPT state and capabilities to verify that
 in-flight work uses its captured context.
 
-Only the existing suspended-CPU fixture can seed the private EPT state; it
-restores that state and the capability MSR after each test. EPT remains disabled
-at VM entry. These tests inspect faults without invoking a VM exit and do not
-claim pipeline execution or a bootable EPT guest.
+The suspended-CPU fixture seeds private EPT state and restores it and the
+capability MSR after each test. It isolates MMU faults and lifecycle behavior;
+it does not replace architectural VM entry/exit coverage.
+
+The same `--ept-only` suite also runs `ept_entry.elf` on AtomicSimple,
+TimingSimple, Minor and O3 with Classic caches. This is a second build of the
+existing VM-entry guest, not a new fixture: real VMLAUNCH/VMRESUME captures
+EPTP, real guest fetches/loads/stores use distinct GVAs/GPAs/HPAs, and VMREAD
+checks exits 48/49, qualification, GPA, valid GLA and saved guest RIP. It
+rejects an invalid EPTP before launch, repairs mappings and resumes faulting
+instructions, checks guest paging A/D update failures, then verifies successful
+VMCALL exits. It repeats with EPT A/D off/on and different roots, checks actual
+guest/EPT A/D changes and untouched neighboring data, and finally disables EPT
+on resume. No test-side capability override or private-state seeding is used
+by this guest.
+
+Entry/exit instructions squash younger work after the transition so O3 cannot
+reuse bytes fetched with the previous host/guest translation context, even
+when its branch-target prediction was correct. The existing VM-entry trace
+also checks this flag without changing the configured execution latencies.
+O3 discards its virtual-address-tagged byte buffer on traps and squash-after
+redirects; ordinary branch redirects retain it. Refetch may change total cycle
+counts even though the instruction's configured `opLat` is unchanged.
+
+The advertised profile is deliberately limited to four-level WB EPT tables,
+4 KiB EPT leaves and optional A/D updates, with IA-32e guests and 64-bit hosts.
+INVEPT, VPID, five-level/large-page EPT advertisement, active-EPT checkpoints,
+event-vectoring fault coverage and a Linux/KVM boot remain outside this patch.
 
 The native VMX operand guest runs independently of VM entry/exit and EPT:
 
@@ -216,8 +240,9 @@ register/memory operands on AtomicSimple, TimingSimple and O3, plus timing/O3
 Ruby MESI Two Level. Checks include indexed/RIP-relative addressing, high
 64-bit field values, split-page success/faults, unchanged flags on operand
 faults, unsupported/read-only fields, and precheck-versus-operand fault
-priority. This is operand execution coverage; full timing/O3 VM entry/exit and
-event delivery remain separate EPT integration gates.
+priority. Advertised EPTP, secondary controls and guest-physical exit fields
+are accessible even while EPT is disabled. This is operand execution coverage;
+the separate entry guests cover VM entry/exit.
 
 The focused VM entry regression adds a minimal no-EPT launch/resume/VMCALL
 round trip, plus #UD, VMfailInvalid and VMfailValid checks for both entry

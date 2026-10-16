@@ -121,19 +121,19 @@ void paging_test(void)
     FAULT(op_vmwrite_mem, hole, 0xffff8000, 14, 0, 42);
     STATUS(op_vmwrite_reg, 0, 0x4400, 7, 0x40, 43);
     check(read_field(0x4400) == 13, 44);
-    /* Metadata knows these encodings, but the CPU advertises neither the
-     * secondary controls nor EPT. They must remain inaccessible to VMX code. */
-    STATUS(op_vmwrite_reg, 0, 0x201a, value, 0x40, 61);
-    check(read_field(0x4400) == 12, 62);
-    STATUS(op_vmread_mem, hole, 0x201a, 0, 0x40, 63);
-    check(read_field(0x4400) == 12, 64);
-    STATUS(op_vmwrite_reg, 0, 0x401e, 2, 0x40, 65);
-    check(read_field(0x4400) == 12, 66);
-    STATUS(op_vmwrite_reg, 0, 0x201b, value >> 32, 0x40, 67);
-    STATUS(op_vmread_mem, hole, 0x2400, 0, 0x40, 68);
-    check(read_field(0x4400) == 12, 69);
-    STATUS(op_vmread_mem, hole, 0x2401, 0, 0x40, 70);
-    check(read_field(0x4400) == 12, 71);
+    /* Advertised EPT fields are accessible even before EPT is enabled.
+     * VMREAD must reach its memory operand rather than reject the field. */
+    SUCCESS(op_vmwrite_reg, 0, 0x201a, value, 61);
+    check(read_field(0x201a) == value, 62);
+    FAULT(op_vmread_mem, hole, 0x201a, 14, 2, 63);
+    check(read_field(0x201a) == value, 64);
+    SUCCESS(op_vmwrite_reg, 0, 0x401e, 2, 65);
+    check(read_field(0x401e) == 2, 66);
+    SUCCESS(op_vmwrite_reg, 0, 0x201b, value >> 32, 67);
+    FAULT(op_vmread_mem, hole, 0x2400, 14, 2, 68);
+    check(read_field(0x2400) == 0, 69);
+    FAULT(op_vmread_mem, hole, 0x2401, 14, 2, 70);
+    check(read_field(0x2401) == 0, 71);
     FAULT(op_vmptrst, hole, 0, 14, 2, 45);
     FAULT(op_vmread_mem, hole, RIP, 14, 2, 46);
     FAULT(op_vmread_mem, 1ull << 47, RIP, 13, 0, 47);
