@@ -700,6 +700,12 @@ Fetch::squashFromCommit(const PCStateBase &new_pc, const InstSeqNum seq_num,
 {
     DPRINTF(Fetch, "[tid:%i] Squash from commit.\n", tid);
 
+    // Traps and serializing transitions may change the translation of an
+    // unchanged virtual PC. Do not reuse bytes fetched in the old context.
+    if (!squashInst || squashInst->isSquashAfter()) {
+        fetchBufferValid[tid] = false;
+    }
+
     doSquash(new_pc, squashInst, tid);
 
     // Tell the CPU to remove any instructions that are not in the ROB.

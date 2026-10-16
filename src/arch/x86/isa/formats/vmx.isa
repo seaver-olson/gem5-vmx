@@ -91,6 +91,9 @@ output decoder {{
             flags[IsControl] = true;
             flags[IsIndirectControl] = true;
             flags[IsUncondControl] = true;
+            // Even a correctly predicted target was fetched using the old
+            // host/guest translation context. Refetch after the transition.
+            flags[IsSquashAfter] = true;
         }
     }
 
