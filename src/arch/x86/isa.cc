@@ -29,6 +29,7 @@
 #include "arch/x86/isa.hh"
 
 #include "arch/x86/decoder.hh"
+#include "arch/x86/ept.hh"
 #include "arch/x86/faults.hh"
 #include "arch/x86/mmu.hh"
 #include "arch/x86/paging.hh"
@@ -164,11 +165,11 @@ ISA::clear()
     // External-interrupt and NMI exiting are not advertised until event
     // acknowledgement/pending-state behavior is modeled end to end.
     const uint32_t supportedPinbased = 0;
-    // CR3-load exiting is the only optional primary execution control in
-    // the audited contract.  Other interception hooks remain present for
+    // Secondary controls expose only EPT. Other interception hooks remain for
     // future work, but exposing their bits before their complete exit
     // metadata and integration tests exist would overstate the model.
-    const uint32_t supportedProcbased = CpuBasedCr3LoadExiting;
+    const uint32_t supportedProcbased =
+        CpuBasedCr3LoadExiting | ept::ActivateSecondaryControls;
     const uint32_t supportedExit =
         VmExitHostAddressSpaceSize |
         VmExitSaveIa32Efer |
@@ -213,8 +214,12 @@ ISA::clear()
     // Guest IA32_SYSENTER_CS (encoding 0x482a, index 0x15) has the
     // highest index among the VMCS fields supported by this implementation.
     regVal[misc_reg::VmxVmcsEnum] = 0x2a;
-    regVal[misc_reg::VmxProcbasedCtls2] = 0;
-    regVal[misc_reg::VmxEptVpidCap] = 0;
+    regVal[misc_reg::VmxProcbasedCtls2] =
+        vmx::controlCapabilityMsr(0, ept::EnableEptSecondaryControl);
+    // Start with four-level, WB EPT tables, 4 KiB leaves and A/D updates.
+    // Do not imply support for INVEPT, VPID or other secondary controls.
+    regVal[misc_reg::VmxEptVpidCap] =
+        (1ULL << 6) | (1ULL << 14) | (1ULL << 21);
     regVal[misc_reg::VmxVmfunc] = 0;
     regVal[misc_reg::VmxProcbasedCtls3] = 0;
     regVal[misc_reg::VmxExitCtls2] = 0;

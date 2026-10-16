@@ -1372,14 +1372,6 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
         return vmFailValid(vmcs, toInt(validation.instructionError));
     }
 
-    // EPT's second-stage translation and exit reporting are not wired into
-    // the MMU yet. Never enter a guest that requests EPT with only the
-    // configuration parser available.
-    if (validation.eptConfig) {
-        return vmFailValid(vmcs,
-                toInt(VmxInstructionError::VmEntryInvalidControlFields));
-    }
-
     DPRINTF(VMX, "VM-entry validation passed: pin %#x primary %#x "
             "exit %#x entry %#x VMCS %#x\n",
             readOrZero(*vmcs, VmcsPinBasedVmExecControl),
@@ -2217,7 +2209,7 @@ void
 VmxState::serialize(CheckpointOut &cp) const
 {
     panic_if(activeEptConfig,
-            "Cannot checkpoint an EPT guest before EPT MMU support exists");
+             "Checkpointing an active EPT guest is not implemented");
     size_t numVmcsRegions = vmcsRegions.size();
     SERIALIZE_SCALAR(vmxActive);
     SERIALIZE_SCALAR(inVmxNonRoot);

@@ -254,8 +254,8 @@ struct VmxResult
 class VmxState
 {
   private:
-    // The suspended-CPU fixture seeds captured EPT state before VM entry
-    // supports EPT. No guest-visible setter or capability is introduced.
+    // The suspended-CPU fixture isolates MMU transport/lifecycle tests without
+    // executing VM entry. Ordinary guests capture EPT state through vmEntry.
     friend class PagingTester;
     using VmcsMap = std::map<Addr, Vmcs>;
     static constexpr Addr InvalidVmcsPointer = ~Addr(0);
