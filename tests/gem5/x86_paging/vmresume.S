@@ -7,7 +7,7 @@ vmx_probe op_vmcall, "vmcall"
 vmx_probe op_ud2, "ud2"
 
 // Return zero on a VM exit, or the VMfail flags on failed entry. The guest
-// uses no callee-saved registers; VM exit restores this call's host stack. 
+// uses no callee-saved registers; VM exit restores this call's host stack.
 .global enter_guest
 enter_guest:
     mov $0x6c14, %ecx // HOST_RSP
@@ -57,3 +57,17 @@ injected_common:
 injected_exit:
     vmcall
     ud2
+
+#ifdef EPT_ENTRY_TEST
+/* One remapped code page; absolute operands need no guest GPR save/restore
+ * in this deliberately minimal VMM when a faulting instruction is resumed. */
+.balign 4096
+.global ept_guest_read, ept_guest_write, ept_guest_exit
+ept_guest_read:
+    mov 0x401000, %eax
+ept_guest_write:
+    movl $0x12345678, 0x401000
+ept_guest_exit:
+    vmcall
+    ud2
+#endif
