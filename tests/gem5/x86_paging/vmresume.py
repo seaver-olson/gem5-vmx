@@ -132,7 +132,10 @@ def main():
     parser.add_argument("--outdir", type=Path, default=Path("m5out-vmresume"))
     args = parser.parse_args()
     suite = Path(__file__).resolve().parent
-    subprocess.run(["make", "-C", str(suite), "vmresume.elf"], check=True)
+    subprocess.run(
+        ["make", "-C", str(suite), "vmresume.elf", "vmx_transition.elf"],
+        check=True,
+    )
     # Explicit synthetic values keep the independence checks meaningful even
     # after the production defaults are calibrated. Also test both defaults.
     cases = [
@@ -185,6 +188,37 @@ def main():
                 print(f"{output.name}: PASS (#UD, VMfail and entry/exit)")
             else:
                 print(f"{output.name}: PASS (architectural behavior only)")
+
+    # Keep transition coverage separate from the fixed-count latency traces.
+    # The timing case saves a deterministic root-mode checkpoint, continues,
+    # then replays the same checks from a fresh simulator process.
+    for cpu in ("atomic", "timing", "minor", "o3", "restore"):
+        output = args.outdir / f"transition-{cpu}"
+        output.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(args.gem5),
+            f"--outdir={output}",
+            str(suite / "config.py"),
+            "--guest",
+            "vmx_transition",
+            "--cpu",
+            "timing" if cpu == "restore" else cpu,
+            "--caches",
+        ]
+        if cpu == "timing":
+            command += ["--vmx-root-checkpoint"]
+        elif cpu == "restore":
+            checkpoint = args.outdir / "transition-timing" / "checkpoint"
+            command += ["--restore", str(checkpoint)]
+        with (output / "console.log").open("w") as log:
+            subprocess.run(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+                timeout=120,
+            )
+        print(f"{output.name}: PASS (VMX transitions and root state)")
 
 
 if __name__ == "__main__":

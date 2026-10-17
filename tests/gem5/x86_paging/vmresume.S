@@ -71,3 +71,70 @@ ept_guest_exit:
     vmcall
     ud2
 #endif
+
+#ifdef VMX_TRANSITION_TEST
+// Keep all guest clobbers caller-saved, as required by enter_guest's ABI.
+.global probe_wrmsr
+probe_wrmsr:
+    mov %edi, %ecx
+    mov %esi, %eax
+    mov %rsi, %rdx
+    shr $32, %rdx
+    lea 1f(%rip), %r8
+    mov %r8, resume_ip(%rip)
+    wrmsr
+1:  movq $0, resume_ip(%rip)
+    ret
+
+.global transition_guest, transition_exit1, transition_exit2
+transition_guest:
+    mov 0x400000, %rax
+    mov %rax, transition_seen(%rip)
+    mov transition_root_b(%rip), %rax
+    mov %rax, %cr3
+    mov 0x400000, %rax
+    mov %rax, transition_seen+8(%rip)
+    mov %cr3, %rax
+    mov %rax, transition_seen+16(%rip)
+    movabs $0x535441434b, %rax
+    push %rax
+    pop %rax
+    mov %rax, transition_seen+24(%rip)
+transition_exit1:
+    vmcall
+    incq transition_seen+32(%rip)
+transition_exit2:
+    vmcall
+    ud2
+
+.global transition_clts, transition_clts_exit
+transition_clts:
+    clts
+    mov %cr0, %rax
+    mov %rax, transition_seen+40(%rip)
+transition_clts_exit:
+    vmcall
+    ud2
+
+.global transition_cr3, transition_cr3_instruction
+transition_cr3:
+    mov transition_root_b(%rip), %rax
+transition_cr3_instruction:
+    mov %rax, %cr3
+    vmcall
+    ud2
+
+.global transition_pf, transition_getsec
+transition_pf:
+    mov 0x600000, %rax
+    ud2
+transition_getsec:
+    .byte 0x0f, 0x37
+    ud2
+.global transition_xsetbv, transition_xsetbv_instruction
+transition_xsetbv:
+    xor %ecx, %ecx
+transition_xsetbv_instruction:
+    xsetbv
+    ud2
+#endif

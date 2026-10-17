@@ -2,6 +2,7 @@
 /vmx_operands.elf
 /vmresume.elf
 /ept_entry.elf
+/vmx_transition.elf
 /legacy.elf
 /pae.elf
 /gdb.elf

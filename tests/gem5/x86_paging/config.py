@@ -36,6 +36,7 @@ parser.add_argument(
         "vmx_operands",
         "vmresume",
         "ept_entry",
+        "vmx_transition",
         "paging",
         "legacy",
         "pae",
@@ -69,6 +70,11 @@ parser.add_argument(
 )
 parser.add_argument("--restore", type=Path)
 parser.add_argument(
+    "--vmx-root-checkpoint",
+    action="store_true",
+    help="Checkpoint at the transition guest's VMX-root marker",
+)
+parser.add_argument(
     "--pae-checkpoint",
     action="store_true",
     help="Checkpoint after PDPTE memory diverges from retained state",
@@ -86,6 +92,19 @@ parser.add_argument(
     help="Run standalone EPT walker tests in all memory modes",
 )
 args = parser.parse_args()
+if args.vmx_root_checkpoint and (
+    args.guest != "vmx_transition"
+    or args.restore
+    or args.checkpoint_at
+    or args.switch_to
+    or args.fixture
+    or args.transport
+    or args.ept_only
+):
+    parser.error(
+        "--vmx-root-checkpoint requires a fresh vmx_transition guest "
+        "without other checkpoint, fixture or switching options"
+    )
 if args.ept_only and (
     args.cpu not in ("atomic", "timing")
     or args.transport
@@ -223,6 +242,16 @@ if args.switch_to and args.guest != "pae":
     m5.switchCpus(system, [(system.cpu, system.switch_cpu)])
 # Each exit reports a test ID in its code. Zero is a complete pass.
 event = m5.simulate(10_000_000_000)
+if args.guest == "vmx_transition" and not args.restore:
+    if event.getCause() != "m5_exit instruction encountered":
+        raise RuntimeError(
+            f"Missing VMX-root marker: {event.getCause()} "
+            f"code={event.getCode()}"
+        )
+    print("VMX ROOT MARKER: current VMCS and guest RIP set")
+    if args.vmx_root_checkpoint:
+        m5.checkpoint(str(Path(m5.options.outdir) / "checkpoint"))
+    event = m5.simulate(10_000_000_000)
 if (
     args.guest == "pae"
     and event.getCause() == "m5_exit instruction encountered"

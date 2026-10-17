@@ -267,6 +267,35 @@ then exercises ordinary resume again. This guards O3's executing-instruction
 PC redirect as well as the shared ROM delivery path. These focused injection
 checks do not cover IRET, all event types or EPT.
 
+The same runner also executes `vmx_transition.elf`, a separate build of the
+shared VM-entry setup, on all four CPU models with Classic caches. It ports
+the Linux VMX modules' distinct coverage: different host/guest mappings,
+non-exiting guest CR3 changes, guest-stack use, CR0 masks/read shadows and
+CLTS interception, CR3-load exit metadata, intercepted #PF with unchanged
+CR2, GETSEC/XSETBV #UD priority, early-entry failure atomicity and late-entry
+failure field/launch-state preservation. It checks VMCS revision handling,
+the advertised VMX/EPT capability MSRs and rejected writes to read-only MSRs.
+It does not change the latency guest's fixed instruction counts.
+
+Secondary-control and EPT/VPID capability MSRs are now mapped for real RDMSR
+accesses and reject WRMSR with #GP. Intercepted control-register operations
+return the existing VM-exit fault: the CPU squashes younger guest work before
+switching to host execution, rather than letting guest instructions run after
+an execute-time context change. CLTS and CR3-load cases guard this on O3 too.
+
+The timing transition case checkpoints at an explicit guest marker while VMX
+root operation and a current VMCS are active, then completes normally. A fresh
+simulator restores that checkpoint and repeats the remaining checks, including
+the current VMCS pointer, a full-width saved field and successful VM entry.
+This is root-mode checkpoint coverage, not active-EPT checkpoint support.
+For a focused manual run, use `config.py --guest vmx_transition --cpu timing
+--caches --vmx-root-checkpoint`, then `--restore <outdir>/checkpoint` instead
+of `--vmx-root-checkpoint`. Failure codes 200--219 identify capability/MSR
+checks; 220--254 identify transition, revision and checkpoint checks.
+
+The Linux harness in `tests/gem5/vmx` is retained until its replacement
+coverage has been reviewed; it is not removed by this coverage-port patch.
+
 CI builds the disk-free guests before compiling gem5, so guest C/assembly
 errors fail early rather than preventing every regression after a long build.
 

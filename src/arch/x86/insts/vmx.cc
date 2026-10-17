@@ -1549,14 +1549,22 @@ VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
     return VmxResult::successRedirect(hostRip);
 }
 
-VmxResult
-VmxState::controlRegisterExit(ExecContext *xc, uint8_t cr,
-        VmxCrAccessType type, uint8_t gpr, uint64_t value,
-        uint8_t instructionSize, bool lmswMemoryOperand)
+Fault
+VmxState::controlRegisterExitFault(uint8_t cr, VmxCrAccessType type,
+                                   uint8_t gpr, uint64_t value,
+                                   uint8_t instructionSize,
+                                   bool lmswMemoryOperand) const
 {
-    return vmexitInstruction(xc, VmxExitReason::ControlRegisterAccess,
-            instructionSize, crQualification(
-                cr, type, gpr, value, lmswMemoryOperand));
+    // Deliver through the CPU's fault path, not from a register micro-op's
+    // execution: O3 must squash younger guest work before loading host state.
+    VmxExitInfo exitInfo;
+    exitInfo.reason = VmxExitReason::ControlRegisterAccess;
+    exitInfo.hasInstructionLength = true;
+    exitInfo.instructionLength = instructionSize;
+    exitInfo.hasQualification = true;
+    exitInfo.qualification =
+        crQualification(cr, type, gpr, value, lmswMemoryOperand);
+    return std::make_shared<VmxExitFault>(exitInfo);
 }
 
 VmxResult

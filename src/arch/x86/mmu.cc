@@ -222,11 +222,10 @@ namespace
 bool
 readOnlyVmxMsr(Addr msr)
 {
-    // IA32_VMX_BASIC through IA32_VMX_VMCS_ENUM and the true-control MSRs
+    // IA32_VMX_BASIC through IA32_VMX_EPT_VPID_CAP and the true-control MSRs
     // are read-only. Unsupported optional VMX MSRs are absent from the MSR
     // map and therefore fault on both reads and writes.
-    return (msr >= 0x480 && msr <= 0x48a) ||
-        (msr >= 0x48d && msr <= 0x490);
+    return (msr >= 0x480 && msr <= 0x48c) || (msr >= 0x48d && msr <= 0x490);
 }
 
 Cycles

@@ -157,6 +157,190 @@ test_ept_entry(uint64_t host_cr3)
 }
 #endif
 
+#ifdef VMX_TRANSITION_TEST
+// Port the Linux modules' unique checks without duplicating VMCS setup.
+static volatile uint64_t roots[2][4][512] __attribute__((aligned(4096)));
+static volatile uint64_t data[2][512] __attribute__((aligned(4096)));
+volatile uint64_t transition_seen[6], transition_root_b;
+extern void transition_guest(void), transition_exit1(void);
+extern void transition_exit2(void), transition_clts(void);
+extern void transition_clts_exit(void), transition_cr3(void);
+extern void transition_cr3_instruction(void), transition_pf(void);
+extern void transition_getsec(void), transition_xsetbv(void);
+extern void transition_xsetbv_instruction(void);
+extern uint64_t probe_wrmsr(uint64_t, uint64_t);
+PROBE(op_vmptrst);
+
+static void
+test_vmx_capabilities(void)
+{
+    uint32_t a = 1, b, c, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    check((c & (1u << 5)) && (msr(0x3a) & 5) == 5, 200);
+    // This is the simulator's advertised contract, not a hardware profile.
+    const uint64_t expected[] = {
+        0, ((1ull << 15) | (1ull << 31)) << 32,
+        ((1ull << 9) | (1ull << 20) | (1ull << 21)) << 32 | (1u << 9),
+        ((1ull << 9) | (1ull << 15)) << 32 | (1u << 9)};
+    for (unsigned i = 0; i < 4; ++i) {
+        check(msr(0x481 + i) == expected[i], 201 + i);
+        check(msr(0x48d + i) == expected[i], 205 + i);
+    }
+    check(!(msr(0x489) & (1u << 17)) && msr(0x48a) == 0x2a, 209);
+    check(msr(0x48b) == (2ull << 32), 210); // Secondary controls: EPT only.
+    check(msr(0x48c) == ((1u << 6) | (1u << 14) | (1u << 21)), 211);
+    // Unlike the retired no-EPT assumptions, these MSRs are now readable.
+    const uint32_t readonly[] = {0x480, 0x48b, 0x48c, 0x3a};
+    for (unsigned i = 0; i < sizeof(readonly) / sizeof(readonly[0]); ++i) {
+        uint64_t before = msr(readonly[i]);
+        fault_vector = fault_error = 0;
+        probe_wrmsr(readonly[i], before);
+        check(fault_vector == 13 && fault_error == 0, 212 + i);
+        check(msr(readonly[i]) == before, 216 + i);
+    }
+    fault_vector = 0;
+}
+
+static void
+transition_exit(unsigned resume, void (*rip)(void), uint64_t reason,
+                uint64_t host_cr0, uint64_t host_cr3, uint64_t host_cr4)
+{
+    field(0x681e, (uint64_t)rip);
+    check(enter_guest(resume) == 0, 220);
+    check(read_field(0x4402) == reason, 221);
+    uint64_t cr0, cr3, cr4;
+    __asm__ volatile("mov %%cr0, %0; mov %%cr3, %1; mov %%cr4, %2"
+                     : "=r"(cr0), "=r"(cr3), "=r"(cr4));
+    check(cr0 == host_cr0 && cr3 == host_cr3 && cr4 == host_cr4, 222);
+    check(*(volatile uint64_t *)0x400000 == 0x484f5354, 223);
+}
+
+static void
+test_vmx_transition(uint64_t cr0, uint64_t cr3, uint64_t cr4, uint64_t pointer)
+{
+    test_vmx_capabilities();
+    uint32_t revision = vmcs_region[0];
+    vmcs_region[0] ^= 1;
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 224);
+    vmcs_region[0] = revision;
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 225);
+    vmcs_region[0] ^= 1;
+    check((op_vmptrld((uint64_t)&pointer, 0, 0) & 0x8d5) == 0x40, 226);
+    check(read_field(0x4400) == 11, 227);
+    vmcs_region[0] = revision;
+    uint64_t current = 0;
+    check(!(op_vmptrst((uint64_t)&current, 0, 0) & 0x41), 228);
+    check(current == pointer, 229); // Bad revision must not lose current VMCS.
+
+    // Deterministic VMX-root checkpoint boundary, without active EPT state.
+    field(0x681e, 0x123456789abcdef0ull);
+    __asm__ volatile(".byte 0x0f, 0x04; .word 0x21" ::"D"(0ull) : "memory");
+    check(!(op_vmptrst((uint64_t)&current, 0, 0) & 0x41), 230);
+    check(current == pointer && read_field(0x681e) == 0x123456789abcdef0ull,
+          231);
+
+    // Identity-map the code/stack below 2 MiB, but map one data GVA to two
+    // different guest physical pages. The host keeps its boot mapping.
+    *(volatile uint64_t *)0x400000 = 0x484f5354;
+    for (unsigned i = 0; i < 2; ++i) {
+        roots[i][0][0] = (uint64_t)roots[i][1] | 3;
+        roots[i][1][0] = (uint64_t)roots[i][2] | 3;
+        roots[i][2][0] = 0x83;
+        roots[i][2][2] = (uint64_t)roots[i][3] | 3;
+        roots[i][3][0] = (uint64_t)data[i] | 3;
+        data[i][0] = 0x100 + i;
+    }
+    transition_root_b = (uint64_t)roots[1];
+    field(0x6802, (uint64_t)roots[0]);
+    transition_exit(0, transition_guest, 18, cr0, cr3, cr4);
+    check(transition_seen[0] == 0x100 && transition_seen[1] == 0x101, 232);
+    check(transition_seen[2] == transition_root_b &&
+              read_field(0x6802) == transition_root_b,
+          233);
+    check(transition_seen[3] == 0x535441434b, 234); // Guest stack round trip.
+    check(read_field(0x681e) == (uint64_t)transition_exit1 &&
+              read_field(0x440c) == 3,
+          235);
+    transition_exit(1, (void (*)(void))((uint64_t)transition_exit1 + 3), 18,
+                    cr0, cr3, cr4);
+    check(transition_seen[4] == 1 &&
+              read_field(0x681e) == (uint64_t)transition_exit2,
+          236);
+
+    // Masked TS with shadow zero: CLTS must not clear the real guest TS.
+    field(0x6802, (uint64_t)roots[0]);
+    field(0x6800, cr0 | 8);
+    field(0x6000, 8);           // CR0 guest/host mask
+    field(0x6004, cr0 & ~8ull); // CR0 read shadow
+    transition_exit(1, transition_clts, 18, cr0, cr3, cr4);
+    check((read_field(0x6800) & 8) && !(transition_seen[5] & 8), 237);
+    check(read_field(0x681e) == (uint64_t)transition_clts_exit, 238);
+    field(0x6004, cr0 | 8);
+    transition_exit(1, transition_clts, 28, cr0, cr3, cr4);
+    check(read_field(0x6400) == 0x20 && (read_field(0x6800) & 8), 239);
+    check(read_field(0x681e) == (uint64_t)transition_clts, 240);
+
+    field(0x6000, 0);
+    field(0x6004, cr0);
+    field(0x6800, cr0);
+    field(0x4002, controls(0x48e, 1u << 15)); // CR3-load exiting
+    transition_exit(1, transition_cr3, 28, cr0, cr3, cr4);
+    check(read_field(0x6400) == 3 && read_field(0x6802) == (uint64_t)roots[0],
+          241);
+    check(read_field(0x681e) == (uint64_t)transition_cr3_instruction, 242);
+
+    field(0x4002, controls(0x48e, 0));
+    field(0x4004, 1u << 14); // Intercept #PF, including its error code.
+    uint64_t saved_cr2, after_cr2;
+    __asm__ volatile("mov %%cr2, %0" : "=r"(saved_cr2));
+    __asm__ volatile("mov %0, %%cr2" ::"r"(0x12345000ull) : "memory");
+    transition_exit(1, transition_pf, 0, cr0, cr3, cr4);
+    __asm__ volatile("mov %%cr2, %0" : "=r"(after_cr2));
+    check(after_cr2 == 0x12345000 && read_field(0x6400) == 0x600000, 243);
+    check(read_field(0x4404) == 0x80000b0e && read_field(0x4406) == 0, 244);
+    check(read_field(0x681e) == (uint64_t)transition_pf, 245);
+    __asm__ volatile("mov %0, %%cr2" ::"r"(saved_cr2) : "memory");
+
+    // Disabled SMXE/OSXSAVE: #UD wins over GETSEC/XSETBV's VM exits.
+    field(0x4004, 1u << 6);
+    field(0x6804, cr4 & ~((1ull << 14) | (1ull << 18)));
+    transition_exit(1, transition_getsec, 0, cr0, cr3, cr4);
+    check(read_field(0x4404) == 0x80000306 &&
+              read_field(0x681e) == (uint64_t)transition_getsec,
+          246);
+    transition_exit(1, transition_xsetbv, 0, cr0, cr3, cr4);
+    check(read_field(0x4404) == 0x80000306 &&
+              read_field(0x681e) == (uint64_t)transition_xsetbv_instruction,
+          247);
+
+    // Late failure loads host state, preserves earlier exception-exit fields,
+    // and must not mark a previously clear VMCS as launched.
+    uint64_t info = read_field(0x4404), error = read_field(0x4406);
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 248);
+    check((op_vmresume(0, 0, 0) & 0x8d5) == 1, 249);
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 250);
+    field(0x6826, 1ull << 48); // Noncanonical guest SYSENTER_EIP.
+    transition_exit(0, guest_entry, (1ull << 31) | 33, cr0, cr3, cr4);
+    check(read_field(0x6400) == 0 && read_field(0x4404) == info &&
+              read_field(0x4406) == error && guest_runs == 0,
+          251);
+    check((op_vmresume(0, 0, 0) & 0x8d5) == 0x40 && read_field(0x4400) == 5,
+          252);
+
+    // Only the primary-control bit is invalid; other controls/state are valid.
+    // Bit 31 is now supported, so do not reuse the old no-EPT negative test.
+    field(0x6826, 0);
+    field(0x4002, controls(0x48e, 0) | 1);
+    check((enter_guest(0) & 0x8d5) == 0x40 && read_field(0x4400) == 7, 253);
+    uint64_t after_cr0, after_cr3;
+    __asm__ volatile("mov %%cr0, %0; mov %%cr3, %1"
+                     : "=r"(after_cr0), "=r"(after_cr3));
+    check(after_cr0 == cr0 && after_cr3 == cr3 && guest_runs == 0 &&
+              *(volatile uint64_t *)0x400000 == 0x484f5354,
+          254);
+}
+#endif
+
 void
 paging_test(void)
 {
@@ -245,6 +429,8 @@ paging_test(void)
 
 #ifdef EPT_ENTRY_TEST
     test_ept_entry(cr3);
+#elif defined(VMX_TRANSITION_TEST)
+    test_vmx_transition(cr0, cr3, cr4, pointer);
 #else
     /* Launch once, then resume twice. Check saved RIP, exit reason and a
      * memory side effect so duplicated or skipped guest execution fails. */

@@ -1394,10 +1394,9 @@ let {{
                     dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
                     isa && isa->vmxState().controlRegisterAccessCausesExit(
                         src1, VmxCrAccessType::MovFromCr)) {
-                isa->vmxState().controlRegisterExit(
-                        xc, src1, VmxCrAccessType::MovFromCr,
+                return isa->vmxState().controlRegisterExitFault(
+                        src1, VmxCrAccessType::MovFromCr,
                         dest, 0, StaticInst::size());
-                return NoFault;
             } else {
                 RegVal controlValue = ControlSrc1;
                 if (auto *isa =
@@ -1577,10 +1576,9 @@ let {{
                 if (fault == NoFault && vmxIsa &&
                         vmxIsa->vmxState().controlRegisterAccessCausesExit(
                             dest, VmxCrAccessType::MovToCr, newVal)) {
-                    vmxIsa->vmxState().controlRegisterExit(
-                            xc, dest, VmxCrAccessType::MovToCr,
+                    return vmxIsa->vmxState().controlRegisterExitFault(
+                            dest, VmxCrAccessType::MovToCr,
                             src1, newVal, StaticInst::size());
-                    return NoFault;
                 }
 
                 // Fault-like control-register writes leave architectural
