@@ -402,7 +402,7 @@ class VmxState
     Fault msrExitFault(bool read, uint32_t msr) const;
 
     void serialize(CheckpointOut &cp) const;
-    void unserialize(CheckpointIn &cp);
+    void unserialize(CheckpointIn &cp, unsigned physical_bits);
 };
 
 } // namespace X86ISA

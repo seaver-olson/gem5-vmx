@@ -59,8 +59,7 @@ TEST(VmxControls, FixedBitValidation)
             0b1000));
 }
 
-// With PCID unavailable, IA-32e and legacy non-PAE CR3 permit only PWT/PCD
-// below bit 12. Addresses at or above the advertised physical width fail.
+// IA-32e accepts ignored low bits; legacy non-PAE keeps its separate rules.
 TEST(VmxCr3, Ia32eAndLegacyReservedBits)
 {
     uint64_t cr4 = 0;
@@ -71,7 +70,23 @@ TEST(VmxCr3, Ia32eAndLegacyReservedBits)
 
     cr4 |= 1ull << 5;
     EXPECT_TRUE(vmx::validCr3(0x12345018, cr4, true, 48));
-    EXPECT_FALSE(vmx::validCr3(0x12345001, cr4, true, 48));
+    EXPECT_TRUE(vmx::validCr3(0x12345001, cr4, true, 48));
+}
+
+TEST(VmxCr3, Ia32eIgnoredBitsAndConfiguredWidth)
+{
+    for (unsigned width : {32, 40, 48, 52}) {
+        for (uint64_t low = 0; low < 4096; ++low) {
+            EXPECT_TRUE(vmx::validCr3(0x12345000 | low, 1u << 5, true, width));
+        }
+        EXPECT_TRUE(
+            vmx::validCr3((1ull << width) - 4096, 1u << 5, true, width));
+        for (unsigned bit = width; bit < 64; ++bit) {
+            EXPECT_FALSE(vmx::validCr3(1ull << bit, 1u << 5, true, width));
+        }
+    }
+    EXPECT_TRUE(vmx::validCr3(1ull << 48, 1u << 5, true, 52));
+    EXPECT_FALSE(vmx::validCr3(1ull << 44, 1u << 5, true, 40));
 }
 
 // Legacy PAE loads four PDPTEs from a 32-byte-aligned CR3 base.

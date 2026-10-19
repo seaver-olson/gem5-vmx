@@ -4,6 +4,7 @@
 /ept_entry.elf
 /vmx_transition.elf
 /vmx_nmi.elf
+/vmx_address.elf
 /legacy.elf
 /pae.elf
 /gdb.elf

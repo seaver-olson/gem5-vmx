@@ -200,9 +200,9 @@ inline bool
 validCr3(uint64_t value, uint64_t cr4, bool ia32e,
         unsigned physicalAddressBits)
 {
-    // PCID is deliberately not exposed by gem5-vmx. With PCIDE clear, PWT
-    // and PCD are the only defined low CR3 bits in non-PAE and IA-32e
-    // paging. Legacy PAE requires a 32-byte-aligned PDPTE base.
+    // PCID is deliberately not exposed by gem5-vmx. IA-32e with PCIDE=0
+    // ignores CR3[11:5] and [2:0]; these are not reserved-zero bits.
+    // Legacy PAE requires a 32-byte-aligned PDPTE base.
     const bool pae = bits(cr4, 5);
     const bool pcide = bits(cr4, 17);
     if (pcide) {
@@ -213,6 +213,10 @@ validCr3(uint64_t value, uint64_t cr4, bool ia32e,
         value & ~mask(5);
     if (!validPhysicalAddress(base, physicalAddressBits)) {
         return false;
+    }
+
+    if (ia32e) {
+        return true;
     }
 
     if (pae && !ia32e) {

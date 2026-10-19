@@ -725,7 +725,10 @@ Execute::issue(ThreadID thread_id)
                             /* Remember which instruction this memory op
                              *  depends on so that initiateAcc can be called
                              *  early */
-                            if (allowEarlyMemIssue) {
+                            // Non-speculative accesses must wait for older
+                            // checks/branches (e.g., a VMX region gate).
+                            if (allowEarlyMemIssue &&
+                                !inst->staticInst->isNonSpeculative()) {
                                 inst->instToWaitFor =
                                     scoreboard[thread_id].execSeqNumToWaitFor(inst,
                                         cpu.getContext(thread_id));

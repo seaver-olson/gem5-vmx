@@ -396,6 +396,120 @@ test_vmx_transition(uint64_t cr0, uint64_t cr3, uint64_t cr4, uint64_t pointer)
 }
 #endif
 
+#ifdef VMX_ADDRESS_TEST
+extern void address_guest(void), address_exit(void), address_exit2(void);
+
+static void
+address_enter(unsigned resume, void (*rip)(void), uint64_t code)
+{
+    field(0x681e, (uint64_t)rip);
+    check(enter_guest(resume) == 0, code);
+    check(read_field(0x4402) == 18, code + 1);
+}
+
+static void
+test_vmx_address(uint64_t host_cr3)
+{
+    uint32_t a = 0x80000008, b, c, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    unsigned width = a & 0xff;
+    uint64_t bad = 1ull << width;
+    uint64_t pointer = bad;
+    check((op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41) == 0x40, 500);
+    check(read_field(0x4400) == 9, 501);
+    check((op_vmclear((uint64_t)&pointer, 0, 0) & 0x41) == 0x40, 502);
+    check(read_field(0x4400) == 2, 503);
+    check(!(op_vmxoff(0, 0, 0) & 0x41), 504);
+    check((op_vmxon((uint64_t)&pointer, 0, 0) & 0x41) == 1, 505);
+    pointer = (uint64_t)on_region;
+    check(!(op_vmxon((uint64_t)&pointer, 0, 0) & 0x41), 506);
+    pointer = (uint64_t)vmcs_region;
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 507);
+
+    const uint64_t root = host_cr3 & ~0xfffull;
+    unsigned launched = 0;
+    for (unsigned bit = 0; bit < 13; ++bit) {
+        if (bit == 3 || bit == 4) {
+            continue;
+        }
+        uint64_t low = bit == 12 ? 0xfe7 : 1ull << bit;
+        field(0x6c02, root | low);
+        field(0x6802, root | low);
+        address_enter(launched, guest_entry, 510);
+        launched = 1;
+        uint64_t live_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(live_cr3));
+        check(live_cr3 == (root | low) && read_field(0x6802) == (root | low),
+              512);
+    }
+    field(0x6c02, host_cr3);
+    field(0x6802, host_cr3);
+    uint64_t runs = guest_runs;
+    address_enter(1, address_guest, 520);
+    check(guest_runs == runs + 1 && read_field(0x6802) == (root | 1), 522);
+    check(read_field(0x681e) == (uint64_t)address_exit, 523);
+    address_enter(1, (void (*)(void))((uint64_t)address_exit + 3), 524);
+    check(guest_runs == runs + 2 && read_field(0x6802) == (root | 1), 526);
+    check(read_field(0x681e) == (uint64_t)address_exit2, 527);
+
+    field(0x6c02, root | bad);
+    check((enter_guest(1) & 0x41) == 0x40, 530);
+    check(read_field(0x4400) == 8, 531); // Early invalid host state.
+    field(0x6c02, host_cr3);
+    field(0x6802, root | bad);
+    check(enter_guest(1) == 0, 532);
+    check(read_field(0x4402) == ((1ull << 31) | 33),
+          533); // Late guest failure.
+    check(guest_runs == runs + 2, 534);
+    field(0x6802, host_cr3);
+
+    if (width == 52) {
+        const uint64_t high = 1ull << 48, alias = 0x800000;
+        // Map actual high RAM into a low GVA using a legal host PDE.
+        // Every region/header/root write below is a CPU store, not a proxy.
+        uint64_t *pml4 = (uint64_t *)root;
+        uint64_t *pdpt = (uint64_t *)(pml4[0] & ~0xfffull);
+        volatile uint64_t *pd = (uint64_t *)(pdpt[0] & ~0xfffull);
+        uint64_t saved = pd[4];
+        pd[4] = high | 0x83;
+        __asm__ volatile("invlpg (%0)" ::"r"(alias) : "memory");
+        volatile uint32_t *regions = (uint32_t *)alias;
+        regions[0] = regions[1024] = (uint32_t)msr(0x480) & 0x7fffffff;
+        for (unsigned i = 0; i < 512; ++i) {
+            ((volatile uint64_t *)(alias + 0x2000))[i] = pml4[i];
+            ((volatile uint64_t *)(alias + 0x3000))[i] = pml4[i];
+        }
+        __asm__ volatile("mfence" ::: "memory");
+        pointer = high + 0x1000;
+        check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 540);
+        check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 541);
+        field(0x201a, 0x1234501e);
+        check(read_field(0x201a) == 0x1234501e, 542);
+        check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 543);
+        check(!(op_vmxoff(0, 0, 0) & 0x41), 544);
+        pointer = high;
+        check(!(op_vmxon((uint64_t)&pointer, 0, 0) & 0x41), 545);
+        pointer = (uint64_t)vmcs_region;
+        check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 546);
+        field(0x6c02, high + 0x3000);
+        field(0x6802, high + 0x2000);
+        address_enter(1, guest_entry, 550);
+        uint64_t live_cr3;
+        __asm__ volatile("mov %%cr3, %0" : "=r"(live_cr3));
+        check(live_cr3 == high + 0x3000 && read_field(0x6802) == high + 0x2000,
+              552);
+        // Root-mode checkpoint with real high VMXON/VMCS/root addresses.
+        __asm__ volatile(".byte 0x0f, 0x04; .word 0x21" ::"D"(0ull)
+                         : "memory");
+        field(0x6c02, host_cr3);
+        field(0x6802, host_cr3);
+        __asm__ volatile("mov %0, %%cr3" ::"r"(host_cr3) : "memory");
+        pd[4] = saved;
+        __asm__ volatile("invlpg (%0)" ::"r"(alias) : "memory");
+    }
+}
+#endif
+
 #ifdef VMX_NMI_TEST
 volatile uint64_t nmi_events, nmi_depth, nmi_fixed;
 static volatile uint64_t nmi_ept[6][512] __attribute__((aligned(4096)));
@@ -689,6 +803,8 @@ paging_test(void)
     test_vmx_transition(cr0, cr3, cr4, pointer);
 #elif defined(VMX_NMI_TEST)
     test_vmx_nmi(cr3);
+#elif defined(VMX_ADDRESS_TEST)
+    test_vmx_address(cr3);
 #else
     /* Launch once, then resume twice. Check saved RIP, exit reason and a
      * memory side effect so duplicated or skipped guest execution fails. */

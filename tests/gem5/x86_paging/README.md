@@ -155,6 +155,18 @@ Legal 52-bit GPAs outside a four-level EPT's range return EPT violation with
 zero permissions and no memory requests, including with A/D enabled. Separate
 `--physical-bits 52 --guest ept_entry` CPU runs check read, write and fetch
 exit delivery for GPA bits 48 through 51 on all four CPU models.
+
+The same suite runs `vmx_address` at MAXPHYADDR 32/40/48/52 on all four
+CPUs. It checks ignored CR3 low bits, MOV CR3/exit/resume, correct early
+host versus late guest failures, and reserved VMX region addresses. The
+52-bit configuration adds real high RAM: CPU stores initialize its VMX
+regions and page-table roots through a low virtual alias, then actual VMX
+instructions and host/guest walks use their high HPAs. Root-mode checkpoint
+restore preserves these addresses; narrowing MAXPHYADDR explicitly rejects
+the incompatible saved pointers. No functional-memory initialization or
+address remapper substitutes for high RAM. Minor honors non-speculative
+memory micro-ops at its early-issue boundary, so a rejected VMX pointer cannot
+issue its physical header read before the validation branch commits.
 Returned HPAs deliberately lie outside fixture RAM to verify that the walker
 does not access translated data. Additional timing cases exercise retries,
 cancellation before admission, at rejection and after issue (including a

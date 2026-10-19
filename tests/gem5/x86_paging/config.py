@@ -39,6 +39,11 @@ parser.add_argument(
     help="Advertise this MAXPHYADDR through CPUID.80000008H",
 )
 parser.add_argument(
+    "--vmx-high-memory",
+    action="store_true",
+    help="Install real RAM above bit 48 for VMX address validation",
+)
+parser.add_argument(
     "--pcid",
     action="store_true",
     help="Advertise PCID for control-register tests",
@@ -51,6 +56,7 @@ parser.add_argument(
         "ept_entry",
         "vmx_transition",
         "vmx_nmi",
+        "vmx_address",
         "paging",
         "legacy",
         "pae",
@@ -106,8 +112,14 @@ parser.add_argument(
     help="Run standalone EPT walker tests in all memory modes",
 )
 args = parser.parse_args()
+if args.vmx_high_memory and (
+    (args.physical_bits != 52 and not args.restore)
+    or args.guest != "vmx_address"
+):
+    parser.error("--vmx-high-memory requires vmx_address and 52 physical bits")
 if args.vmx_root_checkpoint and (
-    args.guest != "vmx_transition"
+    args.guest not in ("vmx_transition", "vmx_address")
+    or (args.guest == "vmx_address" and not args.vmx_high_memory)
     or args.restore
     or args.checkpoint_at
     or args.switch_to
@@ -116,7 +128,8 @@ if args.vmx_root_checkpoint and (
     or args.ept_only
 ):
     parser.error(
-        "--vmx-root-checkpoint requires a fresh vmx_transition guest "
+        "--vmx-root-checkpoint requires a fresh vmx_transition or high-memory "
+        "vmx_address guest "
         "without other checkpoint, fixture or switching options"
     )
 if args.ept_only and (
@@ -154,6 +167,11 @@ if args.no_snoop_filter:
     system.membus.snoop_filter = NULL
 system.memory = SimpleMemory(range=system.mem_ranges[0], latency="30ns")
 system.memory.port = system.membus.mem_side_ports
+if args.vmx_high_memory:
+    high_range = AddrRange(1 << 48, size="64KiB")
+    system.mem_ranges = [*system.mem_ranges, high_range]
+    system.high_memory = SimpleMemory(range=high_range, latency="30ns")
+    system.high_memory.port = system.membus.mem_side_ports
 system.system_port = system.membus.cpu_side_ports
 system.cpu = {
     "atomic": AtomicSimpleCPU,
@@ -264,7 +282,10 @@ if args.switch_to and args.guest != "pae":
     m5.switchCpus(system, [(system.cpu, system.switch_cpu)])
 # Each exit reports a test ID in its code. Zero is a complete pass.
 event = m5.simulate(10_000_000_000)
-if args.guest == "vmx_transition" and not args.restore:
+if (
+    args.guest == "vmx_transition"
+    or (args.guest == "vmx_address" and args.vmx_high_memory)
+) and not args.restore:
     if event.getCause() != "m5_exit instruction encountered":
         raise RuntimeError(
             f"Missing VMX-root marker: {event.getCause()} "

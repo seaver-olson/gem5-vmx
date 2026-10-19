@@ -273,6 +273,55 @@ def main():
             )
             for cpu in ("atomic", "timing", "minor", "o3")
         ]
+        for width in (32, 40, 48, 52):
+            for cpu in ("atomic", "timing", "minor", "o3"):
+                cases.append(
+                    (
+                        f"vmx-address-{width}-{cpu}",
+                        "config.py",
+                        [
+                            "--cpu",
+                            cpu,
+                            "--guest",
+                            "vmx_address",
+                            "--caches",
+                            "--physical-bits",
+                            str(width),
+                        ]
+                        + (["--vmx-high-memory"] if width == 52 else [])
+                        + (
+                            ["--vmx-root-checkpoint"]
+                            if width == 52 and cpu == "timing"
+                            else []
+                        ),
+                    )
+                )
+        address_checkpoint = (
+            args.outdir / "vmx-address-52-timing" / "checkpoint"
+        )
+        for width in (52, 40):
+            cases.append(
+                (
+                    (
+                        "vmx-address-restore"
+                        if width == 52
+                        else "vmx-address-narrowed-restore"
+                    ),
+                    "config.py",
+                    [
+                        "--cpu",
+                        "timing",
+                        "--guest",
+                        "vmx_address",
+                        "--caches",
+                        "--physical-bits",
+                        str(width),
+                        "--vmx-high-memory",
+                        "--restore",
+                        str(address_checkpoint),
+                    ],
+                )
+            )
         cases += [
             (
                 f"vmx-nmi-{cpu}-uncached",
@@ -359,6 +408,15 @@ def main():
                 and status != 0
                 and "unsupported raw SwapReq snoop" in diagnostic
                 and "Assertion" not in diagnostic
+            )
+            status = 0 if expected else status or 1
+        elif name == "vmx-address-narrowed-restore":
+            diagnostic = (output / "console.log").read_text()
+            expected = (
+                isinstance(status, int)
+                and status != 0
+                and "Malformed VMX checkpoint: invalid VMCS region pointer"
+                in diagnostic
             )
             status = 0 if expected else status or 1
         results.append(

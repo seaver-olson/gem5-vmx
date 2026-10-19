@@ -216,3 +216,18 @@ nmi_wrong_path:
 nmi_iret:
     iretq
 #endif
+
+#ifdef VMX_ADDRESS_TEST
+.global address_guest, address_exit, address_exit2
+address_guest:
+    incq guest_runs(%rip)
+    mov %cr3, %rax
+    or $1, %rax // Legal ignored CR3 bit, including across exit and resume.
+    mov %rax, %cr3
+address_exit:
+    vmcall
+    incq guest_runs(%rip)
+address_exit2:
+    vmcall
+    ud2
+#endif

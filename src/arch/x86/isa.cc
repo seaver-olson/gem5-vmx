@@ -748,7 +748,13 @@ ISA::unserialize(CheckpointIn &cp)
 
     {
         Serializable::ScopedCheckpointSection sec(cp, "vmx");
-        vmx.unserialize(cp);
+        CpuidResult size;
+        fatal_if(!cpuid->doCpuid(tc, 0x80000008, 0, size),
+                 "Missing physical address width CPUID");
+        const unsigned width = bits(size.rax, 7, 0);
+        fatal_if(width < 32 || width > 52,
+                 "Unsupported x86 physical address width");
+        vmx.unserialize(cp, width);
     }
 }
 
