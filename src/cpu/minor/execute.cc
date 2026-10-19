@@ -1085,7 +1085,9 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
         {
             auto &resume_pc = cpu.getContext(thread_id)->pcState();
 
-            assert(resume_pc.microPC() == 0);
+            // Suspension can occur inside microcode (for example x86 INIT's
+            // halt while waiting for SIPI). Preserve the complete resume PC;
+            // the normal ROM continuation path handles a nonzero micro-PC.
 
             DPRINTF(MinorInterrupt, "Suspending thread: %d from Execute"
                 " inst: %s\n", thread_id, *inst);

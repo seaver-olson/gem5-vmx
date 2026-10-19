@@ -273,6 +273,45 @@ def main():
             )
             for cpu in ("atomic", "timing", "minor", "o3")
         ]
+        for cpu in ("atomic", "timing", "minor", "o3"):
+            cases.append(
+                (
+                    f"vmx-migrate-{cpu}",
+                    "ruby.py",
+                    ["--cpu", cpu, "--classic", "l1", "--guest", "vmx_migrate"]
+                    + (["--vmx-root-checkpoint"] if cpu == "timing" else []),
+                )
+            )
+        migration_checkpoint = (
+            args.outdir / "vmx-migrate-timing" / "checkpoint"
+        )
+        cases.append(
+            (
+                "vmx-migrate-restore",
+                "ruby.py",
+                [
+                    "--cpu",
+                    "timing",
+                    "--classic",
+                    "l1",
+                    "--guest",
+                    "vmx_migrate",
+                    "--restore",
+                    str(migration_checkpoint),
+                ],
+            )
+        )
+        for hierarchy in ("private-l2", "shared-l2", "ruby"):
+            cases.append(
+                (
+                    f"vmx-migrate-{hierarchy}",
+                    "ruby.py",
+                    ["--cpu", "timing", "--guest", "vmx_migrate"]
+                    + (
+                        [] if hierarchy == "ruby" else ["--classic", hierarchy]
+                    ),
+                )
+            )
         for width in (32, 40, 48, 52):
             for cpu in ("atomic", "timing", "minor", "o3"):
                 cases.append(
@@ -415,8 +454,13 @@ def main():
             expected = (
                 isinstance(status, int)
                 and status != 0
-                and "Malformed VMX checkpoint: invalid VMCS region pointer"
-                in diagnostic
+                and any(
+                    message in diagnostic
+                    for message in (
+                        "Malformed VMX checkpoint: invalid VMCS region pointer",
+                        "Malformed VMX checkpoint: invalid VMXON pointer",
+                    )
+                )
             )
             status = 0 if expected else status or 1
         results.append(

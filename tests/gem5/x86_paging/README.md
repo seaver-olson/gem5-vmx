@@ -78,9 +78,27 @@ build/X86/gem5.opt --outdir=m5out-paging-ruby tests/gem5/x86_paging/ruby.py --cp
 build/X86/gem5.opt --outdir=m5out-paging-classic tests/gem5/x86_paging/ruby.py --cpu o3 --classic private-l2
 ```
 
-Ruby uses MESI Two Level and accepts `timing` or `o3`. Classic accepts all
-three CPUs and `l1`, `private-l2`, or `shared-l2`. These are single-core tests;
-they do not establish concurrent descriptor-replacement correctness.
+Ruby uses MESI Two Level; Classic accepts `l1`, `private-l2`, or `shared-l2`.
+`ruby.py` accepts `atomic`, `timing`, `minor`, and `o3` (except Atomic with
+Ruby). Ordinary paging guests remain single-core; the peer fixture and
+`vmx_migrate` guest explicitly select two cores.
+
+`ruby.py --cpu timing --classic l1 --guest vmx_migrate` starts the second CPU
+through INIT/SIPI. CPU 0 launches and clears a VMCS; CPU 1 loads the same
+physical region, checks retained fields and clear launch state, launches it,
+then clears it for migration back to CPU 0. CPU 1's VMXOFF must not release
+CPU 0's separate active VMCS. The EPT suite runs this on all four CPUs with
+Classic L1 and on Timing with private/shared L2 and MESI Two Level. Add
+`--vmx-root-checkpoint` to save between migrations, then `--restore PATH` to
+verify that both cleared and active VMCS records survive. CPU 1 quiesces
+across that checkpoint; its scheduled System wakeup must still fire on restore.
+Components are
+stored once per System; current pointers and VMX execution remain per CPU.
+The entry regression separately switches Atomic→Timing, Timing→O3 and
+O3→Atomic at its root-mode marker to check same-logical-CPU ownership.
+As before, the VMCS body is opaque simulator state accessed through VMREAD/
+VMWRITE, not a guest-readable byte layout. This does not implement ordinary
+RAM copying of opaque VMCS bodies or active-EPT checkpointing.
 
 Add `--guest legacy` to either configuration for 32-bit non-PAE/PSE positive
 translation tests: 4 KiB indexing, 4 MiB upper-half offsets, and A/D updates.

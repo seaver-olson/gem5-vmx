@@ -2,7 +2,6 @@
 #define __ARCH_X86_VMX_HH__
 
 #include <cstdint>
-#include <map>
 #include <optional>
 
 #include "arch/x86/ept.hh"
@@ -18,6 +17,7 @@
 namespace gem5
 {
 class ExecContext;
+class System;
 class ThreadContext;
 
 namespace X86ISA
@@ -253,14 +253,14 @@ class VmxState
     // The suspended-CPU fixture isolates MMU transport/lifecycle tests without
     // executing VM entry. Ordinary guests capture EPT state through vmEntry.
     friend class PagingTester;
-    using VmcsMap = std::map<Addr, Vmcs>;
     static constexpr Addr InvalidVmcsPointer = ~Addr(0);
 
     bool vmxActive = false;
     bool inVmxNonRoot = false;
     Addr vmxonRegion = 0;
     Addr currentVmcsPtr = InvalidVmcsPointer;
-    VmcsMap vmcsRegions;
+    System *system = nullptr;
+    ContextID logicalProcessor = InvalidContextID;
     std::optional<EptConfig> activeEptConfig;
     // Physical NMI blocking for the current guest. Virtual NMIs and
     // NMI-window exiting remain unsupported.
@@ -326,6 +326,12 @@ class VmxState
             VmxExitReason exitReason, uint8_t instructionSize);
 
   public:
+    void
+    attach(System *owner)
+    {
+        system = owner;
+    }
+    void reset();
     bool active() const { return vmxActive; }
     bool nonRootActive() const { return inVmxNonRoot; }
     const std::optional<EptConfig> &eptConfig() const
@@ -402,7 +408,8 @@ class VmxState
     Fault msrExitFault(bool read, uint32_t msr) const;
 
     void serialize(CheckpointOut &cp) const;
-    void unserialize(CheckpointIn &cp, unsigned physical_bits);
+    void unserialize(CheckpointIn &cp, unsigned physical_bits,
+                     ContextID processor);
 };
 
 } // namespace X86ISA

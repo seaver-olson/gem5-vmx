@@ -15,6 +15,7 @@
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
 #include "arch/x86/utility.hh"
+#include "arch/x86/vmcs_store.hh"
 #include "arch/x86/vmx_utils.hh"
 #include "base/bitfield.hh"
 #include "cpu/exec_context.hh"
@@ -2028,15 +2029,13 @@ VmxState::msrExitFault(bool read, uint32_t msr) const
 Vmcs *
 VmxState::findVmcs(Addr regionPtr)
 {
-    auto it = vmcsRegions.find(regionPtr);
-    return it == vmcsRegions.end() ? nullptr : &it->second;
+    return system ? system->getX86VmcsStore().find(regionPtr) : nullptr;
 }
 
 const Vmcs *
 VmxState::findVmcs(Addr regionPtr) const
 {
-    auto it = vmcsRegions.find(regionPtr);
-    return it == vmcsRegions.end() ? nullptr : &it->second;
+    return system ? system->getX86VmcsStore().find(regionPtr) : nullptr;
 }
 
 Vmcs *
@@ -2154,9 +2153,8 @@ VmxState::completeOperand(ExecContext *xc, VmxExitReason operation,
                 VmxInstructionError::VmclearWithVmxonPointer);
         if (currentVmcsPtr == value)
             currentVmcsPtr = InvalidVmcsPointer;
-        auto [it, inserted] = vmcsRegions.try_emplace(value, value, vmcsRevisionId(tc));
-        if (!inserted)
-            it->second.clear();
+        system->getX86VmcsStore().clear(value, vmcsRevisionId(tc),
+                                        logicalProcessor);
         return VmxResult::success();
     }
     const bool validHeader = bits(header, 30, 0) == vmcsRevisionId(tc) &&
@@ -2165,6 +2163,7 @@ VmxState::completeOperand(ExecContext *xc, VmxExitReason operation,
         if (!validHeader)
             return VmxResult::failInvalid();
         vmxActive = true;
+        logicalProcessor = tc->contextId();
         inVmxNonRoot = false;
         vmxonRegion = value;
         currentVmcsPtr = InvalidVmcsPointer;
@@ -2172,8 +2171,8 @@ VmxState::completeOperand(ExecContext *xc, VmxExitReason operation,
         if (!validHeader)
             return vmFailIfCurrent(currentVmcs(),
                 VmxInstructionError::VmptrldIncorrectVmcsRevision);
-        auto it = vmcsRegions.try_emplace(value, value, vmcsRevisionId(tc)).first;
-        it->second.setActive(true);
+        system->getX86VmcsStore().activate(value, vmcsRevisionId(tc),
+                                           logicalProcessor);
         currentVmcsPtr = value;
     } else {
         panic("Unexpected VMX operand commit operation");
@@ -2189,9 +2188,7 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
         return *result;
     }
 
-    for (auto &entry : vmcsRegions) {
-        entry.second.setActive(false);
-    }
+    system->getX86VmcsStore().release(logicalProcessor);
     vmxActive = false;
     inVmxNonRoot = false;
     activeEptConfig.reset();
@@ -2330,16 +2327,25 @@ VmxState::vmwrite(ExecContext *xc, Vmcs::RawEncoding rawEncoding,
 }
 
 void
+VmxState::reset()
+{
+    System *owner = system;
+    if (owner && logicalProcessor != InvalidContextID) {
+        owner->getX86VmcsStore().release(logicalProcessor);
+    }
+    *this = VmxState{};
+    attach(owner);
+}
+
+void
 VmxState::serialize(CheckpointOut &cp) const
 {
     panic_if(activeEptConfig,
              "Checkpointing an active EPT guest is not implemented");
-    size_t numVmcsRegions = vmcsRegions.size();
     SERIALIZE_SCALAR(vmxActive);
     SERIALIZE_SCALAR(inVmxNonRoot);
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
-    SERIALIZE_SCALAR(numVmcsRegions);
     SERIALIZE_SCALAR(guestNmiBlocked);
     paramOut(cp, "guestIretActive", guestIret.has_value());
     if (guestIret) {
@@ -2349,18 +2355,13 @@ VmxState::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(guestStiShadow);
     SERIALIZE_SCALAR(guestMovSsShadow);
     SERIALIZE_SCALAR(guestShadowRip);
-    // Serialize each VMCS region with a unique section name.
-    size_t index = 0;
-    for (const auto &[regionPtr, vmcs] : vmcsRegions) {
-        Serializable::ScopedCheckpointSection sec(
-                cp, "vmcsRegion" + std::to_string(index++));
-        vmcs.serialize(cp);
-    }
 }
 
 void
-VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits)
+VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits,
+                      ContextID processor)
 {
+    logicalProcessor = processor;
     activeEptConfig.reset();
     guestIret.reset();
     // If VMX is inactive, ignore any stale serialized VMX state.
@@ -2369,7 +2370,6 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits)
         inVmxNonRoot = false;
         vmxonRegion = 0;
         currentVmcsPtr = InvalidVmcsPointer;
-        vmcsRegions.clear();
         return;
     }
 
@@ -2379,7 +2379,7 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits)
     }
     UNSERIALIZE_SCALAR(vmxonRegion);
     UNSERIALIZE_SCALAR(currentVmcsPtr);
-    UNSERIALIZE_SCALAR(numVmcsRegions);
+    optParamIn(cp, "numVmcsRegions", numVmcsRegions, false);
     if (!UNSERIALIZE_OPT_SCALAR(guestNmiBlocked)) {
         guestNmiBlocked = false;
     }
@@ -2403,21 +2403,16 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits)
         guestShadowRip = 0;
     }
 
-    vmcsRegions.clear();
     for (size_t index = 0; index < numVmcsRegions; ++index) {
         Serializable::ScopedCheckpointSection sec(
                 cp, "vmcsRegion" + std::to_string(index));
         Vmcs vmcs;
         vmcs.unserialize(cp);
-        const auto [it, inserted] =
-            vmcsRegions.emplace(vmcs.pointer(), std::move(vmcs));
-        panic_if(!validAlignedPhysicalAddress(it->first, Vmcs::VmcsRegionSize,
-                                              physical_bits),
+        panic_if(!validAlignedPhysicalAddress(
+                     vmcs.pointer(), Vmcs::VmcsRegionSize, physical_bits),
                  "Malformed VMX checkpoint: invalid VMCS region pointer %#x",
-                 it->first);
-        panic_if(!inserted,
-                "Malformed VMX checkpoint: duplicate VMCS pointer %#x",
-                it->first);
+                 vmcs.pointer());
+        system->getX86VmcsStore().restoreRegion(std::move(vmcs), processor);
     }
 
     panic_if(inVmxNonRoot && !vmxActive,
@@ -2427,10 +2422,14 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits)
              "Malformed VMX checkpoint: invalid VMXON pointer %#x",
              vmxonRegion);
     Vmcs *current = currentVmcs();
-    panic_if(currentVmcsPtr != InvalidVmcsPointer &&
-            (!vmxActive || !current || !current->active()),
-            "Malformed VMX checkpoint: invalid current VMCS pointer %#x",
-            currentVmcsPtr);
+    panic_if(
+        currentVmcsPtr != InvalidVmcsPointer &&
+            (!vmxActive || !current || !current->active() ||
+             !system->getX86VmcsStore().ownedBy(currentVmcsPtr, processor) ||
+             !validAlignedPhysicalAddress(currentVmcsPtr, PageBytes,
+                                          physical_bits)),
+        "Malformed VMX checkpoint: invalid current VMCS pointer %#x",
+        currentVmcsPtr);
     panic_if(inVmxNonRoot && !current,
             "Malformed VMX checkpoint: non-root state without current VMCS");
 }

@@ -55,6 +55,106 @@ controls(uint32_t reg, uint32_t wanted)
     return (wanted | (uint32_t)allowed) & (allowed >> 32);
 }
 
+#ifdef VMX_MIGRATE_TEST
+static uint32_t ap_on[1024] __attribute__((aligned(4096)));
+static uint32_t bsp_vmcs[1024] __attribute__((aligned(4096)));
+uint8_t ap_stack[8192] __attribute__((aligned(16)));
+static volatile unsigned migration_done;
+extern uint8_t ap_boot[], ap_boot_end[], ap_gdtr[], ap_root[];
+
+static void
+migration_entry(unsigned runs, uint64_t eptp)
+{
+    check(read_field(0x201a) == eptp, 600);
+    check(read_field(0x681e) == (uint64_t)guest_entry, 601);
+    check((op_vmresume(0, 0, 0) & 0x41) == 0x40, 602);
+    check(read_field(0x4400) == 5, 603); // VMCLEAR reset launch state.
+    check(enter_guest(0) == 0 && guest_runs == runs, 604);
+    check(read_field(0x4402) == 18 &&
+              read_field(0x681e) == (uint64_t)guest_exit,
+          605);
+    field(0x681e, (uint64_t)guest_entry);
+}
+
+void
+migration_ap(void)
+{
+    struct __attribute__((packed))
+    {
+        uint16_t limit;
+        uint64_t base;
+    } idtr = {sizeof(idt) - 1, (uint64_t)idt};
+    __asm__ volatile("lidt %0" ::"m"(idtr) : "memory");
+    uint64_t cr0, cr4;
+    __asm__ volatile("mov %%cr0, %0; mov %%cr4, %1" : "=r"(cr0), "=r"(cr4));
+    cr0 = (cr0 | msr(0x486)) & msr(0x487);
+    cr4 = (cr4 | msr(0x488) | (1ull << 13)) & msr(0x489);
+    __asm__ volatile("mov %0, %%cr0; mov %1, %%cr4" ::"r"(cr0), "r"(cr4)
+                     : "memory");
+    uint64_t pointer = (uint64_t)ap_on;
+    check(!(op_vmxon((uint64_t)&pointer, 0, 0) & 0x41), 606);
+    pointer = (uint64_t)vmcs_region;
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 607);
+    migration_entry(2, 0x1234501e);
+    field(0x201a, 0x2345601e);
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 608);
+    check(!(op_vmxoff(0, 0, 0) & 0x41), 609);
+    __asm__ volatile("mfence" ::: "memory");
+    migration_done = 1;
+    // Leave a real System wakeup event pending across the BSP's checkpoint.
+    __asm__ volatile(".byte 0x0f, 0x04; .word 0x02" ::"D"(50000ull)
+                     : "memory");
+    migration_done = 2;
+}
+
+static void
+test_vmx_migrate(uint64_t cr3, uint64_t gdt)
+{
+    field(0x201a, 0x1234501e); // Opaque component; EPT stays disabled.
+    check(enter_guest(0) == 0 && guest_runs == 1, 610);
+    field(0x681e, (uint64_t)guest_entry);
+    uint64_t pointer = (uint64_t)vmcs_region;
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 611);
+    // CPU 1's VMXOFF must not deactivate CPU 0's separate current VMCS.
+    bsp_vmcs[0] = ap_on[0] = on_region[0];
+    pointer = (uint64_t)bsp_vmcs;
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 612);
+    field(0x681e, 0xfeedface);
+
+    check(ap_boot_end - ap_boot < 4096, 613);
+    volatile uint8_t *boot = (volatile uint8_t *)0x8000;
+    for (unsigned i = 0; i < (unsigned)(ap_boot_end - ap_boot); ++i) {
+        boot[i] = ap_boot[i];
+    }
+    *(volatile uint64_t *)(gdt + 40) = 0x00cf9b000000ffff;
+    *(volatile uint32_t *)(boot + (ap_gdtr - ap_boot) + 2) = gdt;
+    *(volatile uint32_t *)(boot + (ap_root - ap_boot)) = cr3;
+    __asm__ volatile("mfence" ::: "memory");
+    volatile uint32_t *apic = (volatile uint32_t *)0xfee00000;
+    apic[0x310 / 4] = 1u << 24;
+    apic[0x300 / 4] = 0xc500; // INIT, asserted, physical destination 1.
+    while (apic[0x300 / 4] & (1u << 12)) {}
+    apic[0x300 / 4] = 0x608; // SIPI vector 8 -> physical 0x8000.
+    for (unsigned i = 0; !migration_done && i < 1000000; ++i) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+    check(migration_done, 614);
+    __asm__ volatile("mfence" ::: "memory");
+    check(read_field(0x681e) == 0xfeedface, 615);
+    // Checkpoint while root-mode: the shared cleared VMCS is not current
+    // on either CPU, but its components must still survive restoration.
+    __asm__ volatile(".byte 0x0f, 0x04; .word 0x21" ::"D"(0ull) : "memory");
+    pointer = (uint64_t)vmcs_region;
+    check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 616);
+    migration_entry(3, 0x2345601e);
+    check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 617);
+    for (unsigned i = 0; migration_done != 2 && i < 1000000; ++i) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+    check(migration_done == 2, 618);
+}
+#endif
+
 #ifdef EPT_ENTRY_TEST
 static volatile uint64_t guest_tables[4][512] __attribute__((aligned(4096)));
 static volatile uint64_t ept_tables[6][512] __attribute__((aligned(4096)));
@@ -805,6 +905,8 @@ paging_test(void)
     test_vmx_nmi(cr3);
 #elif defined(VMX_ADDRESS_TEST)
     test_vmx_address(cr3);
+#elif defined(VMX_MIGRATE_TEST)
+    test_vmx_migrate(cr3, gdtr.base);
 #else
     /* Launch once, then resume twice. Check saved RIP, exit reason and a
      * memory side effect so duplicated or skipped guest execution fails. */

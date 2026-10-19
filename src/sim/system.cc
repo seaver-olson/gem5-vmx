@@ -49,6 +49,7 @@
 #include "base/loader/symtab.hh"
 #include "base/str.hh"
 #include "base/trace.hh"
+#include "config/use_x86_isa.hh"
 #include "cpu/base.hh"
 #include "cpu/thread_context.hh"
 #include "debug/Loader.hh"
@@ -61,6 +62,11 @@
 #include "sim/debug.hh"
 #include "sim/redirect_path.hh"
 #include "sim/serialize_handlers.hh"
+
+#if USE_X86_ISA
+#include "arch/x86/vmcs_store.hh"
+
+#endif
 
 namespace gem5
 {
@@ -340,6 +346,9 @@ System::getDeviceMemory(const PacketPtr& pkt) const
 void
 System::serialize(CheckpointOut &cp) const
 {
+#if USE_X86_ISA
+    paramOut(cp, "hasX86Vmcs", bool(x86Vmcs));
+#endif
     for (auto &t: threads.threads) {
         Tick when = 0;
         if (t.resumeEvent && t.resumeEvent->scheduled())
@@ -347,6 +356,15 @@ System::serialize(CheckpointOut &cp) const
         ContextID id = t.context->contextId();
         paramOut(cp, csprintf("quiesceEndTick_%d", id), when);
     }
+
+#if USE_X86_ISA
+    // Write child sections only after all of this System's scalar fields.
+    // Popping a ScopedCheckpointSection does not emit a parent INI heading.
+    if (x86Vmcs) {
+        Serializable::ScopedCheckpointSection sec(cp, "x86Vmcs");
+        x86Vmcs->serialize(cp);
+    }
+#endif
 
     // also serialize the memories in the system
     physmem.serializeSection(cp, "physmem");
@@ -356,6 +374,14 @@ System::serialize(CheckpointOut &cp) const
 void
 System::unserialize(CheckpointIn &cp)
 {
+#if USE_X86_ISA
+    bool has_vmcs = false;
+    optParamIn(cp, "hasX86Vmcs", has_vmcs, false);
+    if (has_vmcs) {
+        Serializable::ScopedCheckpointSection sec(cp, "x86Vmcs");
+        getX86VmcsStore().unserialize(cp, threads.size());
+    }
+#endif
     for (auto &t: threads.threads) {
         Tick when = 0;
         ContextID id = t.context->contextId();
@@ -369,6 +395,17 @@ System::unserialize(CheckpointIn &cp)
     // also unserialize the memories in the system
     physmem.unserializeSection(cp, "physmem");
 }
+
+#if USE_X86_ISA
+X86ISA::VmcsStore &
+System::getX86VmcsStore()
+{
+    if (!x86Vmcs) {
+        x86Vmcs = std::make_shared<X86ISA::VmcsStore>();
+    }
+    return *x86Vmcs;
+}
+#endif
 
 void
 System::regStats()

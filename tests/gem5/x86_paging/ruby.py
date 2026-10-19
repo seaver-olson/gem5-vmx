@@ -1,6 +1,7 @@
 """Disk-free guest-paging test under timing Ruby MESI Two Level."""
 
 import argparse
+import configparser
 from pathlib import Path
 
 import m5
@@ -17,7 +18,7 @@ from gem5.isas import ISA
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
-    "--cpu", choices=["atomic", "timing", "o3"], default="timing"
+    "--cpu", choices=["atomic", "timing", "minor", "o3"], default="timing"
 )
 parser.add_argument("--classic", choices=["l1", "private-l2", "shared-l2"])
 parser.add_argument(
@@ -29,6 +30,7 @@ parser.add_argument(
         "pae",
         "ept_entry",
         "vmx_nmi",
+        "vmx_migrate",
     ],
     default="paging",
 )
@@ -44,7 +46,11 @@ parser.add_argument(
     help="Include shared transport and lifecycle fixture cases",
 )
 parser.add_argument("--ept-only", action="store_true")
+parser.add_argument("--restore", type=Path)
+parser.add_argument("--vmx-root-checkpoint", action="store_true")
 args = parser.parse_args()
+if args.vmx_root_checkpoint and args.guest != "vmx_migrate":
+    parser.error("--vmx-root-checkpoint requires --guest vmx_migrate")
 args.fixture |= args.transport
 args.fixture |= args.fixture_peers
 args.fixture |= args.ept_only
@@ -87,10 +93,13 @@ board = X86Board(
         cpu_type={
             "atomic": CPUTypes.ATOMIC,
             "timing": CPUTypes.TIMING,
+            "minor": CPUTypes.MINOR,
             "o3": CPUTypes.O3,
         }[args.cpu],
         isa=ISA.X86,
-        num_cores=2 if args.fixture_peers else 1,
+        num_cores=(
+            2 if args.fixture_peers or args.guest == "vmx_migrate" else 1
+        ),
     ),
     memory=SingleChannelDDR3_1600(size="64MiB"),
     cache_hierarchy=hierarchy,
@@ -108,7 +117,7 @@ input_file.write_bytes(bytes.fromhex("0011223344556677"))
 board.readfile = str(input_file)
 root = board._pre_instantiate()
 if args.fixture:
-    if args.cpu == "o3":
+    if args.cpu not in ("atomic", "timing"):
         parser.error("The direct fixture uses an atomic or timing context")
     from m5.objects import X86PagingTester
 
@@ -119,8 +128,22 @@ if args.fixture:
     cpu.mmu.dtb.walker.port.splice(
         board.paging_tester.cpu_side, board.paging_tester.mem_side
     )
-m5.instantiate()
+m5.instantiate(str(args.restore) if args.restore else None)
 event = m5.simulate(10_000_000_000)
+if args.guest == "vmx_migrate" and not args.restore:
+    if event.getCause() != "m5_exit instruction encountered":
+        raise RuntimeError(
+            f"Missing VMCS migration marker: {event.getCause()} "
+            f"code={event.getCode()}"
+        )
+    if args.vmx_root_checkpoint:
+        checkpoint = Path(m5.options.outdir) / "checkpoint"
+        m5.checkpoint(str(checkpoint))
+        state = configparser.ConfigParser(interpolation=None)
+        state.read(checkpoint / "m5.cpt")
+        if state.getint("board", "quiesceEndTick_1") <= m5.curTick():
+            raise RuntimeError("CPU 1's System wakeup was not checkpointed")
+    event = m5.simulate(10_000_000_000)
 if (
     args.guest == "pae"
     and event.getCause() == "m5_exit instruction encountered"

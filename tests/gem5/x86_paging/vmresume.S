@@ -36,6 +36,57 @@ guest_exit:
     vmcall
     ud2
 
+#ifdef VMX_MIGRATE_TEST
+// A real INIT/SIPI starts CPU 1 here, not at a copied ThreadContext.
+// The BSP copies this position-independent bootstrap to physical 0x8000.
+.code16
+.global ap_boot, ap_boot_end, ap_gdtr, ap_root
+ap_boot:
+    cli
+    xor %ax, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    lgdtl (0x8000 + ap_gdtr - ap_boot)
+    mov %cr0, %eax
+    or $1, %eax
+    mov %eax, %cr0
+    ljmpl $40, $(0x8000 + ap_protected - ap_boot)
+.code32
+ap_protected:
+    mov $16, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %ss
+    mov (0x8000 + ap_root - ap_boot), %eax
+    mov %eax, %cr3
+    mov %cr4, %eax
+    or $0x2020, %eax
+    mov %eax, %cr4
+    mov $0xc0000080, %ecx
+    rdmsr
+    or $0x100, %eax
+    wrmsr
+    mov %cr0, %eax
+    or $0x80000021, %eax
+    mov %eax, %cr0
+    ljmp $8, $(0x8000 + ap_long - ap_boot)
+.code64
+ap_long:
+    movabs $(ap_stack + 8192), %rsp
+    movabs $migration_ap, %rax
+    call *%rax
+1:  hlt
+    jmp 1b
+.balign 8
+ap_gdtr:
+    .word 47
+    .long 0
+ap_root:
+    .long 0
+ap_boot_end:
+#endif
+
 // Normalize the exception frame, record the injected payload, then exit.
 // No callee-saved registers are changed across enter_guest.
 .global injected_ud, injected_gp, injected_exit

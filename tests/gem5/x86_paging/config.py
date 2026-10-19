@@ -275,7 +275,7 @@ if args.checkpoint_at:
             f"Unexpected pre-checkpoint exit: {event.getCause()}"
         )
     m5.checkpoint(str(Path(m5.options.outdir) / "checkpoint"))
-if args.switch_to and args.guest != "pae":
+if args.switch_to and args.guest not in ("pae", "vmx_transition"):
     event = m5.simulate(args.switch_at)
     if event.getCause() != "simulate() limit reached":
         raise RuntimeError(f"Unexpected pre-switch exit: {event.getCause()}")
@@ -294,6 +294,8 @@ if (
     print("VMX ROOT MARKER: current VMCS and guest RIP set")
     if args.vmx_root_checkpoint:
         m5.checkpoint(str(Path(m5.options.outdir) / "checkpoint"))
+    if args.switch_to and args.guest == "vmx_transition":
+        m5.switchCpus(system, [(system.cpu, system.switch_cpu)])
     event = m5.simulate(10_000_000_000)
 if (
     args.guest == "pae"

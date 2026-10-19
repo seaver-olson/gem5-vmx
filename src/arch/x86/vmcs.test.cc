@@ -26,6 +26,8 @@
 #include <gtest/gtest.h>
 
 #include "arch/x86/vmcs.hh"
+#include "arch/x86/vmcs_store.hh"
+#include "base/gtest/logging.hh"
 
 namespace gem5
 {
@@ -37,6 +39,67 @@ namespace
 using Field = Vmcs::Field;
 using FieldWidth = Vmcs::FieldWidth;
 using FieldType = Vmcs::VmcsFieldType;
+
+TEST(VmcsStore, ClearPreservesComponentsForAnotherProcessor)
+{
+    VmcsStore store;
+    store.activate(0x4000, 1, 0);
+    auto *vmcs = store.find(0x4000);
+    ASSERT_NE(vmcs, nullptr);
+    ASSERT_TRUE(vmcs->write(Field::GuestRip, 0x12345678));
+    ASSERT_TRUE(vmcs->write(Field::EptPointer, 0xabcdef001e));
+    vmcs->writeUnchecked(Field::VmExitReason, 18);
+    vmcs->setLaunched(true);
+
+    store.clear(0x4000, 1, 0);
+    EXPECT_FALSE(store.ownedBy(0x4000, 0));
+    EXPECT_FALSE(vmcs->active());
+    EXPECT_FALSE(vmcs->launched());
+    store.activate(0x4000, 1, 1);
+    EXPECT_EQ(store.find(0x4000), vmcs);
+    EXPECT_TRUE(store.ownedBy(0x4000, 1));
+    uint64_t value;
+    ASSERT_TRUE(vmcs->read(Field::GuestRip, value));
+    EXPECT_EQ(value, 0x12345678);
+    ASSERT_TRUE(vmcs->read(Field::EptPointer, value));
+    EXPECT_EQ(value, 0xabcdef001e);
+    ASSERT_TRUE(vmcs->read(Field::VmExitReason, value));
+    EXPECT_EQ(value, 18);
+}
+
+TEST(VmcsStore, ReleaseOnlyAffectsTheOwningProcessor)
+{
+    VmcsStore store;
+    store.activate(0x4000, 1, 0);
+    store.activate(0x8000, 1, 1);
+    store.find(0x4000)->setLaunched(true);
+    store.release(1);
+    EXPECT_TRUE(store.ownedBy(0x4000, 0));
+    EXPECT_TRUE(store.find(0x4000)->active());
+    EXPECT_TRUE(store.find(0x4000)->launched());
+    EXPECT_FALSE(store.find(0x8000)->active());
+    EXPECT_FALSE(store.ownedBy(0x8000, 1));
+}
+
+TEST(VmcsStore, SeparateSystemsDoNotShareRegions)
+{
+    VmcsStore first, second;
+    first.activate(0x4000, 1, 0);
+    EXPECT_EQ(second.find(0x4000), nullptr);
+    second.activate(0x4000, 1, 0);
+    EXPECT_NE(first.find(0x4000), second.find(0x4000));
+}
+
+TEST(VmcsStore, ConcurrentActivationIsDiagnosedNotVmfail)
+{
+    VmcsStore store;
+    store.activate(0x4000, 1, 0);
+    EXPECT_THROW(store.activate(0x4000, 1, 1), GTestException);
+    EXPECT_THROW(store.clear(0x4000, 1, 1), GTestException);
+    EXPECT_NE(gtestLogOutput.str().find("VMCLEAR it there"),
+              std::string::npos);
+    EXPECT_TRUE(store.ownedBy(0x4000, 0));
+}
 
 // Intel SDM Vol. 3C, Section 25.11.2: width and type are encoded in
 // component bits 14:13 and 11:10, while bit 0 selects high access.

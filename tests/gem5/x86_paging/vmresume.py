@@ -220,6 +220,37 @@ def main():
             )
         print(f"{output.name}: PASS (VMX transitions and root state)")
 
+    # CPU-model takeover is distinct from interprocessor VMCS migration:
+    # preserve the same logical owner's active VMCS at the root marker.
+    for source, target in (
+        ("atomic", "timing"),
+        ("timing", "o3"),
+        ("o3", "atomic"),
+    ):
+        output = args.outdir / f"transition-switch-{source}-{target}"
+        output.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(args.gem5),
+            f"--outdir={output}",
+            str(suite / "config.py"),
+            "--guest",
+            "vmx_transition",
+            "--cpu",
+            source,
+            "--caches",
+            "--switch-to",
+            target,
+        ]
+        with (output / "console.log").open("w") as log:
+            subprocess.run(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                check=True,
+                timeout=120,
+            )
+        print(f"{output.name}: PASS (same logical VMCS owner)")
+
 
 if __name__ == "__main__":
     main()

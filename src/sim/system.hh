@@ -42,6 +42,7 @@
 #ifndef __SYSTEM_HH__
 #define __SYSTEM_HH__
 
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -70,10 +71,17 @@ namespace gem5
 class BaseRemoteGDB;
 class KvmVM;
 class ThreadContext;
+namespace X86ISA
+{
+class VmcsStore;
+}
 
 class System : public SimObject, public PCEventScope
 {
   private:
+    // Sole owner. shared_ptr permits an incomplete x86 type in non-x86
+    // builds without adding ISA headers to this widely included interface.
+    std::shared_ptr<X86ISA::VmcsStore> x86Vmcs;
 
     /**
      * Private class for the system port which is only used as a
@@ -572,6 +580,8 @@ class System : public SimObject, public PCEventScope
 
     void registerThreadContext(ThreadContext *tc);
     void replaceThreadContext(ThreadContext *tc, ContextID context_id);
+
+    X86ISA::VmcsStore &getX86VmcsStore();
 
     void serialize(CheckpointOut &cp) const override;
     void unserialize(CheckpointIn &cp) override;

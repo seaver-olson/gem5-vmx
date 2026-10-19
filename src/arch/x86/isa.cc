@@ -143,7 +143,7 @@ ISA::clear()
     // per-logical-processor state and are reset along with the rest of the
     // architectural state.  Keeping a stale current VMCS across reset would
     // allow VMREAD/VMWRITE after the processor has left VMX operation.
-    vmx = VmxState{};
+    vmx.reset();
     paePdpteRegs.fill(0);
     endEventDelivery();
 
@@ -330,11 +330,15 @@ ISA::copyRegsFrom(ThreadContext *src)
         tc->setReg(id, src->getReg(id));
     copyMiscRegs(src, tc);
     // CPU model switching moves the logical processor, not merely its
-    // general registers.  Preserve VMXON/non-root state, current VMCS, launch
-    // state, and the implementation-specific VMCS field representation.
+    // general registers. Preserve VMXON/non-root state, current VMCS and its
+    // logical owner; VMCS components stay in the original System's store.
     auto *src_isa = dynamic_cast<ISA *>(src->getIsaPtr());
     panic_if(!src_isa, "Cannot copy x86 VMX state from a non-x86 ISA");
+    panic_if(src_isa->vmxState().active() &&
+                 src->getSystemPtr() != tc->getSystemPtr(),
+             "Cannot transfer active VMX state between simulated systems");
     vmx = src_isa->vmxState();
+    vmx.attach(tc->getSystemPtr());
     paePdpteRegs = src_isa->paePdpte();
     delivery = src_isa->delivery;
     tc->pcState(src->pcState());
@@ -754,7 +758,7 @@ ISA::unserialize(CheckpointIn &cp)
         const unsigned width = bits(size.rax, 7, 0);
         fatal_if(width < 32 || width > 52,
                  "Unsupported x86 physical address width");
-        vmx.unserialize(cp, width);
+        vmx.unserialize(cp, width, tc->contextId());
     }
 }
 
@@ -762,6 +766,7 @@ void
 ISA::setThreadContext(ThreadContext *_tc)
 {
     BaseISA::setThreadContext(_tc);
+    vmx.attach(tc->getSystemPtr());
     tc->getDecoderPtr()->as<Decoder>().setM5Reg(regVal[misc_reg::M5Reg]);
 }
 
