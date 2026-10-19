@@ -249,6 +249,72 @@ def main():
             )
             for cpu in ("atomic", "timing", "minor", "o3")
         ]
+        cases += [
+            (
+                f"vmx-nmi-{cpu}",
+                "config.py",
+                ["--cpu", cpu, "--guest", "vmx_nmi", "--caches"],
+            )
+            for cpu in ("atomic", "timing", "minor", "o3")
+        ]
+        cases += [
+            (
+                f"vmx-nmi-{cpu}-uncached",
+                "config.py",
+                ["--cpu", cpu, "--guest", "vmx_nmi"],
+            )
+            for cpu in ("atomic", "timing")
+        ]
+        for hierarchy in ("l1", "private-l2", "shared-l2", "ruby"):
+            cases.append(
+                (
+                    f"ept-peers-{hierarchy}",
+                    "ruby.py",
+                    ["--cpu", "timing", "--ept-only", "--fixture-peers"]
+                    + (
+                        [] if hierarchy == "ruby" else ["--classic", hierarchy]
+                    ),
+                )
+            )
+            for guest in ("ept_entry", "vmx_nmi"):
+                cases.append(
+                    (
+                        f"{guest}-{hierarchy}",
+                        "ruby.py",
+                        ["--cpu", "timing", "--guest", guest]
+                        + (
+                            []
+                            if hierarchy == "ruby"
+                            else ["--classic", hierarchy]
+                        ),
+                    )
+                )
+        for guest in ("ept_entry", "vmx_nmi"):
+            cases.append(
+                (
+                    f"{guest}-ruby-o3",
+                    "ruby.py",
+                    ["--cpu", "o3", "--guest", guest],
+                )
+            )
+        # An unsupported topology is a diagnostic test, never a guest pass.
+        for cpu in ("atomic", "timing", "minor", "o3"):
+            for broadcast in (False, True):
+                cases.append(
+                    (
+                        f"raw-swap-{cpu}-{int(broadcast)}",
+                        "config.py",
+                        [
+                            "--cpu",
+                            cpu,
+                            "--guest",
+                            "ept_entry",
+                            "--caches",
+                            "--direct-walker",
+                        ]
+                        + (["--no-snoop-filter"] if broadcast else []),
+                    )
+                )
     for name, script, options in cases:
         output = args.outdir / name
         output.mkdir(parents=True, exist_ok=True)
@@ -269,10 +335,21 @@ def main():
                 ).returncode
             except subprocess.TimeoutExpired:
                 status = "timeout"
+        process_status = status
+        if name.startswith("raw-swap-"):
+            diagnostic = (output / "console.log").read_text()
+            expected = (
+                isinstance(status, int)
+                and status != 0
+                and "unsupported raw SwapReq snoop" in diagnostic
+                and "Assertion" not in diagnostic
+            )
+            status = 0 if expected else status or 1
         results.append(
             {
                 "case": name,
                 "status": status,
+                "process_status": process_status,
                 "command": command,
                 "seconds": round(time.monotonic() - start, 3),
             }

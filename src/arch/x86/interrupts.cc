@@ -662,32 +662,43 @@ X86ISA::Interrupts::Interrupts(const Params &p)
     regs[APIC_VERSION] = (5 << 16) | 0x14;
 }
 
+X86ISA::Interrupts::Unmaskable
+X86ISA::Interrupts::eligibleUnmaskable() const
+{
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    const bool nmi_blocked = isa && isa->vmxState().nonRootActive() &&
+                             isa->vmxState().interruptShadowBlocksNmi(tc);
+    if (pendingSmi) {
+        return Unmaskable::Smi;
+    }
+    if (pendingNmi && !nmi_blocked) {
+        return Unmaskable::Nmi;
+    }
+    if (pendingInit) {
+        return Unmaskable::Init;
+    }
+    if (pendingStartup) {
+        return Unmaskable::Startup;
+    }
+    return Unmaskable::None;
+}
 
 bool
 X86ISA::Interrupts::checkInterrupts() const
 {
     // A VMX guest's most recent VM entry may have armed a one-instruction
-    // STI-shadow/MOV-SS-shadow (SDM Vol. 3C 24.4.2, 6.8.3); while it is
-    // still in effect it withholds maskable interrupts (both shadows) and
-    // NMI (MOV-SS-shadow only) from delivery, though not from otherwise
-    // being reported/queued.
+    // STI-shadow/MOV-SS-shadow withholds maskable interrupts; NMI blocking
+    // and the MOV-SS shadow are handled by eligibleUnmaskable(). Queued
+    // interrupts remain visible to checkInterruptsRaw().
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
     const bool inVmxGuest = isa && isa->vmxState().nonRootActive();
-    const bool nmiBlocked = inVmxGuest &&
-        isa->vmxState().interruptShadowBlocksNmi(tc);
     const bool maskableBlocked = inVmxGuest &&
         isa->vmxState().interruptShadowBlocksMaskable(tc);
 
     RFLAGS rflags = tc->readMiscRegNoEffect(misc_reg::Rflags);
-    if (pendingUnmaskableInt) {
-        if (pendingSmi || pendingInit || pendingStartup) {
-            DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
-            return true;
-        }
-        if (pendingNmi && !nmiBlocked) {
-            DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
-            return true;
-        }
+    if (eligibleUnmaskable() != Unmaskable::None) {
+        DPRINTF(LocalApic, "Reported pending unmaskable interrupt.\n");
+        return true;
     }
     if (rflags.intf && !maskableBlocked) {
         if (pendingExtInt) {
@@ -717,25 +728,23 @@ X86ISA::Interrupts::getInterrupt()
     assert(checkInterrupts());
     // These are all probably fairly uncommon, so we'll make them easier to
     // check for.
-    if (pendingUnmaskableInt) {
-        if (pendingSmi) {
+    switch (eligibleUnmaskable()) {
+        case Unmaskable::Smi:
             DPRINTF(LocalApic, "Generated SMI fault object.\n");
             return std::make_shared<SystemManagementInterrupt>();
-        } else if (pendingNmi) {
+        case Unmaskable::Nmi:
             DPRINTF(LocalApic, "Generated NMI fault object.\n");
             return std::make_shared<NonMaskableInterrupt>(nmiVector);
-        } else if (pendingInit) {
+        case Unmaskable::Init:
             DPRINTF(LocalApic, "Generated INIT fault object.\n");
             return std::make_shared<InitInterrupt>(initVector);
-        } else if (pendingStartup) {
+        case Unmaskable::Startup:
             DPRINTF(LocalApic, "Generating SIPI fault object.\n");
             return std::make_shared<StartupInterrupt>(startupVector);
-        } else {
-            panic("pendingUnmaskableInt set, but no unmaskable "
-                    "ints were pending.\n");
-            return NoFault;
-        }
-    } else if (pendingExtInt) {
+        case Unmaskable::None:
+            break;
+    }
+    if (pendingExtInt) {
         DPRINTF(LocalApic, "Generated external interrupt fault object.\n");
         return std::make_shared<ExternalInterrupt>(extIntVector);
     } else {
@@ -749,18 +758,19 @@ void
 X86ISA::Interrupts::updateIntrInfo()
 {
     assert(checkInterrupts());
-    if (pendingUnmaskableInt) {
-        if (pendingSmi) {
+    const auto selected = eligibleUnmaskable();
+    if (selected != Unmaskable::None) {
+        if (selected == Unmaskable::Smi) {
             DPRINTF(LocalApic, "SMI sent to core.\n");
             pendingSmi = false;
-        } else if (pendingNmi) {
+        } else if (selected == Unmaskable::Nmi) {
             DPRINTF(LocalApic, "NMI sent to core.\n");
             pendingNmi = false;
-        } else if (pendingInit) {
+        } else if (selected == Unmaskable::Init) {
             DPRINTF(LocalApic, "Init sent to core.\n");
             pendingInit = false;
             startedUp = false;
-        } else if (pendingStartup) {
+        } else if (selected == Unmaskable::Startup) {
             DPRINTF(LocalApic, "SIPI sent to core.\n");
             pendingStartup = false;
             startedUp = true;

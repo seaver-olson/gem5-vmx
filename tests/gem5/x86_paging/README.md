@@ -172,6 +172,43 @@ bits, absent/malformed/denied entries, failed updates, retry and cancellation.
 An issued update can commit despite cancellation or an error response;
 rejected cancelled updates cannot. Functional walks remain read-only.
 
+The `ept_entry` guest runs dirty and clean-resident host-written tables with
+guest and EPT A/D initially clear. It compares complete descriptors after
+updates, including software bits. Standard Classic hierarchies use their
+existing coherent MMU caches; MESI Two Level uses its sequencer endpoints.
+Two-context EPT fixtures replace observed descriptors using coherent peer
+`WriteReq`s before the conditional update retries. This checks real coherent
+replacement, not a concurrently retiring second CPU store.
+
+Raw `SwapReq` traffic cannot be forwarded to Classic cache snoop ports.
+Connect walkers to the CPU side of a coherent cache, as the standard x86
+hierarchies already do. The crossbar rejects incompatible atomic and timing
+requests with `unsupported raw SwapReq snoop`, before forwarding. Direct
+uncached-memory paths with no snoop destinations remain valid. UC requests
+retain their attributes; this does not add support for UC/cacheable aliases.
+The focused suite includes filtered and broadcast negative-topology tests;
+only the specific diagnostic counts as the expected failure.
+
+The same suite runs `vmx_nmi`, built from the existing VM-entry guest helpers:
+
+```
+build/X86/gem5.opt --outdir=/tmp/vmx-nmi tests/gem5/x86_paging/config.py --cpu o3 --guest vmx_nmi --caches
+```
+
+AtomicSimple, TimingSimple, Minor and O3 execute native APIC self-NMIs and
+VM-entry NMI injection, blocked second NMIs, a fixed interrupt passing a
+blocked NMI, successful IRET, intercepted memory #PF/non-memory #GP, and
+accepted #GP delivery. Runs repeat without EPT, with EPT, and with EPT A/D.
+EPT-denied IRET stack reads check saved NMI blocking and qualification bit 12;
+misconfiguration, ordinary loads and pre-IRET fetch faults check that the bit
+is not fabricated. A branch around IRET guards wrong-path state changes;
+this alone is not proof that a particular predictor speculated that path.
+The guest supplies accessed GDT descriptors instead of relying on missing
+segment accessed-bit emulation. NMI exiting remains unadvertised and its
+rejection is checked explicitly; virtual NMIs remain unsupported.
+IRET's added lifecycle micro-op and ordering can change measurement counters;
+capture fresh provenance and regenerate affected no-EPT signatures.
+
 The same suite also calls the public MMU atomic, functional and timing APIs
 with a suspended CPU and a captured EPT configuration. Guest virtual addresses,
 guest physical addresses and backing host physical addresses all differ.

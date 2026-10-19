@@ -630,6 +630,7 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
 void
 ISA::beginEventDelivery(const vmx::DeliveryContext &event)
 {
+    vmx.acceptGuestEvent(event.type == VmxInterruptionType::Nmi);
     // A nested exception changes the accepted event, not the interrupted
     // frame. There is only one frame until a handler is reached.
     if (!delivery.event) {

@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS = -O2 -g -ffreestanding -fno-pie -fno-stack-protector -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror
 
 .PHONY: all
-all: vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf \
+all: vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
     paging.elf legacy.elf pae.elf gdb.elf se-context-1 se-context-2
 
 se-context-%: se_context.S
@@ -25,7 +25,7 @@ host_faults: host_faults.c
 
 .PHONY: clean
 clean:
-	$(RM) vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf \
+	$(RM) vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
 	    paging.elf legacy.elf pae.elf gdb.elf host_faults \
 	    se-context-1 se-context-2
 
@@ -40,4 +40,8 @@ ept_entry.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
 
 vmx_transition.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
 	$(CC) $(CFLAGS) -DVMX_TRANSITION_TEST -nostdlib -static -no-pie \
+	    -Wl,-T,link.ld -o $@ vmresume.S vmresume.c
+
+vmx_nmi.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
+	$(CC) $(CFLAGS) -DVMX_NMI_TEST -nostdlib -static -no-pie \
 	    -Wl,-T,link.ld -o $@ vmresume.S vmresume.c

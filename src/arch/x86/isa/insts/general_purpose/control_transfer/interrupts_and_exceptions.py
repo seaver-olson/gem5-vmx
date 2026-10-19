@@ -74,6 +74,8 @@ def macroop IRET_PROT {
     .serialize_after
     .adjust_env oszIn64Override
 
+    iretbegin
+
     # Check for a nested task. This isn't supported at the moment.
     rflag t1, 14; #NT bit
     panic "Task switching with iret is unimplemented!", flags=(nCEZF,)
@@ -244,7 +246,7 @@ skipSegmentSquashing:
     #  RF cleared
 
     #RIP = temp_RIP
-    wrip t0, t1
+    iretend t0, t1
 };
 
 def macroop IRET_VIRT {

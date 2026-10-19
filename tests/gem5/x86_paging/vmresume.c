@@ -87,13 +87,16 @@ test_ept_entry(uint64_t host_cr3)
     check((enter_guest(0) & 0x41) == 0x40, 105);
     check(read_field(0x4400) == 7 && !fault_vector, 106);
 
-    for (unsigned ad = 0; ad < 2; ++ad) {
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        const unsigned ad = variant & 1;
+        const uint64_t software = 1ull << 52;
         // GVA 0x400000/0x401000 -> GPA 0x2000000/0x2001000 -> ELF RAM.
         // Three guest paging pages also have distinct GPAs and HPAs.
-        guest_tables[0][0] = 0x1801003;
-        guest_tables[1][0] = 0x1802003;
-        guest_tables[2][2] = 0x2000083; // Guest 2 MiB leaf, A/D clear.
-        ept_tables[ad][0] = (uint64_t)ept_tables[2] | 7;
+        guest_tables[0][0] = 0x1801203;
+        guest_tables[1][0] = 0x1802203;
+        guest_tables[2][2] =
+            0x2000283; // Guest leaf, software bit 9, A/D clear.
+        ept_tables[ad][0] = (uint64_t)ept_tables[2] | 7 | software;
         ept_tables[2][0] = (uint64_t)ept_tables[3] | 7;
         ept_tables[3][12] = (uint64_t)ept_tables[4] | 7;
         ept_tables[3][16] = (uint64_t)ept_tables[5] | 7;
@@ -104,9 +107,27 @@ test_ept_entry(uint64_t host_cr3)
         ept_tables[5][1] = (uint64_t)ept_data | 0x30;       // No access.
         ept_data[0] = 0;
         ept_data[1] = 0xfeedface;
+        if (variant & 2) {
+            // Establish clean resident lines without functional memory writes.
+            for (unsigned i = 0; i < 3; ++i) {
+                volatile uint64_t *entry = &guest_tables[i][i == 2 ? 2 : 0];
+                __asm__ volatile("clflush (%0); mfence" ::"r"(entry)
+                                 : "memory");
+                (void)*entry;
+            }
+            volatile uint64_t *entries[] = {
+                &ept_tables[ad][0], &ept_tables[2][0], &ept_tables[3][12],
+                &ept_tables[3][16], &ept_tables[4][0], &ept_tables[5][0],
+            };
+            for (unsigned i = 0; i < 6; ++i) {
+                __asm__ volatile("clflush (%0); mfence" ::"r"(entries[i])
+                                 : "memory");
+                (void)*entries[i];
+            }
+        }
         field(0x201a, (uint64_t)ept_tables[ad] | 0x1e | (ad << 6));
         field(0x681e, GUEST_IP(ept_guest_read));
-        check(enter_guest(ad != 0) == 0, 107);
+        check(enter_guest(variant != 0) == 0, 107);
         check_ept_exit(48, 0x19c, 0x2000000, 0x400000, 0x400000);
 
         ept_tables[5][0] = (uint64_t)ept_guest_read | 0x37;
@@ -146,6 +167,16 @@ test_ept_entry(uint64_t host_cr3)
         check((ept_tables[4][0] & 0x300) == (ad ? 0x300 : 0) &&
                   (ept_tables[5][1] & 0x300) == (ad ? 0x300 : 0),
               120);
+        check(guest_tables[0][0] == 0x1801223 &&
+                  guest_tables[1][0] == 0x1802223 &&
+                  guest_tables[2][2] == 0x20002e3,
+              123);
+        check(ept_tables[ad][0] ==
+                  ((uint64_t)ept_tables[2] | 7 | software | (ad ? 0x100 : 0)),
+              124);
+        check(ept_tables[5][1] ==
+                  ((uint64_t)ept_data | 0x37 | (ad ? 0x300 : 0)),
+              125);
         ept_tables[ad][0] = 0; // The next entry must capture its new root.
     }
     // Disable EPT on resume; neither host nor next guest may retain it.
@@ -341,6 +372,207 @@ test_vmx_transition(uint64_t cr0, uint64_t cr3, uint64_t cr4, uint64_t pointer)
 }
 #endif
 
+#ifdef VMX_NMI_TEST
+volatile uint64_t nmi_events, nmi_depth, nmi_fixed;
+static volatile uint64_t nmi_ept[6][512] __attribute__((aligned(4096)));
+static uint64_t nmi_paging[4][512] __attribute__((aligned(4096)));
+static uint64_t nmi_stack[512] __attribute__((aligned(4096)));
+// Segment-load accessed-bit emulation is outside this regression. Supply
+// accessed descriptors so a handler exit can resume without rewriting CS.
+static const uint64_t nmi_gdt[] = {0, 0x00af9b000000ffff, 0x00cf93000000ffff};
+extern void nmi_guest(void), nmi_handler(void), nmi_handler_exit(void);
+extern void nmi_done(void), nmi_iret(void), nmi_load(void);
+extern void nmi_fault_handler(void), nmi_wrong_path(void);
+extern void nmi_priority(void), nmi_fixed_handler(void);
+
+static void
+nmi_gate(unsigned vector, void (*handler)(void))
+{
+    uint64_t target = (uint64_t)handler;
+    idt[vector * 2] = (target & 0xffff) | (8ull << 16) | (0x8eull << 40) |
+                      ((target & 0xffff0000) << 32);
+    idt[vector * 2 + 1] = target >> 32;
+}
+
+static void
+nmi_entry(void (*entry)(void), uint64_t rsp, unsigned blocked)
+{
+    field(0x4816, 0xa09b);
+    field(0x4818, 0xc093);
+    field(0x804, 16);
+    field(0x681c, rsp);
+    field(0x681e, (uint64_t)entry);
+    field(0x6820, 2);
+    field(0x4824, blocked);
+    field(0x4016, 0);
+}
+
+static void
+nmi_exit(unsigned resume, unsigned reason, void (*rip)(void), unsigned blocked,
+         uint64_t code)
+{
+    check(enter_guest(resume) == 0, code);
+    check(read_field(0x4402) == reason, code + 1);
+    check(read_field(0x681e) == (uint64_t)rip, code + 2);
+    check((read_field(0x4824) & 8) == blocked, code + 3);
+    check(read_field(0x4408) == 0, code + 4);
+}
+
+static void
+test_vmx_nmi(uint64_t host_cr3)
+{
+    nmi_gate(2, nmi_handler);
+    nmi_gate(14, nmi_fault_handler);
+    nmi_gate(13, nmi_fault_handler);
+    nmi_gate(64, nmi_fixed_handler);
+    const uint64_t top = (uint64_t)(guest_stack + sizeof(guest_stack));
+    const uint64_t frame = (uint64_t)nmi_stack;
+    unsigned launched = 0;
+    field(0x6816, (uint64_t)nmi_gdt);
+    field(0x4810, sizeof(nmi_gdt) - 1);
+    // Independent guest paging leaves 1 GiB unmapped for a real #PF.
+    // EPT uses 4 KiB leaves for the ELF's first 2 MiB, including IRET's stack.
+    nmi_paging[0][0] = (uint64_t)nmi_paging[1] | 3;
+    nmi_paging[1][0] = (uint64_t)nmi_paging[2] | 3;
+    nmi_paging[1][3] = (uint64_t)nmi_paging[3] | 3;
+    nmi_paging[3][503] = 0xfee00083;
+    nmi_ept[0][0] = (uint64_t)nmi_ept[1] | 7;
+    nmi_ept[1][0] = (uint64_t)nmi_ept[2] | 7;
+    nmi_ept[1][3] = (uint64_t)nmi_ept[3] | 7;
+    nmi_ept[3][503] = (uint64_t)nmi_ept[5] | 7;
+    nmi_ept[5][0] = 0xfee00007; // UC APIC mapping, not WB RAM.
+    for (unsigned i = 0; i < 512; ++i) {
+        nmi_paging[2][i] = ((uint64_t)i << 21) | 0x83;
+        nmi_ept[4][i] = ((uint64_t)i << 12) | 0x37;
+    }
+    nmi_ept[2][0] = (uint64_t)nmi_ept[4] | 7;
+    field(0x6802, (uint64_t)nmi_paging[0]);
+
+    // No EPT, EPT without A/D, and EPT with real conditional A/D updates.
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        field(0x4002, controls(0x48e, mode ? 1u << 31 : 0));
+        field(0x401e, mode ? 2 : 0);
+        field(0x201a, (uint64_t)nmi_ept[0] | 0x1e | (mode == 2 ? 64 : 0));
+        for (unsigned source = 0; source < 3; ++source) {
+            nmi_events = nmi_depth = nmi_fixed = 0;
+            nmi_entry(source == 2   ? nmi_priority
+                      : source == 1 ? nmi_done
+                                    : nmi_guest,
+                      top, source == 2 ? 8 : 0);
+            if (source == 1) {
+                field(0x4016, 0x80000202);
+            }
+            if (source == 2) {
+                field(0x6820, 0x202);
+            }
+            nmi_exit(launched, 18, nmi_handler_exit, 8, 310);
+            launched = 1;
+            check(nmi_events == 1 && nmi_depth == 1, 315);
+            field(0x4016, 0);
+            field(0x681e, (uint64_t)nmi_handler_exit + 3);
+            nmi_exit(1, 18, nmi_done, 0, 330);
+            check(nmi_events == 2 && nmi_depth == 0, 335);
+            check(nmi_fixed == (source == 2), 336);
+        }
+
+        nmi_stack[0] = (uint64_t)nmi_done;
+        nmi_stack[1] = 8;
+        nmi_stack[2] = 2;
+        nmi_stack[3] = top;
+        nmi_stack[4] = 16;
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_exit(1, 18, nmi_done, 0, 340);
+
+        // NMI exiting is not advertised today. Do not mask an unsupported
+        // requested control down to zero and call that a passing test.
+        field(0x4000, controls(0x48d, 0) | (1u << 3));
+        nmi_entry(nmi_iret, frame, 8);
+        if ((msr(0x48d) >> 32) & (1u << 3)) {
+            nmi_exit(1, 18, nmi_done, 8, 350);
+        } else {
+            check((enter_guest(1) & 0x41) == 0x40, 350);
+            check(read_field(0x4400) == 7 && read_field(0x4824) == 8, 351);
+        }
+        field(0x4000, controls(0x48d, 0));
+
+        field(0x4004, 1u << 14);
+        nmi_entry(nmi_iret, 0x40000000, 8);
+        nmi_exit(1, 0, nmi_iret, 0, 360);
+        check(read_field(0x4404) == 0x80001b0e, 365);
+        check(read_field(0x6400) == 0x40000000, 366);
+        field(0x4004, 0);
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_stack[0] = 1ull << 48; // Non-memory canonical-RIP check: #GP.
+        field(0x4004, 1u << 13);
+        nmi_exit(1, 0, nmi_iret, 0, 370);
+        check(read_field(0x4404) == 0x80000b0d, 375);
+        // Accept that same #GP and reach its handler, ending IRET lifetime.
+        field(0x4004, 0);
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_exit(1, 18, nmi_fault_handler, 0, 430);
+        nmi_stack[0] = (uint64_t)nmi_done;
+        field(0x4004, 0);
+
+        nmi_entry(nmi_wrong_path, frame, 8);
+        nmi_exit(1, 18, nmi_done, 8, 380);
+        if (!mode) {
+            continue;
+        }
+
+        volatile uint64_t *stack_leaf = &nmi_ept[4][frame >> 12];
+        uint64_t stack_mapping = frame | 0x37;
+        for (unsigned misconfig = 0; misconfig < 2; ++misconfig) {
+            *stack_leaf = frame | (misconfig ? 0x32 : 0x30);
+            nmi_entry(nmi_iret, frame, 8);
+            nmi_exit(1, misconfig ? 49 : 48, nmi_iret, 0, 390);
+            check(read_field(0x6400) == (misconfig ? 0 : 0x1181), 395);
+            check(read_field(0x2400) == frame, 396);
+            if (!misconfig) {
+                // Re-enter with the saved, now-unblocked state. A second
+                // fault at the same RIP must not reuse the old attribution.
+                nmi_exit(1, 48, nmi_iret, 0, 440);
+                check(read_field(0x6400) == 0x181, 445);
+            }
+            *stack_leaf = stack_mapping;
+            nmi_exit(1, 18, nmi_done, 0, 400);
+            check(read_field(0x6400) == 0, 405);
+        }
+        *stack_leaf = frame | 0x30;
+        nmi_entry(nmi_load, frame, 8);
+        nmi_exit(1, 48, nmi_load, 8, 410);
+        check(read_field(0x6400) == 0x181, 415);
+        *stack_leaf = stack_mapping;
+        // A later descriptor read is still part of IRET, unlike its fetch.
+        const uint64_t gdt = (uint64_t)nmi_gdt;
+        unsigned gdt_page = gdt >> 12;
+        uint64_t gdt_mapping = nmi_ept[4][gdt_page];
+        nmi_ept[4][gdt_page] = (gdt_mapping & ~7ull);
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_exit(1, 48, nmi_iret, 0, 450);
+        check(read_field(0x6400) == 0x1181 && read_field(0x2400) == gdt + 8,
+              455);
+        nmi_ept[4][gdt_page] = gdt_mapping;
+        unsigned code_page = (uint64_t)nmi_iret >> 12;
+        uint64_t code_mapping = nmi_ept[4][code_page];
+        nmi_ept[4][code_page] = code_mapping & ~4ull;
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_exit(1, 48, nmi_iret, 8, 420);
+        check(!(read_field(0x6400) & 0x1000), 425);
+        nmi_ept[4][code_page] = code_mapping;
+        // IRET completes, then its target fetch faults: no IRET attribution.
+        code_page = (uint64_t)nmi_done >> 12;
+        code_mapping = nmi_ept[4][code_page];
+        nmi_ept[4][code_page] = code_mapping & ~4ull;
+        nmi_entry(nmi_iret, frame, 8);
+        nmi_exit(1, 48, nmi_done, 0, 460);
+        check(!(read_field(0x6400) & 0x1000), 465);
+        nmi_ept[4][code_page] = code_mapping;
+    }
+    field(0x4002, controls(0x48e, 0));
+    field(0x6802, host_cr3);
+}
+#endif
+
 void
 paging_test(void)
 {
@@ -431,6 +663,8 @@ paging_test(void)
     test_ept_entry(cr3);
 #elif defined(VMX_TRANSITION_TEST)
     test_vmx_transition(cr0, cr3, cr4, pointer);
+#elif defined(VMX_NMI_TEST)
+    test_vmx_nmi(cr3);
 #else
     /* Launch once, then resume twice. Check saved RIP, exit reason and a
      * memory side effect so duplicated or skipped guest execution fails. */

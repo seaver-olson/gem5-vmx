@@ -120,6 +120,16 @@ class Interrupts : public BaseInterrupts
     // This is a quick check whether any of the above (except ExtInt) are set.
     bool pendingUnmaskableInt = false;
 
+    enum class Unmaskable
+    {
+        None,
+        Smi,
+        Nmi,
+        Init,
+        Startup
+    };
+    Unmaskable eligibleUnmaskable() const;
+
     // A count of how many IPIs are in flight.
     int pendingIPIs = 0;
 

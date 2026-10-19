@@ -296,10 +296,49 @@ PagingTester::eptAdCase(EptAdTest test)
         if (test == EptAdTest::Replace || test == EptAdTest::Revoke) {
             // Change the root rights as well: resuming at the old leaf would
             // return stale permissions even if it noticed the new PFN.
-            descriptor(0, descriptor(0) & ~2ULL);
-            descriptor(descriptors.size() - 1,
-                0xc0000000ULL | 7 | (6 << 3) | Software |
-                (test == EptAdTest::Replace ? D : 0));
+            const uint64_t root_value = descriptor(0) & ~2ULL;
+            const uint64_t leaf_value = 0xc0000000ULL | 7 | (6 << 3) |
+                                        Software |
+                                        (test == EptAdTest::Replace ? D : 0);
+            if (system->isTimingMode() && system->threads.size() > 1) {
+                // Hold the observed update while a separate coherent cache
+                // endpoint replaces descriptors using real WriteReqs.
+                auto *peer_mmu =
+                    static_cast<MMU *>(system->threads[1]->getMMUPtr());
+                auto *peer_port = &peer_mmu->getDataWalker()->pagingPort();
+                const auto write = [=](Addr address, uint64_t value,
+                                       PagingPort::Completion done) {
+                    auto req = std::make_shared<Request>(
+                        address, 8, Request::PHYSICAL, requestor);
+                    auto *pkt = new Packet(req, MemCmd::WriteReq);
+                    pkt->allocate();
+                    pkt->setLE<uint64_t>(value);
+                    peer_port->submit(
+                        pkt, [] { return true; }, std::move(done));
+                };
+                const Addr root_address = descriptors.front();
+                const Addr leaf_address = descriptors.back();
+                startPeer = [=, this] {
+                    write(root_address, root_value,
+                          [=, this](PacketPtr pkt, bool cancelled) {
+                              panic_if(cancelled || pkt->isError(),
+                                       "Coherent EPT root replacement failed");
+                              delete pkt;
+                              write(leaf_address, leaf_value,
+                                    [this](PacketPtr pkt, bool cancelled) {
+                                        panic_if(cancelled || pkt->isError(),
+                                                 "Coherent EPT leaf "
+                                                 "replacement failed");
+                                        delete pkt;
+                                        schedule(retryEvent, curTick() + 1);
+                                    });
+                          });
+                };
+                injection = PeerUpdate;
+            } else {
+                descriptor(0, root_value);
+                descriptor(descriptors.size() - 1, leaf_value);
+            }
         } else if (test == EptAdTest::UpdateError && system->isAtomicMode()) {
             packet->makeResponse();
             packet->setBadAddress();

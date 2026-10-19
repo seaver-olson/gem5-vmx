@@ -26,6 +26,12 @@ parser.add_argument(
 )
 parser.add_argument("--caches", action="store_true")
 parser.add_argument(
+    "--direct-walker",
+    action="store_true",
+    help="Bypass the walker cache (raw coherent swaps are unsupported)",
+)
+parser.add_argument("--no-snoop-filter", action="store_true")
+parser.add_argument(
     "--pcid",
     action="store_true",
     help="Advertise PCID for control-register tests",
@@ -37,6 +43,7 @@ parser.add_argument(
         "vmresume",
         "ept_entry",
         "vmx_transition",
+        "vmx_nmi",
         "paging",
         "legacy",
         "pae",
@@ -134,6 +141,10 @@ system.clk_domain = SrcClockDomain(
 system.mem_mode = "atomic" if args.cpu == "atomic" else "timing"
 system.mem_ranges = [AddrRange("64MiB")]
 system.membus = SystemXBar()
+if args.no_snoop_filter:
+    from m5.params import NULL
+
+    system.membus.snoop_filter = NULL
 system.memory = SimpleMemory(range=system.mem_ranges[0], latency="30ns")
 system.memory.port = system.membus.mem_side_ports
 system.system_port = system.membus.cpu_side_ports
@@ -172,7 +183,7 @@ else:
     system.cpu.dcache_port = system.membus.cpu_side_ports
 # Deliberately share the TLB: a data fill must also enforce fetch permissions.
 system.cpu.mmu.itb = system.cpu.mmu.dtb
-if args.caches:
+if args.caches and not args.direct_walker:
     system.walkcache = Cache(
         size="8KiB",
         assoc=4,

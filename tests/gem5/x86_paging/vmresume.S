@@ -138,3 +138,81 @@ transition_xsetbv_instruction:
     xsetbv
     ud2
 #endif
+
+#ifdef VMX_NMI_TEST
+// Check blocking before queuing a second NMI, then require non-nested
+// delivery through IRET. Guest clobbers remain caller-saved.
+.global nmi_guest, nmi_handler, nmi_handler_exit, nmi_done
+.global nmi_priority, nmi_fixed_handler
+nmi_priority:
+    mov $0xfee00300, %eax
+    movl $0x40400, (%rax)
+    movl $0x40040, (%rax) // Fixed interrupt must pass the blocked NMI.
+    jmp nmi_wait
+nmi_fixed_handler:
+    incq nmi_fixed(%rip)
+    push %rax
+    mov $0xfee000b0, %eax
+    movl $0, (%rax) // EOI before the next fixed-interrupt test.
+    pop %rax
+    iretq
+nmi_guest:
+    mov $0xfee00300, %eax
+    movl $0x40400, (%rax) // Self NMI through the real local APIC.
+nmi_wait:
+    // Device completion/interrupt dispatch is asynchronous on O3. Wait for
+    // actual handler progress, not a fixed number of simulated cycles.
+    mov $100000, %ecx
+1:  cmpq $2, nmi_events(%rip)
+    je nmi_done
+    dec %ecx
+    jnz 1b
+    mov $302, %esi
+    xor %edi, %edi
+    .byte 0x0f, 0x04; .word 0x22
+    ud2
+nmi_handler:
+    push %rax
+    incq nmi_depth(%rip)
+    cmpq $1, nmi_depth(%rip)
+    jne nmi_nested
+    incq nmi_events(%rip)
+    cmpq $1, nmi_events(%rip)
+    jne nmi_tail
+nmi_handler_exit:
+    vmcall
+    mov $0xfee00300, %eax
+    movl $0x40400, (%rax)
+nmi_tail:
+    decq nmi_depth(%rip)
+    pop %rax
+    iretq
+nmi_nested:
+    mov $301, %esi
+    xor %edi, %edi
+    .byte 0x0f, 0x04; .word 0x22
+    ud2
+nmi_done:
+    vmcall
+    ud2
+
+.global nmi_load, nmi_fault_handler, nmi_wrong_path
+nmi_load:
+    mov (%rsp), %rax
+    jmp nmi_done
+nmi_fault_handler:
+    vmcall
+    ud2
+nmi_wrong_path:
+    xor %eax, %eax
+    test %eax, %eax
+    jz nmi_done
+    iretq // Must not remove NMI blocking on a wrong path.
+    ud2
+
+// Isolate the IRET fetch page from the handler and ordinary load probe.
+.balign 4096
+.global nmi_iret
+nmi_iret:
+    iretq
+#endif

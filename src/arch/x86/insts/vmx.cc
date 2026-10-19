@@ -625,6 +625,7 @@ VmxExitFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
     VmxExitInfo info = exitInfo;
+    info.iretMemoryAccess = isa && isa->vmxState().iretMemoryAccess(tc, inst);
     if (info.hasInstructionLength && info.instructionLength == 0 && inst) {
         info.instructionLength = inst->size();
     }
@@ -951,9 +952,8 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
     // (bits 0/1) are honored for one guest instruction after VM entry (see
     // guestStiShadow/guestMovSsShadow), so only their internal consistency
     // is checked here; SMI blocking is not modeled, so its bit must be
-    // zero; blocking-by-NMI (bit 3) is a carry-through value that VM-entry
-    // event injection can set (see vmEntry()), so it is allowed to be
-    // either 0 or 1 here.
+    // zero; blocking-by-NMI (bit 3) is loaded at entry and subsequently
+    // maintained by accepted NMI delivery and IRET.
     {
         constexpr uint64_t StiBlocking = 1ull << 0;
         constexpr uint64_t MovSsBlocking = 1ull << 1;
@@ -1180,8 +1180,8 @@ VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs, uint64_t rflags) const
             tc->readMiscRegNoEffect(misc_reg::SysenterEip));
 
     // SMI blocking is not modeled, so it always saves back clear;
-    // blocking-by-NMI reflects the effect of the most recent VM-entry NMI
-    // injection (see vmEntry()); STI-shadow/MOV-SS-shadow reflect whether
+    // blocking-by-NMI reflects accepted delivery and IRET;
+    // STI-shadow/MOV-SS-shadow reflect whether
     // the guest instruction that armed them has retired yet.
     refreshInterruptShadow(tc);
     uint64_t interruptibility = guestNmiBlocked ? (1ull << 3) : 0;
@@ -1412,6 +1412,7 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     // on whenever this entry injects an NMI, regardless of that field's
     // incoming value.
     guestNmiBlocked = injectingNmi || bits(guestInterruptibility, 3);
+    guestIret.reset();
     // STI-shadow/MOV-SS-shadow (bits 0/1) carry through unchanged; they
     // are consumed as soon as the guest's first post-entry instruction
     // (at guestRip) is observed to have retired (see
@@ -1502,6 +1503,13 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
         (exceptionDuringDelivery ||
          exitInfo.reason == VmxExitReason::EptViolation ||
          exitInfo.reason == VmxExitReason::EptMisconfiguration);
+    // SDM 28.2.3: only a memory access by an IRET which removed blocking
+    // reports unblocking. IDT vectoring and #DF suppress this information.
+    const bool iret_unblocking =
+        exitInfo.iretMemoryAccess && guestIret && guestIret->unblockedNmi &&
+        !shouldExitOnNmi() && !vectoring &&
+        !(exitInfo.reason == VmxExitReason::ExceptionOrNmi &&
+          bits(exitInfo.interruptionInfo, 7, 0) == 8);
     uint32_t instructionLength =
         exitInfo.hasInstructionLength ? exitInfo.instructionLength : 0;
     if (vectoring && delivery->softwareEvent() &&
@@ -1529,13 +1537,22 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
     }
     saveGuestState(tc, *vmcs, rflags);
     vmcs->writeUnchecked(VmcsVmExitReason, reason);
-    vmcs->writeUnchecked(VmcsExitQualification,
-            exitInfo.hasQualification ? exitInfo.qualification : 0);
+    vmcs->writeUnchecked(
+        VmcsExitQualification,
+        (exitInfo.hasQualification ? exitInfo.qualification : 0) |
+            (iret_unblocking && exitInfo.reason == VmxExitReason::EptViolation
+                 ? 1ull << 12
+                 : 0));
     vmcs->writeUnchecked(VmcsVmExitInstructionLen, instructionLength);
     vmcs->writeUnchecked(VmcsVmxInstructionInfo,
             exitInfo.hasInstructionInfo ? exitInfo.instructionInfo : 0);
-    vmcs->writeUnchecked(VmcsVmExitInterruptionInfo,
-            exitInfo.hasInterruptionInfo ? exitInfo.interruptionInfo : 0);
+    vmcs->writeUnchecked(
+        VmcsVmExitInterruptionInfo,
+        (exitInfo.hasInterruptionInfo ? exitInfo.interruptionInfo : 0) |
+            (iret_unblocking && exitInfo.hasInterruptionInfo &&
+                     exitInfo.reason == VmxExitReason::ExceptionOrNmi
+                 ? 1u << 12
+                 : 0));
     vmcs->writeUnchecked(VmcsVmExitInterruptionErrorCode,
             exitInfo.hasInterruptionErrorCode ?
             exitInfo.interruptionErrorCode : 0);
@@ -1550,6 +1567,7 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
             exitInfo.hasGuestPhysicalAddress ?
             exitInfo.guestPhysicalAddress : 0);
     isa->endEventDelivery();
+    guestIret.reset();
 
     Addr hostRipValue = 0;
     if (!loadHostState(tc, *vmcs, hostRipValue)) {
@@ -1712,7 +1730,39 @@ VmxState::interruptShadowBlocksNmi(ThreadContext *tc) const
     // SDM Vol. 3C 6.8.3: unlike STI-shadow, the shadow after MOV SS/POP SS
     // also blocks NMI delivery for the one instruction it covers.
     refreshInterruptShadow(tc);
-    return guestMovSsShadow;
+    return guestNmiBlocked || guestMovSsShadow;
+}
+
+void
+VmxState::beginGuestIret(ThreadContext *tc)
+{
+    if (!inVmxNonRoot || shouldExitOnNmi()) {
+        return;
+    }
+    const Addr rip = tc->pcState().instAddr();
+    // Internal replay must retain the original blocking state.
+    if (!guestIret || guestIret->rip != rip) {
+        guestIret = IretState{rip, guestNmiBlocked};
+        guestNmiBlocked = false;
+    }
+}
+
+bool
+VmxState::iretMemoryAccess(ThreadContext *tc, const StaticInstPtr &inst) const
+{
+    return inVmxNonRoot && guestIret && inst && inst->isMemRef() &&
+           guestIret->rip == tc->pcState().instAddr();
+}
+
+void
+VmxState::acceptGuestEvent(bool nmi)
+{
+    if (inVmxNonRoot) {
+        guestIret.reset();
+        if (nmi) {
+            guestNmiBlocked = true;
+        }
+    }
 }
 
 bool
@@ -2136,6 +2186,7 @@ VmxState::vmxoff(ExecContext *xc, uint8_t instructionSize)
     vmxActive = false;
     inVmxNonRoot = false;
     activeEptConfig.reset();
+    guestIret.reset();
     vmxonRegion = 0;
     currentVmcsPtr = InvalidVmcsPointer;
     DPRINTF(VMX, "VMXOFF\n");
@@ -2281,6 +2332,11 @@ VmxState::serialize(CheckpointOut &cp) const
     SERIALIZE_SCALAR(currentVmcsPtr);
     SERIALIZE_SCALAR(numVmcsRegions);
     SERIALIZE_SCALAR(guestNmiBlocked);
+    paramOut(cp, "guestIretActive", guestIret.has_value());
+    if (guestIret) {
+        paramOut(cp, "guestIretRip", guestIret->rip);
+        paramOut(cp, "guestIretUnblockedNmi", guestIret->unblockedNmi);
+    }
     SERIALIZE_SCALAR(guestStiShadow);
     SERIALIZE_SCALAR(guestMovSsShadow);
     SERIALIZE_SCALAR(guestShadowRip);
@@ -2297,6 +2353,7 @@ void
 VmxState::unserialize(CheckpointIn &cp)
 {
     activeEptConfig.reset();
+    guestIret.reset();
     // If VMX is inactive, ignore any stale serialized VMX state.
     if (!UNSERIALIZE_OPT_SCALAR(vmxActive)) {
         vmxActive = false;
@@ -2316,6 +2373,16 @@ VmxState::unserialize(CheckpointIn &cp)
     UNSERIALIZE_SCALAR(numVmcsRegions);
     if (!UNSERIALIZE_OPT_SCALAR(guestNmiBlocked)) {
         guestNmiBlocked = false;
+    }
+    bool iret_active = false;
+    optParamIn(cp, "guestIretActive", iret_active);
+    if (iret_active) {
+        IretState state{};
+        paramIn(cp, "guestIretRip", state.rip);
+        paramIn(cp, "guestIretUnblockedNmi", state.unblockedNmi);
+        panic_if(!inVmxNonRoot || guestNmiBlocked,
+                 "Malformed VMX checkpoint: inconsistent IRET state");
+        guestIret = state;
     }
     if (!UNSERIALIZE_OPT_SCALAR(guestStiShadow)) {
         guestStiShadow = false;

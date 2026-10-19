@@ -369,6 +369,7 @@ let {{
             op_iter = iter(self.ops)
             ops = list([Type(op_iter).ctor_args() for Type in operand_types])
             op_args = ', '.join(ops)
+            op_args = ', ' + op_args if op_args else ''
             if self.big_code != "":
                 className = self.className
                 if is_imm:
@@ -376,11 +377,11 @@ let {{
                 allocString = '''
                     (%(dataSize)s >= 4) ?
                         (StaticInstPtr)(new %(class_name)sBig(machInst,
-                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s,
-                            %(op_args)s)) :
+                            macrocodeBlock, %(flags)s, %(dataSize)s,
+                            %(ext)s%(op_args)s)) :
                         (StaticInstPtr)(new %(class_name)s(machInst,
-                            macrocodeBlock, %(flags)s, %(dataSize)s, %(ext)s,
-                            %(op_args)s))
+                            macrocodeBlock, %(flags)s, %(dataSize)s,
+                            %(ext)s%(op_args)s))
                     '''
                 allocator = allocString % {
                     "class_name" : className,
@@ -394,7 +395,7 @@ let {{
                 if is_imm:
                     className += "Imm"
                 allocator = '''new %(class_name)s(machInst, macrocodeBlock,
-                        %(flags)s, %(dataSize)s, %(ext)s, %(op_args)s)''' % {
+                        %(flags)s, %(dataSize)s, %(ext)s%(op_args)s)''' % {
                     "class_name" : className,
                     "flags" : self.microFlagsText(microFlags),
                     "op_args" : op_args,
@@ -1202,6 +1203,29 @@ let {{
     class Wrip(WrRegOp, CondRegOp):
         code = 'NRIP = ((SrcReg1 + sop2) & mask(dataSize * 8)) + CSBase;'
         else_code = "NRIP = NRIP;"
+
+    class Iretbegin(RegOp):
+        operand_types = ()
+        code = '''
+            static_cast<ISA *>(xc->tcBase()->getIsaPtr())->vmxState()
+                .beginGuestIret(xc->tcBase());
+        '''
+
+        def getAllocator(self, microFlags):
+            # Order all IRET accesses after the architectural state change,
+            # including Minor's early memory issue, using existing barriers.
+            return super().getAllocator(microFlags + [
+                "IsNonSpeculative", "IsSerializeAfter",
+                "IsReadBarrier", "IsWriteBarrier"])
+
+    class Iretend(Wrip):
+        code = Wrip.code + '''
+            static_cast<ISA *>(xc->tcBase()->getIsaPtr())->vmxState()
+                .endGuestIret();
+        '''
+
+        def getAllocator(self, microFlags):
+            return super().getAllocator(microFlags + ["IsNonSpeculative"])
 
     class Wruflags(WrRegOp):
         code = '''

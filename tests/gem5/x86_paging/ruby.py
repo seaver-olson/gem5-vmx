@@ -22,7 +22,14 @@ parser.add_argument(
 parser.add_argument("--classic", choices=["l1", "private-l2", "shared-l2"])
 parser.add_argument(
     "--guest",
-    choices=["vmx_operands", "paging", "legacy", "pae"],
+    choices=[
+        "vmx_operands",
+        "paging",
+        "legacy",
+        "pae",
+        "ept_entry",
+        "vmx_nmi",
+    ],
     default="paging",
 )
 parser.add_argument("--fixture", action="store_true")
@@ -36,9 +43,11 @@ parser.add_argument(
     action="store_true",
     help="Include shared transport and lifecycle fixture cases",
 )
+parser.add_argument("--ept-only", action="store_true")
 args = parser.parse_args()
 args.fixture |= args.transport
 args.fixture |= args.fixture_peers
+args.fixture |= args.ept_only
 if args.classic:
     from gem5.components.cachehierarchies.classic.private_l1_cache_hierarchy import (
         PrivateL1CacheHierarchy,
@@ -104,7 +113,7 @@ if args.fixture:
     from m5.objects import X86PagingTester
 
     board.paging_tester = X86PagingTester(
-        system=board, transport_cases=args.transport
+        system=board, transport_cases=args.transport, ept_only=args.ept_only
     )
     cpu = board.get_processor().get_cores()[0].get_simobject()
     cpu.mmu.dtb.walker.port.splice(

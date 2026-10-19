@@ -714,6 +714,11 @@ CoherentXBar::forwardTiming(PacketPtr pkt, PortID exclude_cpu_side_port_id,
         // from
         if (exclude_cpu_side_port_id == InvalidPortID ||
             p->getId() != exclude_cpu_side_port_id) {
+            fatal_if(pkt->cmd == MemCmd::SwapReq,
+                     "%s: unsupported raw SwapReq snoop at %#x; connect "
+                     "the requestor through a CPU-side coherent cache or "
+                     "a supported sequencer endpoint",
+                     name(), pkt->getAddr());
             // cache is not allowed to refuse snoop
             p->sendTimingSnoopReq(pkt);
             fanout++;
@@ -952,6 +957,12 @@ CoherentXBar::forwardAtomic(PacketPtr pkt, PortID exclude_cpu_side_port_id,
         if (exclude_cpu_side_port_id != InvalidPortID &&
             p->getId() == exclude_cpu_side_port_id)
             continue;
+
+        fatal_if(pkt->cmd == MemCmd::SwapReq,
+                 "%s: unsupported raw SwapReq snoop at %#x; connect "
+                 "the requestor through a CPU-side coherent cache or "
+                 "a supported sequencer endpoint",
+                 name(), pkt->getAddr());
 
         Tick latency = p->sendAtomicSnoop(pkt);
         fanout++;

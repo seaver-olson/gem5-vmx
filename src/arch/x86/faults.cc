@@ -165,6 +165,8 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
                 vector, event.errorCode.value_or(0));
         }
         if (shouldExit) {
+            exitInfo.iretMemoryAccess =
+                isa->vmxState().iretMemoryAccess(tc, inst);
             exitInfo.resumeFlag = event.resumeFlag;
             if (exitInfo.reason == VmxExitReason::ExceptionOrNmi ||
                 exitInfo.reason == VmxExitReason::ExternalInterrupt) {

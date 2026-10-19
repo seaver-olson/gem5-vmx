@@ -1014,7 +1014,7 @@ Execute::commitInst(MinorDynInstPtr inst, bool early_memory_issue,
             } else {
                 DPRINTF(MinorExecute, "Fault in execute: %s\n",
                     fault->name());
-                fault->invoke(thread, NULL);
+                fault->invoke(thread, inst->staticInst);
 
                 tryToBranch(inst, fault, branch);
                 completed_inst = true;

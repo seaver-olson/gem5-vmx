@@ -153,6 +153,8 @@ struct VmxExitInfo
     bool hasInterruptionErrorCode = false;
     uint32_t interruptionErrorCode = 0;
     std::optional<bool> resumeFlag = std::nullopt;
+    // Set at precise fault dispatch, never by a translation callback.
+    bool iretMemoryAccess = false;
 
     bool hasGuestLinearAddress = false;
     uint64_t guestLinearAddress = 0;
@@ -260,14 +262,15 @@ class VmxState
     Addr currentVmcsPtr = InvalidVmcsPointer;
     VmcsMap vmcsRegions;
     std::optional<EptConfig> activeEptConfig;
-    // Tracks "blocking by NMI" (SDM Vol. 3C 24.4.2) across VM entry/exit
-    // for the current VMCS's guest. This model does not implement the
-    // "virtual NMIs" control, "NMI-window exiting", or IRET-triggered
-    // unblocking, so this bit is set only as a direct effect of VM-entry
-    // NMI injection and is otherwise carried through unchanged; it exists
-    // so that a guest hypervisor's VMREAD of the guest-interruptibility-
-    // state field after a VM exit reflects an NMI it asked to inject.
+    // Physical NMI blocking for the current guest. Virtual NMIs and
+    // NMI-window exiting remain unsupported.
     bool guestNmiBlocked = false;
+    struct IretState
+    {
+        Addr rip;
+        bool unblockedNmi;
+    };
+    std::optional<IretState> guestIret;
 
     // Tracks the one-instruction "interrupt shadow" the guest hypervisor
     // requested via the STI-blocking / MOV-SS-blocking bits of the guest-
@@ -359,6 +362,14 @@ class VmxState
     // X86ISA::Interrupts::checkInterrupts().
     bool interruptShadowBlocksMaskable(ThreadContext *tc) const;
     bool interruptShadowBlocksNmi(ThreadContext *tc) const;
+    void beginGuestIret(ThreadContext *tc);
+    void
+    endGuestIret()
+    {
+        guestIret.reset();
+    }
+    bool iretMemoryAccess(ThreadContext *tc, const StaticInstPtr &inst) const;
+    void acceptGuestEvent(bool nmi);
     bool hltCausesExit() const;
     bool invlpgCausesExit() const;
     bool movDrCausesExit() const;
