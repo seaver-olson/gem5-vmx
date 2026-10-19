@@ -53,6 +53,14 @@ struct WalkState
              input.access != EptAccess::Execute)) {
             return;
         }
+        // A valid 52-bit GPA outside four-level EPT's range is an
+        // architectural violation, not an invalid walker invocation.
+        // No entry is consulted, so the reported EPT permissions are zero.
+        if (config.walkLength == 4 && !(input.guestPhysical & ~mask(52)) &&
+            bits(input.guestPhysical, 51, 48)) {
+            result = WalkResult{WalkStatus::Violation};
+            return;
+        }
         const auto root = rootEntryAddress(input, physicalBits);
         if (!root)
             return;

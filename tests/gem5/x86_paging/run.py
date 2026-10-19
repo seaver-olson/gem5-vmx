@@ -251,6 +251,22 @@ def main():
         ]
         cases += [
             (
+                f"ept-wide-gpa-{cpu}",
+                "config.py",
+                [
+                    "--cpu",
+                    cpu,
+                    "--guest",
+                    "ept_entry",
+                    "--caches",
+                    "--physical-bits",
+                    "52",
+                ],
+            )
+            for cpu in ("atomic", "timing", "minor", "o3")
+        ]
+        cases += [
+            (
                 f"vmx-nmi-{cpu}",
                 "config.py",
                 ["--cpu", cpu, "--guest", "vmx_nmi", "--caches"],

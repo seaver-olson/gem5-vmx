@@ -32,6 +32,13 @@ parser.add_argument(
 )
 parser.add_argument("--no-snoop-filter", action="store_true")
 parser.add_argument(
+    "--physical-bits",
+    type=int,
+    choices=[32, 40, 48, 52],
+    default=48,
+    help="Advertise this MAXPHYADDR through CPUID.80000008H",
+)
+parser.add_argument(
     "--pcid",
     action="store_true",
     help="Advertise PCID for control-register tests",
@@ -199,6 +206,9 @@ else:
     system.cpu.mmu.dtb.walker.port = system.membus.cpu_side_ports
 system.cpu.createInterruptController()
 system.cpu.createThreads()
+address_sizes = list(system.cpu.isa[0].LongModeAddressSize)
+address_sizes[0] = (int(address_sizes[0]) & ~0xFF) | args.physical_bits
+system.cpu.isa[0].LongModeAddressSize = address_sizes
 if args.pcid:
     features = list(system.cpu.isa[0].FamilyModelStepping)
     features[3] = int(features[3]) | (1 << 17)
@@ -211,6 +221,7 @@ if args.switch_to:
     }[args.switch_to](cpu_id=0, switched_out=True)
     system.switch_cpu.mmu.itb = system.switch_cpu.mmu.dtb
     system.switch_cpu.createThreads()
+    system.switch_cpu.isa[0].LongModeAddressSize = address_sizes
     if args.pcid:
         system.switch_cpu.isa[0].FamilyModelStepping = features
 system.cpu.interrupts[0].pio = system.membus.mem_side_ports

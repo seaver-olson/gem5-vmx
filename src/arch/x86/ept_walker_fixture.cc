@@ -1163,7 +1163,23 @@ PagingTester::eptCases()
     for (unsigned levels : {4, 5}) {
         setup(levels);
         gpa |= 1ULL << (12 + 9 * levels);
-        check("GPA outside walk width", WalkStatus::InvalidInput, 0);
+        check("GPA outside walk width",
+              levels == 4 ? WalkStatus::Violation : WalkStatus::InvalidInput,
+              0, EptAccess::Read, 0);
+    }
+    for (unsigned bit = 48; bit < 52; ++bit) {
+        for (bool ad : {false, true}) {
+            for (auto access :
+                 {EptAccess::Read, EptAccess::Write, EptAccess::Execute}) {
+                setup();
+                physicalBits = 52;
+                config = *ept::decodeEptp(config.eptp | (ad ? 64 : 0),
+                                          capability, physicalBits);
+                gpa |= 1ULL << bit;
+                check("four-level GPA overflow", WalkStatus::Violation, 0,
+                      access, 0);
+            }
+        }
     }
     for (unsigned field = 0; field < 5; ++field) {
         setup();
@@ -1174,6 +1190,7 @@ PagingTester::eptCases()
           case 3: config.accessedDirty = true; break;
           case 4: config.eptp |= 128; break;
         }
+        gpa |= 1ULL << 48; // Invalid configuration must win over overflow.
         check("inconsistent captured config", WalkStatus::InvalidInput, 0);
     }
     for (unsigned bit : {6, 14}) {

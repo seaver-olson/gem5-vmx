@@ -140,7 +140,7 @@ python3 tests/gem5/x86_paging/run.py --ept-only --outdir /tmp/ept-walker-tests
 
 It runs with and without a Classic walker cache, in atomic and timing system
 configurations. Atomic configurations compare atomic and functional results
-for all 109 scenarios (218 lookups); timing configurations replay the same
+for all maintained scenarios; timing configurations replay the same
 scenarios asynchronously and compare against their functional results.
 Functional lookups must leave simulated time and table contents unchanged.
 Tables are initialized by the fixture, then every EPT entry is read as an
@@ -151,6 +151,10 @@ versus misconfiguration ordering, leaf attributes, UC/WB requests, unchanged
 tables, physical read errors, and exact accumulated atomic memory latency.
 Invalid inputs, including EPT A/D without its capability bit, fail before
 any memory request.
+Legal 52-bit GPAs outside a four-level EPT's range return EPT violation with
+zero permissions and no memory requests, including with A/D enabled. Separate
+`--physical-bits 52 --guest ept_entry` CPU runs check read, write and fetch
+exit delivery for GPA bits 48 through 51 on all four CPU models.
 Returned HPAs deliberately lie outside fixture RAM to verify that the walker
 does not access translated data. Additional timing cases exercise retries,
 cancellation before admission, at rejection and after issue (including a

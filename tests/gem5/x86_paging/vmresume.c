@@ -56,7 +56,7 @@ controls(uint32_t reg, uint32_t wanted)
 }
 
 #ifdef EPT_ENTRY_TEST
-static volatile uint64_t guest_tables[3][512] __attribute__((aligned(4096)));
+static volatile uint64_t guest_tables[4][512] __attribute__((aligned(4096)));
 static volatile uint64_t ept_tables[6][512] __attribute__((aligned(4096)));
 static volatile uint32_t ept_data[1024] __attribute__((aligned(4096)));
 extern void ept_guest_read(void), ept_guest_write(void), ept_guest_exit(void);
@@ -178,6 +178,30 @@ test_ept_entry(uint64_t host_cr3)
                   ((uint64_t)ept_data | 0x37 | (ad ? 0x300 : 0)),
               125);
         ept_tables[ad][0] = 0; // The next entry must capture its new root.
+    }
+    uint32_t a = 0x80000008, b, c, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    if ((a & 0xff) == 52) {
+        // Legal guest PTEs can exceed four-level EPT's GPA range. The
+        // instruction remains low while its data page is remapped high.
+        ept_tables[0][0] = (uint64_t)ept_tables[2] | 7;
+        ept_tables[4][3] = (uint64_t)guest_tables[3] | 0x37;
+        guest_tables[2][2] = 0x1803003;
+        field(0x201a, (uint64_t)ept_tables[0] | 0x1e);
+        for (unsigned bit = 48; bit < 52; ++bit) {
+            for (unsigned access = 0; access < 3; ++access) {
+                const uint64_t high = 1ull << bit;
+                guest_tables[3][0] = 0x2000003 | (access == 2 ? high : 0);
+                guest_tables[3][1] = 0x2001003 | high;
+                uint64_t rip =
+                    GUEST_IP(access == 1 ? ept_guest_write : ept_guest_read);
+                field(0x681e, rip);
+                check(enter_guest(1) == 0, 126);
+                check_ept_exit(48, 0x180 | (1u << access),
+                               high | (access == 2 ? 0x2000000 : 0x2001000),
+                               access == 2 ? 0x400000 : 0x401000, rip);
+            }
+        }
     }
     // Disable EPT on resume; neither host nor next guest may retain it.
     field(0x4002, controls(0x48e, 0));
