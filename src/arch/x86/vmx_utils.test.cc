@@ -202,6 +202,69 @@ TEST(VmxEventInjection, SoftwareClassInstructionLengthValid)
     EXPECT_FALSE(vmx::softwareClassInstructionLengthValid(16, true));
 }
 
+// Event type comes from its source: INT 3 and INT3 share a vector but do
+// not have the same VMX interruption type or software length.
+TEST(VmxEventDelivery, PreservesTypeAndErrorCode)
+{
+    using Type = vmx::InterruptionType;
+    const vmx::DeliveryContext int3{3, Type::SoftwareException, std::nullopt,
+                                    1};
+    const vmx::DeliveryContext intN{3, Type::SoftwareInterrupt, std::nullopt,
+                                    2};
+    const vmx::DeliveryContext pf{14, Type::HardwareException, 5, 0};
+    EXPECT_EQ(int3.interruptionInfo(), 0x80000603);
+    EXPECT_EQ(intN.interruptionInfo(), 0x80000403);
+    EXPECT_EQ(pf.interruptionInfo(), 0x80000b0e);
+    EXPECT_TRUE(int3.softwareEvent());
+    EXPECT_TRUE(intN.softwareEvent());
+    EXPECT_FALSE(pf.softwareEvent());
+    EXPECT_EQ(*pf.errorCode, 5);
+}
+
+// VM-entry injection preserves RF even for an injected hardware fault.
+TEST(VmxEventDelivery, ResumeFlagImage)
+{
+    vmx::DeliveryContext event{14, vmx::InterruptionType::HardwareException, 0,
+                               0};
+    constexpr uint64_t rf = 1u << 16;
+    EXPECT_EQ(event.rflagsImage(0x202), 0x202);
+    EXPECT_EQ(event.rflagsImage(0x202 | rf), 0x202 | rf);
+    event.resumeFlag = true;
+    EXPECT_EQ(event.rflagsImage(0x202), 0x202 | rf);
+    event.resumeFlag = false;
+    EXPECT_EQ(event.rflagsImage(0x202 | rf), 0x202);
+}
+
+// Intel's double-fault table is asymmetric: contributory -> #PF is
+// serial delivery, whereas #PF -> contributory becomes #DF.
+TEST(VmxEventDelivery, NestedExceptionMatrix)
+{
+    using Action = vmx::NestedException;
+    using Type = vmx::InterruptionType;
+    const uint8_t vectors[] = {6, 13, 14};
+    const Action expected[3][3] = {
+        {Action::Deliver, Action::Deliver, Action::Deliver},
+        {Action::Deliver, Action::DoubleFault, Action::Deliver},
+        {Action::Deliver, Action::DoubleFault, Action::DoubleFault}};
+    for (unsigned i = 0; i < 3; ++i) {
+        const std::optional<vmx::DeliveryContext> a = vmx::DeliveryContext{
+            vectors[i], Type::HardwareException, std::nullopt, 0};
+        for (unsigned j = 0; j < 3; ++j) {
+            EXPECT_EQ(vmx::nestedException(a, vectors[j]), expected[i][j]);
+            // Classification must not replace the original event.
+            EXPECT_EQ(a->vector, vectors[i]);
+        }
+    }
+    const vmx::DeliveryContext softwareGp{13, Type::SoftwareInterrupt,
+                                          std::nullopt, 2};
+    EXPECT_EQ(vmx::nestedException(softwareGp, 13), Action::Deliver);
+    const vmx::DeliveryContext df{8, Type::HardwareException, 0, 0};
+    EXPECT_EQ(vmx::nestedException(df, 13), Action::TripleFault);
+    EXPECT_EQ(vmx::nestedException(df, 6), Action::Deliver);
+    EXPECT_EQ(vmx::nestedException(df, 6, true), Action::TripleFault);
+    EXPECT_EQ(vmx::nestedException(std::nullopt, 13), Action::Deliver);
+}
+
 } // namespace
 } // namespace X86ISA
 } // namespace gem5

@@ -37,6 +37,7 @@
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/utility.hh"
 #include "arch/x86/vmx_utils.hh"
 #include "base/compiler.hh"
 #include "cpu/base.hh"
@@ -67,6 +68,10 @@ constexpr uint32_t VmExitLoadIa32Efer = 1u << 21;
 
 constexpr uint32_t VmEntryIa32eModeGuest = 1u << 9;
 constexpr uint32_t VmEntryLoadIa32Efer = 1u << 15;
+
+constexpr std::array<RegIndex, 8> DeliverySegmentRegs = {
+    misc_reg::Cs, misc_reg::CsBase, misc_reg::CsLimit, misc_reg::CsAttr,
+    misc_reg::Ss, misc_reg::SsBase, misc_reg::SsLimit, misc_reg::SsAttr};
 
 } // namespace
 
@@ -140,6 +145,7 @@ ISA::clear()
     // allow VMREAD/VMWRITE after the processor has left VMX operation.
     vmx = VmxState{};
     paePdpteRegs.fill(0);
+    endEventDelivery();
 
     // Blank everything. 0 might not be an appropriate value for some things,
     // but it is for most.
@@ -330,6 +336,7 @@ ISA::copyRegsFrom(ThreadContext *src)
     panic_if(!src_isa, "Cannot copy x86 VMX state from a non-x86 ISA");
     vmx = src_isa->vmxState();
     paePdpteRegs = src_isa->paePdpte();
+    delivery = src_isa->delivery;
     tc->pcState(src->pcState());
 }
 
@@ -621,6 +628,38 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
 }
 
 void
+ISA::beginEventDelivery(const vmx::DeliveryContext &event)
+{
+    // A nested exception changes the accepted event, not the interrupted
+    // frame. There is only one frame until a handler is reached.
+    if (!delivery.event) {
+        delivery.pc = tc->pcState().as<PCState>();
+        delivery.rsp = tc->getReg(int_reg::Rsp);
+        delivery.rflags = getRFlags(tc);
+        for (unsigned i = 0; i < DeliverySegmentRegs.size(); ++i) {
+            delivery.segments[i] = readMiscRegNoEffect(DeliverySegmentRegs[i]);
+        }
+    }
+    delivery.event = event;
+}
+
+void
+ISA::restoreEventDelivery()
+{
+    if (!delivery.event || !vmx.nonRootActive()) {
+        return;
+    }
+    // Called only from precise fault/exit handling, never a translation
+    // callback. Keep the event descriptor and all memory/CR2/NMI effects.
+    for (unsigned i = 0; i < DeliverySegmentRegs.size(); ++i) {
+        tc->setMiscReg(DeliverySegmentRegs[i], delivery.segments[i]);
+    }
+    tc->setReg(int_reg::Rsp, delivery.rsp);
+    setRFlags(tc, delivery.rflags);
+    tc->pcState(delivery.pc);
+}
+
+void
 ISA::serialize(CheckpointOut &cp) const
 {
     BaseISA::serialize(cp);
@@ -628,6 +667,23 @@ ISA::serialize(CheckpointOut &cp) const
     SERIALIZE_ARRAY(regVal, misc_reg::NumRegs);
     for (unsigned i = 0; i < 4; ++i)
         paramOut(cp, csprintf("paePdpte%u", i), paePdpteRegs[i]);
+
+    paramOut(cp, "deliveryActive", delivery.event.has_value());
+    if (delivery.event) {
+        const auto &event = *delivery.event;
+        paramOut(cp, "deliveryVector", event.vector);
+        paramOut(cp, "deliveryType", uint8_t(event.type));
+        paramOut(cp, "deliveryHasErrorCode", event.errorCode.has_value());
+        paramOut(cp, "deliveryErrorCode", event.errorCode.value_or(0));
+        paramOut(cp, "deliveryLength", event.instructionLength);
+        paramOut(cp, "deliveryHasResumeFlag", event.resumeFlag.has_value());
+        paramOut(cp, "deliveryResumeFlag", event.resumeFlag.value_or(false));
+        paramOut(cp, "deliveryRsp", delivery.rsp);
+        paramOut(cp, "deliveryRflags", delivery.rflags);
+        arrayParamOut(cp, "deliverySegments", delivery.segments);
+        Serializable::ScopedCheckpointSection sec(cp, "deliveryPc");
+        delivery.pc.serialize(cp);
+    }
 
     {
         Serializable::ScopedCheckpointSection sec(cp, "vmx");
@@ -648,6 +704,41 @@ ISA::unserialize(CheckpointIn &cp)
     fatal_if(!complete && CR0(regVal[misc_reg::Cr0]).pg &&
              CR4(regVal[misc_reg::Cr4]).pae && !Efer(regVal[misc_reg::Efer]).lme,
              "Active legacy PAE checkpoint lacks retained PDPTE registers");
+    endEventDelivery();
+    bool deliveryActive = false;
+    optParamIn(cp, "deliveryActive", deliveryActive, false);
+    if (deliveryActive) {
+        vmx::DeliveryContext event;
+        uint8_t type;
+        bool hasErrorCode;
+        bool hasResumeFlag, resumeFlag;
+        uint32_t errorCode;
+        paramIn(cp, "deliveryVector", event.vector);
+        paramIn(cp, "deliveryType", type);
+        paramIn(cp, "deliveryHasErrorCode", hasErrorCode);
+        paramIn(cp, "deliveryErrorCode", errorCode);
+        paramIn(cp, "deliveryLength", event.instructionLength);
+        paramIn(cp, "deliveryHasResumeFlag", hasResumeFlag);
+        paramIn(cp, "deliveryResumeFlag", resumeFlag);
+        fatal_if(type == 1 || type > 6 || event.instructionLength > 15,
+                 "Invalid checkpoint event-delivery descriptor");
+        event.type = static_cast<vmx::InterruptionType>(type);
+        if (hasErrorCode) {
+            event.errorCode = errorCode;
+        }
+        if (hasResumeFlag) {
+            event.resumeFlag = resumeFlag;
+        }
+        paramIn(cp, "deliveryRsp", delivery.rsp);
+        paramIn(cp, "deliveryRflags", delivery.rflags);
+        arrayParamIn(cp, "deliverySegments", delivery.segments.data(),
+                     delivery.segments.size());
+        {
+            Serializable::ScopedCheckpointSection sec(cp, "deliveryPc");
+            delivery.pc.unserialize(cp);
+        }
+        delivery.event = event;
+    }
     updateHandyM5Reg(regVal[misc_reg::Efer],
                      regVal[misc_reg::Cr0],
                      regVal[misc_reg::CsAttr],

@@ -27,6 +27,7 @@
 #define __ARCH_X86_VMX_UTILS_HH__
 
 #include <cstdint>
+#include <optional>
 
 #include "base/bitfield.hh"
 
@@ -36,6 +37,89 @@ namespace X86ISA
 {
 namespace vmx
 {
+
+enum class InterruptionType : uint8_t
+{
+    ExternalInterrupt = 0,
+    Nmi = 2,
+    HardwareException = 3,
+    SoftwareInterrupt = 4,
+    PrivilegedSoftwareException = 5,
+    SoftwareException = 6,
+};
+
+inline constexpr uint32_t
+interruptionInfo(uint8_t vector, InterruptionType type, bool errorCodeValid)
+{
+    return (1u << 31) | (uint32_t(type) << 8) | vector |
+           (errorCodeValid ? 1u << 11 : 0);
+}
+
+// The event accepted for architectural delivery, not a newly discovered
+// exception. Interception must be decided before replacing this context.
+struct DeliveryContext
+{
+    uint8_t vector = 0;
+    InterruptionType type = InterruptionType::HardwareException;
+    std::optional<uint32_t> errorCode;
+    uint8_t instructionLength = 0;
+    // Native faults set RF in the saved image; native software events clear
+    // it. VM-entry injection preserves the supplied RF (SDM 29.6.1.1).
+    std::optional<bool> resumeFlag = std::nullopt;
+
+    uint64_t
+    rflagsImage(uint64_t rflags) const
+    {
+        return resumeFlag ? insertBits(rflags, 16, *resumeFlag) : rflags;
+    }
+
+    bool
+    softwareEvent() const
+    {
+        return type == InterruptionType::SoftwareInterrupt ||
+               type == InterruptionType::PrivilegedSoftwareException ||
+               type == InterruptionType::SoftwareException;
+    }
+
+    uint32_t
+    interruptionInfo() const
+    {
+        return vmx::interruptionInfo(vector, type, errorCode.has_value());
+    }
+};
+
+enum class NestedException : uint8_t
+{
+    Deliver,
+    DoubleFault,
+    TripleFault,
+};
+
+// SDM Vol. 3A, Table 7-5; in VMX non-root operation an intercepted second
+// exception exits before this classification (Vol. 3C, 28.2).
+inline NestedException
+nestedException(const std::optional<DeliveryContext> &delivery, uint8_t vector,
+                bool vmxNonRoot = false)
+{
+    if (!delivery || delivery->type != InterruptionType::HardwareException) {
+        return NestedException::Deliver;
+    }
+    auto contributory = [](uint8_t v) {
+        return v == 0 || (v >= 10 && v <= 13) || v == 21;
+    };
+    auto pageFault = [](uint8_t v) { return v == 14 || v == 20; };
+    if (delivery->vector == 8) {
+        return vmxNonRoot || contributory(vector) || pageFault(vector)
+                   ? NestedException::TripleFault
+                   : NestedException::Deliver;
+    }
+    if ((contributory(delivery->vector) && contributory(vector)) ||
+        (pageFault(delivery->vector) &&
+         (contributory(vector) || pageFault(vector)))) {
+        return NestedException::DoubleFault;
+    }
+    return NestedException::Deliver;
+}
 
 enum class InstructionFault : uint8_t
 {

@@ -502,6 +502,8 @@ class Vmcs
             VMCS_FIELD(VmExitReason, VmExitInformation, false),
             VMCS_FIELD(VmExitInterruptionInfo, VmExitInformation, false),
             VMCS_FIELD(VmExitInterruptionErrorCode, VmExitInformation, false),
+            VMCS_FIELD(IdtVectoringInfoField, VmExitInformation, false),
+            VMCS_FIELD(IdtVectoringErrorCode, VmExitInformation, false),
             VMCS_FIELD(VmExitInstructionLen, VmExitInformation, false),
             VMCS_FIELD(VmxInstructionInfo, VmExitInformation, false),
 

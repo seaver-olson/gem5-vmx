@@ -44,7 +44,9 @@ output header {{
             X86ISA::X86StaticInst(_mnemonic, _machInst, __opClass)
         {
             flags[IsSerializing] = 1;
+            flags[IsSerializeBefore] = 1;
             flags[IsSerializeAfter] = 1;
+            flags[IsNonSpeculative] = 1;
         }
 
         std::string generateDisassembly(Addr pc,
@@ -74,9 +76,12 @@ def template CPUIDExecute {{
         %(op_rd)s;
         ISA *vmxIsa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
         if (vmxIsa && vmxIsa->vmxState().nonRootActive()) {
-            vmxIsa->vmxState().vmexitInstruction(
-                    xc, VmxExitReason::Cpuid, size());
-            return NoFault;
+            // O3 delivers the exit at commit, after older work retires.
+            VmxExitInfo info;
+            info.reason = VmxExitReason::Cpuid;
+            info.hasInstructionLength = true;
+            info.instructionLength = size();
+            return std::make_shared<VmxExitFault>(info);
         }
         %(code)s;
         %(op_wb)s;

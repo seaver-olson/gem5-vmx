@@ -3,9 +3,15 @@
 ## Scope and baseline
 
 Work began on 2026-09-14 from clean `vmx-ext` commit `cfda3cfabe`.
-The EPT plan is accepted as a staged implementation contract, not as a claim
-that EPT or timing VMX currently works. Production EPT advertisement must stay
-disabled through the complete phase-6 acceptance matrix.
+The original staged plan below is a full-release contract, not evidence that
+every EPT feature works. A limited entry/exit profile is now enabled: four-level
+WB EPT tables, 4 KiB leaves and optional A/D updates. The native EPT guest in
+`tests/gem5/x86_paging/run.py --ept-only` validates architectural entry/exit on
+AtomicSimple, TimingSimple, Minor and O3 with Classic caches, in addition to
+the isolated walker/MMU tests. INVEPT, full memory-type resolution, event
+vectoring faults, active-EPT checkpoints/takeover, the broader release matrix
+and Linux/KVM boot remain release gates. The phase table and bootstrap account
+below record the earlier plan/status, not the current advertised profile.
 
 ## Prerequisite status (2026-09-19)
 

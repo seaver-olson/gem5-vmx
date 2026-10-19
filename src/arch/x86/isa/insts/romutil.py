@@ -75,12 +75,13 @@ def rom
     # we're going to a DPL that's less than or equal to the CPL.
     rdattr t10, hs, dataSize=8
     andi t10, t10, 3, dataSize=8
+    mov t13, t13, t10, dataSize=8
     rdattr t5, cs, dataSize=8
     andi t5, t5, 0x3, dataSize=8
     sub t0, t5, t10, flags=(EZF,), dataSize=8
-    # We're going to change priviledge, so zero out the stack selector. We
-    # need to let the IST have priority so we don't branch yet.
-    mov t11, t0, t0, flags=(nCEZF,)
+    # A stack switch loads a null SS selector with RPL equal to the new CPL.
+    # Let the IST have priority, so don't branch yet.
+    mov t11, t11, t13, flags=(nCEZF,), dataSize=8
 
     # Check the IST field of the gate descriptor
     srli t12, t4, 32, dataSize=8
@@ -95,6 +96,7 @@ def rom
     br rom_local_label("%(startLabel)s_stackSwitched")
 
 %(startLabel)s_istStackSwitch:
+    mov t11, t11, t13, dataSize=8
     ld t6, tr, [8, t12, t0], 0x1c, dataSize=8, addressSize=8, atCPL0=True
     br rom_local_label("%(startLabel)s_stackSwitched")
 
@@ -108,10 +110,8 @@ def rom
     subi t6, t6, 40 + %(errorCodeSize)d, dataSize=8
 
     ##
-    ## Point of no return.
-    ## We're now going to irrevocably modify visible state.
-    ## Anything bad that's going to happen should have happened by now or will
-    ## happen right now.
+    ## Stack translation can still fault after these register updates.
+    ## Precise VMX fault/exit handling restores the interrupted delivery frame.
     ##
     wrip t0, t9, dataSize=8
 
@@ -121,6 +121,8 @@ def rom
     #
     srli t5, t4, 16, dataSize=8
     andi t5, t5, 0xFF, dataSize=8
+    andi t5, t5, 0xFC, dataSize=1
+    or t5, t5, t13, dataSize=8
     wrdl cs, t3, t5, dataSize=8
     # Tuck away the old CS for use below
     limm t10, 0, dataSize=8
@@ -142,7 +144,8 @@ def rom
     %(errorCodeCode)s
     st t7, hs, [1, t0, t6], %(errorCodeSize)d, dataSize=8, addressSize=8
     st t10, hs, [1, t0, t6], 8 + %(errorCodeSize)d, dataSize=8, addressSize=8
-    rflags t10, dataSize=8
+    # The dispatcher supplies the saved image, including event-specific RF.
+    mov t10, t10, t14, dataSize=8
     st t10, hs, [1, t0, t6], 16 + %(errorCodeSize)d, dataSize=8, addressSize=8
     st rsp, hs, [1, t0, t6], 24 + %(errorCodeSize)d, dataSize=8, addressSize=8
     rdsel t5, ss, dataSize=2
@@ -150,6 +153,14 @@ def rom
 
     # Set the stack segment
     mov rsp, rsp, t6, dataSize=8
+    # SS.DPL must match the new CPL even for a null selector. Retaining the
+    # interrupted DPL produces guest state that VMRESUME rejects. The other
+    # cached fields remain unchanged; no SS descriptor is fetched in 64-bit
+    # interrupt stack switching (SDM 3A 7.14.4-5, 3C 29.3.1.2).
+    rdattr t5, ss, dataSize=8
+    andi t5, t5, 0xFC, dataSize=1
+    or t5, t5, t13, dataSize=8
+    wrattr ss, t5, dataSize=8
     wrsel ss, t11, dataSize=2
 
     #
@@ -172,7 +183,7 @@ def rom
     # Put the results into rflags
     wrflags t6, t10
 
-    eret
+    eret endDelivery=True
 };
 """
 

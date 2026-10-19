@@ -130,8 +130,11 @@ output exec {{
     {
         auto *isa = dynamic_cast<ISA *>(xc->tcBase()->getIsaPtr());
         if (isa && isa->vmxState().nonRootActive()) {
-            isa->vmxState().vmexitInstruction(xc, reason, size());
-            return NoFault;
+            VmxExitInfo info;
+            info.reason = reason;
+            info.hasInstructionLength = true;
+            info.instructionLength = size();
+            return std::make_shared<VmxExitFault>(info);
         }
 
         // Preserve baseline gem5's warning/no-op behavior after all

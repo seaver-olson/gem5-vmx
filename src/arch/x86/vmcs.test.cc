@@ -130,6 +130,26 @@ TEST(VmcsFields, EnforcesReadOnlyFieldsForVmwrite)
     EXPECT_EQ(value, 42);
 }
 
+// A VMM must be able to read the interrupted event independently of the
+// fault that caused the exit; both vectoring components are read-only.
+TEST(VmcsFields, IdtVectoringComponentsAreReadableAndReadOnly)
+{
+    Vmcs vmcs(0x2000, 1);
+    uint64_t value = 0;
+    for (const auto field :
+         {Field::IdtVectoringInfoField, Field::IdtVectoringErrorCode}) {
+        EXPECT_TRUE(Vmcs::fieldSupported(field));
+        EXPECT_FALSE(Vmcs::fieldWritable(field));
+        EXPECT_FALSE(vmcs.write(field, 1));
+    }
+    vmcs.writeUnchecked(Field::IdtVectoringInfoField, 0x80000b0e);
+    vmcs.writeUnchecked(Field::IdtVectoringErrorCode, 5);
+    ASSERT_TRUE(vmcs.read(Field::IdtVectoringInfoField, value));
+    EXPECT_EQ(value, 0x80000b0e);
+    ASSERT_TRUE(vmcs.read(Field::IdtVectoringErrorCode, value));
+    EXPECT_EQ(value, 5);
+}
+
 // A supported but never-written component reads as zero. This protects the
 // typed model from accidentally treating absent map entries as unsupported.
 TEST(VmcsFields, ReadsSupportedUnsetFieldsAsZero)

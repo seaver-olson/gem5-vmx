@@ -252,16 +252,7 @@ def macroop IRET_VIRT {
 };
 
 def macroop INT3 {
-
-    limm t1, 0x03, dataSize=8
-
-    rdip t7
-
-    # Are we in long mode?
-    rdm5reg t5
-    andi t0, t5, 0x1, flags=(EZF,)
-    br rom_label("longModeSoftInterrupt"), flags=(CEZF,)
-    br rom_label("legacyModeInterrupt")
+    fault "std::make_shared<Breakpoint>()"
 };
 
 def macroop INT3_VIRT {
@@ -273,14 +264,7 @@ def macroop INT3_REAL {
 };
 
 def macroop INT_LONG_I {
-    #load the byte-sized interrupt vector specified in the instruction
-    .adjust_imm trimImm(8)
-    limm t1, imm, dataSize=8
-
-    rdip t7
-
-    # Are we in long mode?
-    br rom_label("longModeSoftInterrupt")
+    fault "std::make_shared<SoftwareInterrupt>(uint8_t(machInst.immediate))"
 };
 
 def macroop INT_PROT_I {

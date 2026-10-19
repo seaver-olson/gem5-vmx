@@ -41,11 +41,12 @@
 #include "arch/x86/faults.hh"
 
 #include "arch/x86/generated/decoder.hh"
-#include "arch/x86/isa.hh"
 #include "arch/x86/insts/static_inst.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/mmu.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/utility.hh"
 #include "base/loader/symtab.hh"
 #include "base/trace.hh"
 #include "cpu/thread_context.hh"
@@ -59,51 +60,39 @@ namespace gem5
 namespace X86ISA
 {
 
-namespace
-{
-
-uint32_t
-vmxInterruptionInfo(uint8_t vector, VmxInterruptionType type,
-        bool errorCodeValid)
-{
-    uint32_t info = vector;
-    info |= static_cast<uint32_t>(type) << 8;
-    if (errorCodeValid) {
-        info |= 1u << 11;
-    }
-    info |= 1u << 31;
-    return info;
-}
-
-} // namespace
-
 void
 deliverInterruptOrException(ThreadContext *tc, Addr returnRip,
-        uint8_t vector, uint64_t errorCode)
+                            const vmx::DeliveryContext &event,
+                            bool softwareGateCheck)
 {
     using namespace X86ISAInst::rom_labels;
     PCState pc = tc->pcState().as<PCState>();
     HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
     MicroPC entry;
     if (m5reg.mode == LongMode) {
-        entry = extern_label_longModeInterrupt;
+        entry = softwareGateCheck ? extern_label_longModeSoftInterrupt
+                                  : extern_label_longModeInterrupt;
     } else {
         if (m5reg.submode == RealMode)
             entry = extern_label_realModeInterrupt;
         else
             entry = extern_label_legacyModeInterrupt;
     }
-    tc->setReg(intRegMicro(1), vector);
+    if (auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr())) {
+        isa->beginEventDelivery(event);
+    }
+    tc->setReg(intRegMicro(1), event.vector);
     Addr cs_base = tc->readMiscRegNoEffect(misc_reg::CsEffBase);
     tc->setReg(intRegMicro(7), returnRip - cs_base);
-    if (errorCode != (uint64_t)(-1)) {
+    tc->setReg(intRegMicro(14), event.rflagsImage(getRFlags(tc)));
+    if (event.errorCode) {
         if (m5reg.mode == LongMode) {
             entry = extern_label_longModeInterruptWithError;
         } else {
             panic("Legacy mode interrupts with error codes "
                     "aren't implemented.");
         }
-        tc->setReg(intRegMicro(15), errorCode);
+        tc->setReg(intRegMicro(15), *event.errorCode);
     }
     pc.upc(romMicroPC(entry));
     pc.nupc(romMicroPC(entry) + 1);
@@ -114,22 +103,52 @@ void
 X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
     auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    if (isa) {
+        isa->restoreEventDelivery();
+    }
+    vmx::DeliveryContext event;
+    event.vector = vector;
+    if (dynamic_cast<X86Fault *>(this)) {
+        event.resumeFlag = true;
+    }
+    if (dynamic_cast<SoftwareInterrupt *>(this)) {
+        event.type = VmxInterruptionType::SoftwareInterrupt;
+    } else if (dynamic_cast<ExternalInterrupt *>(this)) {
+        event.type = VmxInterruptionType::ExternalInterrupt;
+    } else if (dynamic_cast<NonMaskableInterrupt *>(this)) {
+        event.type = VmxInterruptionType::Nmi;
+    } else if (dynamic_cast<Breakpoint *>(this) ||
+               dynamic_cast<OverflowTrap *>(this)) {
+        event.type = VmxInterruptionType::SoftwareException;
+    }
+    if (event.type == VmxInterruptionType::HardwareException &&
+        errorCode != (uint64_t)-1) {
+        event.errorCode = errorCode;
+    }
+    if (event.softwareEvent() && inst) {
+        event.instructionLength = inst->size();
+    }
+    if (event.softwareEvent()) {
+        event.resumeFlag = false;
+    }
+    if (event.errorCode && vector >= 10 && vector <= 13 && isa &&
+        isa->eventDelivery()) {
+        // Selector error codes describe the event during whose delivery
+        // this fault arose. #PF uses a different error-code format.
+        const auto type = isa->eventDelivery()->type;
+        const bool external = type != VmxInterruptionType::SoftwareInterrupt &&
+                              type != VmxInterruptionType::SoftwareException;
+        event.errorCode = (*event.errorCode & ~1u) | unsigned(external);
+    }
+
     if (isa && isa->vmxState().nonRootActive()) {
         VmxExitInfo exitInfo;
         bool shouldExit = false;
-
         if (dynamic_cast<ExternalInterrupt *>(this)) {
             shouldExit = isa->vmxState().shouldExitOnExternalInterrupt();
             exitInfo.reason = VmxExitReason::ExternalInterrupt;
-            exitInfo.hasInterruptionInfo = true;
-            exitInfo.interruptionInfo = vmxInterruptionInfo(vector,
-                    VmxInterruptionType::ExternalInterrupt, false);
         } else if (dynamic_cast<NonMaskableInterrupt *>(this)) {
             shouldExit = isa->vmxState().shouldExitOnNmi();
-            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
-            exitInfo.hasInterruptionInfo = true;
-            exitInfo.interruptionInfo = vmxInterruptionInfo(2,
-                    VmxInterruptionType::Nmi, false);
         } else if (dynamic_cast<SystemManagementInterrupt *>(this)) {
             shouldExit = true;
             exitInfo.reason = VmxExitReason::OtherSmi;
@@ -141,31 +160,29 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
             exitInfo.reason = VmxExitReason::StartupIpi;
             exitInfo.hasQualification = true;
             exitInfo.qualification = vector;
-        } else {
-            const uint64_t checkedErrorCode =
-                errorCode == (uint64_t)-1 ? 0 : errorCode;
+        } else if (event.type != VmxInterruptionType::SoftwareInterrupt) {
             shouldExit = isa->vmxState().shouldExitOnException(
-                    vector, checkedErrorCode);
-            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
-            const bool hasErrorCode = errorCode != (uint64_t)-1;
-            const VmxInterruptionType type =
-                (dynamic_cast<Breakpoint *>(this) ||
-                 dynamic_cast<OverflowTrap *>(this)) ?
-                VmxInterruptionType::SoftwareException :
-                VmxInterruptionType::HardwareException;
-            if (type == VmxInterruptionType::SoftwareException && inst) {
-                exitInfo.hasInstructionLength = true;
-                exitInfo.instructionLength = inst->size();
+                vector, event.errorCode.value_or(0));
+        }
+        if (shouldExit) {
+            exitInfo.resumeFlag = event.resumeFlag;
+            if (exitInfo.reason == VmxExitReason::ExceptionOrNmi ||
+                exitInfo.reason == VmxExitReason::ExternalInterrupt) {
+                exitInfo.hasInterruptionInfo = true;
+                exitInfo.interruptionInfo = event.interruptionInfo();
+                exitInfo.hasInterruptionErrorCode =
+                    event.errorCode.has_value();
+                exitInfo.interruptionErrorCode = event.errorCode.value_or(0);
             }
-            exitInfo.hasInterruptionInfo = true;
-            exitInfo.interruptionInfo = vmxInterruptionInfo(
-                    vector, type, hasErrorCode);
-            exitInfo.hasInterruptionErrorCode = hasErrorCode;
-            exitInfo.interruptionErrorCode = checkedErrorCode;
-            if (dynamic_cast<DebugException *>(this)) {
-                // SDM Table 30-1: the supported #DB sources use the DR6
-                // B0-B3, BD, and BS positions. Bus-lock and RTM debug
-                // sources are not enumerated by this x86 model.
+            if (event.softwareEvent()) {
+                exitInfo.hasInstructionLength = true;
+                exitInfo.instructionLength = event.instructionLength;
+            }
+            if (auto *pf = dynamic_cast<PageFault *>(this)) {
+                // A directly intercepted #PF leaves CR2 unchanged.
+                exitInfo.hasQualification = true;
+                exitInfo.qualification = pf->address();
+            } else if (dynamic_cast<DebugException *>(this)) {
                 constexpr uint64_t supportedDebugQualification =
                     0xf | (1ull << 13) | (1ull << 14);
                 exitInfo.hasQualification = true;
@@ -173,10 +190,11 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
                     tc->readMiscRegNoEffect(misc_reg::Dr6) &
                     supportedDebugQualification;
             }
-        }
-
-        if (shouldExit && isa->vmxState().vmexitEvent(tc, exitInfo)) {
-            return;
+            // A remains the vectoring context if the newly discovered B
+            // exits. Only accepted architectural delivery may replace A.
+            if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
+                return;
+            }
         }
     }
 
@@ -185,9 +203,37 @@ X86FaultBase::invoke(ThreadContext *tc, const StaticInstPtr &inst)
         return;
     }
 
+    if (auto *pf = dynamic_cast<PageFault *>(this)) {
+        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+        tc->setMiscReg(misc_reg::Cr2, m5reg.mode == LongMode
+                                          ? pf->address()
+                                          : uint32_t(pf->address()));
+    }
+    if (isa && event.type == VmxInterruptionType::HardwareException) {
+        const auto nested = vmx::nestedException(
+            isa->eventDelivery(), vector, isa->vmxState().nonRootActive());
+        if (nested == vmx::NestedException::TripleFault) {
+            VmxExitInfo info;
+            info.reason = VmxExitReason::TripleFault;
+            if (isa->vmxState().vmexitEvent(tc, info)) {
+                return;
+            }
+            panic("Triple fault during x86 event delivery");
+        }
+        if (nested == vmx::NestedException::DoubleFault) {
+            Fault df = std::make_shared<DoubleFault>();
+            df->invoke(tc, inst);
+            return;
+        }
+    }
+
     PCState pc = tc->pcState().as<PCState>();
     DPRINTF(Faults, "RIP %#x: vector %d: %s\n", pc.pc(), vector, describe());
-    deliverInterruptOrException(tc, pc.pc(), vector, errorCode);
+    const Addr returnRip =
+        pc.pc() + (event.softwareEvent() ? event.instructionLength : 0);
+    deliverInterruptOrException(tc, returnRip, event,
+                                event.type ==
+                                    VmxInterruptionType::SoftwareInterrupt);
 }
 
 std::string
@@ -212,6 +258,12 @@ X86Trap::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 void
 X86Abort::invoke(ThreadContext *tc, const StaticInstPtr &inst)
 {
+    if (vector == 8) {
+        // #DF participates in the same accepted-delivery lifecycle. A fault
+        // during its delivery is intercepted first, or becomes a triple fault.
+        X86FaultBase::invoke(tc, inst);
+        return;
+    }
     // gem5 does not have a general in-guest delivery path for abort-class
     // exceptions, but an exception-bitmap VM exit occurs before that
     // delivery and is architecturally well defined.  Honor that interception
@@ -226,8 +278,8 @@ X86Abort::invoke(ThreadContext *tc, const StaticInstPtr &inst)
         exitInfo.reason = VmxExitReason::ExceptionOrNmi;
         exitInfo.hasInterruptionInfo = true;
         const bool hasErrorCode = errorCode != (uint64_t)-1;
-        exitInfo.interruptionInfo = vmxInterruptionInfo(vector,
-                VmxInterruptionType::HardwareException, hasErrorCode);
+        exitInfo.interruptionInfo = vmx::interruptionInfo(
+            vector, VmxInterruptionType::HardwareException, hasErrorCode);
         exitInfo.hasInterruptionErrorCode = hasErrorCode;
         exitInfo.interruptionErrorCode = checkedErrorCode;
         if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
@@ -260,40 +312,8 @@ PageFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
         static_cast<MMU *>(tc->getMMUPtr())->invalidateLinear(addr, tc);
     }
 
-    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
-    if (isa && isa->vmxState().nonRootActive()) {
-        const uint64_t checkedErrorCode =
-            errorCode == (uint64_t)-1 ? 0 : errorCode;
-        if (isa->vmxState().shouldExitOnException(vector, checkedErrorCode)) {
-            VmxExitInfo exitInfo;
-            exitInfo.reason = VmxExitReason::ExceptionOrNmi;
-            exitInfo.hasInterruptionInfo = true;
-            exitInfo.interruptionInfo = vmxInterruptionInfo(
-                    vector, VmxInterruptionType::HardwareException, true);
-            exitInfo.hasInterruptionErrorCode = true;
-            exitInfo.interruptionErrorCode = checkedErrorCode;
-            // SDM 30.2.1: a page fault that directly causes a VM exit does
-            // not update CR2; its faulting linear address is instead saved
-            // in the exit-qualification field.
-            exitInfo.hasQualification = true;
-            exitInfo.qualification = addr;
-            if (isa->vmxState().vmexitEvent(tc, exitInfo)) {
-                return;
-            }
-        }
-    }
-
     if (FullSystem) {
-        HandyM5Reg m5reg = tc->readMiscRegNoEffect(misc_reg::M5Reg);
-        X86FaultBase::invoke(tc);
-        // If something bad happens while trying to enter the page fault
-        // handler, I'm pretty sure that's a double fault and then all
-        // bets are off. That means it should be safe to update this
-        // state now.
-        if (m5reg.mode == LongMode)
-            tc->setMiscReg(misc_reg::Cr2, addr);
-        else
-            tc->setMiscReg(misc_reg::Cr2, (uint32_t)addr);
+        X86FaultBase::invoke(tc, inst);
     } else if (!tc->getProcessPtr()->fixupFault(addr)) {
         PageFaultErrorCode code = errorCode;
         const char *modeStr = "";

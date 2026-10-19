@@ -8,6 +8,7 @@
 #include "arch/x86/ept.hh"
 #include "arch/x86/regs/segment.hh"
 #include "arch/x86/vmcs.hh"
+#include "arch/x86/vmx_utils.hh"
 #include "base/types.hh"
 #include "cpu/null_static_inst.hh"
 #include "mem/request.hh"
@@ -122,15 +123,7 @@ enum class VmxInstructionError : uint32_t
     InveptInvvpidInvalidOperand = 28,
 };
 
-enum class VmxInterruptionType : uint8_t
-{
-    ExternalInterrupt = 0,
-    Nmi = 2,
-    HardwareException = 3,
-    SoftwareInterrupt = 4,
-    PrivilegedSoftwareException = 5,
-    SoftwareException = 6,
-};
+using VmxInterruptionType = vmx::InterruptionType;
 
 enum class VmxCrAccessType : uint8_t
 {
@@ -159,6 +152,7 @@ struct VmxExitInfo
 
     bool hasInterruptionErrorCode = false;
     uint32_t interruptionErrorCode = 0;
+    std::optional<bool> resumeFlag = std::nullopt;
 
     bool hasGuestLinearAddress = false;
     uint64_t guestLinearAddress = 0;
@@ -312,7 +306,7 @@ class VmxState
             Vmcs &vmcs) const;
     bool loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const;
     bool loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const;
-    void saveGuestState(ThreadContext *tc, Vmcs &vmcs) const;
+    void saveGuestState(ThreadContext *tc, Vmcs &vmcs, uint64_t rflags) const;
     VmxResult failVmEntry(ThreadContext *tc, Vmcs &vmcs,
             VmxExitReason reason, uint64_t qualification = 0);
     VmxResult vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize);

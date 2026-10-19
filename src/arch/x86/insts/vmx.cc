@@ -1131,7 +1131,7 @@ VmxState::loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const
 }
 
 void
-VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs) const
+VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs, uint64_t rflags) const
 {
     vmcs.writeUnchecked(VmcsGuestCr0,
             tc->readMiscRegNoEffect(misc_reg::Cr0));
@@ -1145,7 +1145,7 @@ VmxState::saveGuestState(ThreadContext *tc, Vmcs &vmcs) const
     }
     vmcs.writeUnchecked(VmcsGuestRsp, tc->getReg(int_reg::Rsp));
     vmcs.writeUnchecked(VmcsGuestRip, currentRip(tc));
-    vmcs.writeUnchecked(VmcsGuestRflags, getRFlags(tc));
+    vmcs.writeUnchecked(VmcsGuestRflags, rflags);
     if (readOrZero(vmcs, VmcsVmExitControls) & VmExitSaveIa32Efer) {
         vmcs.writeUnchecked(VmcsGuestIa32Efer,
                 tc->readMiscRegNoEffect(misc_reg::Efer));
@@ -1384,6 +1384,7 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
         return failVmEntry(tc, *vmcs,
                 VmxExitReason::VmEntryInvalidGuestState);
     }
+    static_cast<ISA *>(tc->getIsaPtr())->endEventDelivery();
 
     // SDM Vol. 3C 26.4: VM-entry MSR loading happens after guest-state
     // loading and before event injection. MSR-load-area processing itself
@@ -1443,7 +1444,17 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
         DPRINTF(VMX, "VM-entry injecting event: vector %d type %d "
                 "errorCode %#x return RIP %#x\n", vector, injectionType,
                 deliverErrorCode ? errorCode : 0, pushedRip);
-        deliverInterruptOrException(tc, pushedRip, vector, errorCode);
+        PCState deliveryPc(guestRip);
+        deliveryPc.setNPC(guestRip);
+        tc->pcState(deliveryPc);
+        vmx::DeliveryContext event;
+        event.vector = vector;
+        event.type = static_cast<VmxInterruptionType>(injectionType);
+        if (deliverErrorCode) {
+            event.errorCode = errorCode;
+        }
+        event.instructionLength = instructionLen;
+        deliverInterruptOrException(tc, pushedRip, event);
     }
 
     inVmxNonRoot = true;
@@ -1475,12 +1486,52 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
         reason |= VmExitReasonVmEntryFailure;
     }
 
-    saveGuestState(tc, *vmcs);
+    auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+    const auto &delivery = isa->eventDelivery();
+    const bool exceptionDuringDelivery =
+        exitInfo.reason == VmxExitReason::ExceptionOrNmi &&
+        exitInfo.hasInterruptionInfo && bits(exitInfo.interruptionInfo, 31) &&
+        bits(exitInfo.interruptionInfo, 10, 8) ==
+            static_cast<uint8_t>(VmxInterruptionType::HardwareException) &&
+        bits(exitInfo.interruptionInfo, 7, 0) != 8;
+    // SDM 30.2.4: a directly intercepted #DF or triple fault does not
+    // report the previous event. An intercepted B otherwise still reports
+    // A, because the dispatcher has not yet accepted B for delivery.
+    const bool vectoring =
+        delivery && !exitInfo.vmEntryFailure &&
+        (exceptionDuringDelivery ||
+         exitInfo.reason == VmxExitReason::EptViolation ||
+         exitInfo.reason == VmxExitReason::EptMisconfiguration);
+    uint32_t instructionLength =
+        exitInfo.hasInstructionLength ? exitInfo.instructionLength : 0;
+    if (vectoring && delivery->softwareEvent() &&
+        (exceptionDuringDelivery ||
+         exitInfo.reason == VmxExitReason::EptViolation)) {
+        // 30.2.5 defines this for software-event faults/EPT violations;
+        // EPT misconfiguration does not define an instruction length.
+        instructionLength = delivery->instructionLength;
+    }
+
+    // SDM 30.1: an incomplete delivery leaves its interrupted frame intact,
+    // even when #DF/triple-fault rules suppress vectoring information.
+    isa->restoreEventDelivery();
+    uint64_t rflags = getRFlags(tc);
+    if (exitInfo.reason == VmxExitReason::EptViolation ||
+        exitInfo.reason == VmxExitReason::EptMisconfiguration) {
+        // SDM 30.3.3: during delivery use its would-be stacked RF; ordinary
+        // EPT exits instead save RF=1.
+        rflags = vectoring ? delivery->rflagsImage(rflags) : rflags | RFBit;
+    } else if (exitInfo.resumeFlag) {
+        rflags = insertBits(rflags, 16, *exitInfo.resumeFlag);
+    } else if (exitInfo.hasInstructionLength &&
+               exitInfo.reason != VmxExitReason::ExceptionOrNmi) {
+        rflags &= ~RFBit;
+    }
+    saveGuestState(tc, *vmcs, rflags);
     vmcs->writeUnchecked(VmcsVmExitReason, reason);
     vmcs->writeUnchecked(VmcsExitQualification,
             exitInfo.hasQualification ? exitInfo.qualification : 0);
-    vmcs->writeUnchecked(VmcsVmExitInstructionLen,
-            exitInfo.hasInstructionLength ? exitInfo.instructionLength : 0);
+    vmcs->writeUnchecked(VmcsVmExitInstructionLen, instructionLength);
     vmcs->writeUnchecked(VmcsVmxInstructionInfo,
             exitInfo.hasInstructionInfo ? exitInfo.instructionInfo : 0);
     vmcs->writeUnchecked(VmcsVmExitInterruptionInfo,
@@ -1488,12 +1539,17 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
     vmcs->writeUnchecked(VmcsVmExitInterruptionErrorCode,
             exitInfo.hasInterruptionErrorCode ?
             exitInfo.interruptionErrorCode : 0);
+    vmcs->writeUnchecked(VmcsField::IdtVectoringInfoField,
+                         vectoring ? delivery->interruptionInfo() : 0);
+    vmcs->writeUnchecked(VmcsField::IdtVectoringErrorCode,
+                         vectoring ? delivery->errorCode.value_or(0) : 0);
     vmcs->writeUnchecked(VmcsGuestLinearAddress,
             exitInfo.hasGuestLinearAddress ?
             exitInfo.guestLinearAddress : 0);
     vmcs->writeUnchecked(VmcsGuestPhysicalAddress,
             exitInfo.hasGuestPhysicalAddress ?
             exitInfo.guestPhysicalAddress : 0);
+    isa->endEventDelivery();
 
     Addr hostRipValue = 0;
     if (!loadHostState(tc, *vmcs, hostRipValue)) {

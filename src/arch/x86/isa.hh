@@ -63,6 +63,14 @@ class ISA : public BaseISA
     std::string vendorString;
     VmxState vmx;
     std::array<RegVal, 4> paePdpteRegs{};
+    struct DeliveryState
+    {
+        std::optional<vmx::DeliveryContext> event;
+        PCState pc{0};
+        RegVal rsp = 0;
+        RegVal rflags = 0;
+        std::array<RegVal, 8> segments{};
+    } delivery;
 
   public:
     void clear() override;
@@ -102,6 +110,21 @@ class ISA : public BaseISA
     std::string getVendorString() const;
     VmxState &vmxState() { return vmx; }
     const VmxState &vmxState() const { return vmx; }
+
+    // Mutate only at precise acceptance/completion boundaries. Discovering
+    // an exception does not change the event currently being delivered.
+    const std::optional<vmx::DeliveryContext> &
+    eventDelivery() const
+    {
+        return delivery.event;
+    }
+    void beginEventDelivery(const vmx::DeliveryContext &event);
+    void restoreEventDelivery();
+    void
+    endEventDelivery()
+    {
+        delivery.event.reset();
+    }
 
     std::unique_ptr<X86CPUID> cpuid;
 };

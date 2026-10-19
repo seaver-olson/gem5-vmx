@@ -133,7 +133,7 @@ let {{
     microopClasses["br"] = Br
 
     class Eret(X86Microop):
-        def __init__(self, flags=None):
+        def __init__(self, flags=None, endDelivery=False):
             self.className = "Eret"
             if flags:
                 if not isinstance(flags, (list, tuple)):
@@ -142,6 +142,8 @@ let {{
                 self.className += "Flags"
             else:
                 self.cond = "X86ISA::condition_tests::True"
+            if endDelivery:
+                self.className += "Delivery"
 
         def getAllocator(self, microFlags):
             if not "IsLastMicroop" in microFlags:
@@ -169,9 +171,17 @@ let {{
         exec_output += SeqOpExecute.subst(iop)
         header_output += BrDeclare.subst(iop)
 
-        iop = InstObjParams("eret", "Eret" + suffix,
-                "X86ISA::InstOperands<X86ISA::MicroCondBase>",
-                {"code": "", "else_code": "", "cond_test": cond}, flags)
-        exec_output += SeqOpExecute.subst(iop)
-        header_output += EretDeclare.subst(iop)
+        for endDelivery in (False, True):
+            name = "Eret" + suffix + ("Delivery" if endDelivery else "")
+            code = """static_cast<X86ISA::ISA *>(
+                xc->tcBase()->getIsaPtr())->endEventDelivery();""" \
+                if endDelivery else ""
+            end_flags = ["IsNonSpeculative", "IsSerializeAfter"] \
+                if endDelivery else []
+            iop = InstObjParams("eret", name,
+                    "X86ISA::InstOperands<X86ISA::MicroCondBase>",
+                    {"code": code, "else_code": "", "cond_test": cond},
+                    flags + end_flags)
+            exec_output += SeqOpExecute.subst(iop)
+            header_output += EretDeclare.subst(iop)
 }};

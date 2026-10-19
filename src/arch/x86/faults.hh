@@ -41,6 +41,7 @@
 #include <string>
 
 #include "arch/x86/tlb.hh"
+#include "arch/x86/vmx_utils.hh"
 #include "base/bitunion.hh"
 #include "base/logging.hh"
 #include "cpu/null_static_inst.hh"
@@ -58,10 +59,11 @@ namespace X86ISA
 // event injection (Intel SDM Vol. 3C 26.5.1), which must push the
 // requested event onto the newly loaded guest context unconditionally,
 // bypassing the exception-bitmap interception that applies to exceptions
-// that arise during normal guest execution. An errorCode of (uint64_t)-1
-// means no error code is pushed.
+// that arise during normal guest execution. Native INT n additionally checks
+// the IDT gate DPL; injected events do not perform that instruction check.
 void deliverInterruptOrException(ThreadContext *tc, Addr returnRip,
-        uint8_t vector, uint64_t errorCode = (uint64_t)-1);
+                                 const vmx::DeliveryContext &event,
+                                 bool softwareGateCheck = false);
 
 // Base class for all x86 "faults" where faults is in the m5 sense
 class X86FaultBase : public FaultBase
@@ -130,6 +132,16 @@ class X86Interrupt : public X86FaultBase
 {
   protected:
     using X86FaultBase::X86FaultBase;
+};
+
+// INT n is a software interrupt even when n names an exception vector.
+// Return a Fault to let every CPU accept delivery at a precise boundary.
+class SoftwareInterrupt : public X86Interrupt
+{
+  public:
+    explicit SoftwareInterrupt(uint8_t vector)
+        : X86Interrupt("Software Interrupt", "INT", vector)
+    {}
 };
 
 class UnimpInstFault : public FaultBase
@@ -288,6 +300,12 @@ class PageFault : public X86Fault
     PageFault(Addr _addr, uint32_t _errorCode) :
         X86Fault("Page-Fault", "#PF", 14, _errorCode), addr(_addr)
     {}
+
+    Addr
+    address() const
+    {
+        return addr;
+    }
 
     PageFault(Addr _addr, bool present, BaseMMU::Mode mode,
             bool user, bool reserved) :
