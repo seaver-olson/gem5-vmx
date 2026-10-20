@@ -45,6 +45,10 @@
 
 #include "mem/coherent_xbar.hh"
 
+#include <algorithm>
+#include <cstring>
+#include <utility>
+
 #include "base/compiler.hh"
 #include "base/logging.hh"
 #include "base/trace.hh"
@@ -56,15 +60,19 @@ namespace gem5
 {
 
 CoherentXBar::CoherentXBar(const CoherentXBarParams &p)
-    : BaseXBar(p), system(p.system), snoopFilter(p.snoop_filter),
+    : BaseXBar(p),
+      system(p.system),
+      snoopFilter(p.snoop_filter),
       snoopResponseLatency(p.snoop_response_latency),
       maxOutstandingSnoopCheck(p.max_outstanding_snoops),
       maxRoutingTableSizeCheck(p.max_routing_table_size),
       pointOfCoherency(p.point_of_coherency),
       pointOfUnification(p.point_of_unification),
+      uncachedSendEvent([this] { sendUncached(); }, name() + ".uncached_send"),
 
       ADD_STAT(snoops, statistics::units::Count::get(), "Total snoops"),
-      ADD_STAT(snoopTraffic, statistics::units::Byte::get(), "Total snoop traffic"),
+      ADD_STAT(snoopTraffic, statistics::units::Byte::get(),
+               "Total snoop traffic"),
       ADD_STAT(snoopFanout, statistics::units::Count::get(),
                "Request fanout histogram")
 {
@@ -106,6 +114,253 @@ CoherentXBar::CoherentXBar(const CoherentXBarParams &p)
                                            csprintf("respLayer%d", i)));
         snoopRespPorts.push_back(new SnoopRespPort(*bp, *this));
     }
+    if (pointOfCoherency) {
+        uncachedPortId = cpuSidePorts.size();
+        auto *port = new CoherentXBarResponsePort(name() + ".uncached_ingress",
+                                                  *this, uncachedPortId);
+        cpuSidePorts.push_back(port);
+        respLayers.push_back(new RespLayer(
+            *port, *this, csprintf("respLayer%d", uncachedPortId)));
+        snoopRespPorts.push_back(new SnoopRespPort(*port, *this));
+        uncachedPort = std::make_unique<UncachedPort>(*this);
+        uncachedPort->bind(*port);
+    }
+    uncachedRetries.resize(cpuSidePorts.size(), false);
+}
+
+Addr
+CoherentXBar::uncachedKey(const PacketPtr pkt) const
+{
+    return pkt->getBlockAddr(system->cacheLineSize()) | Addr(pkt->isSecure());
+}
+
+bool
+CoherentXBar::ownsUncachedLock(const PacketPtr pkt, PortID source) const
+{
+    const auto found = uncachedLocks.find(uncachedKey(pkt));
+    return found != uncachedLocks.end() && found->second.source == source &&
+           found->second.owner == pkt->req->requestorId() &&
+           pkt->cmd == MemCmd::LockedRMWWriteReq;
+}
+
+bool
+CoherentXBar::uncachedRamAccess(const PacketPtr pkt) const
+{
+    return !system->bypassCaches() && pkt->req->isUncacheable() &&
+           pkt->req->memoryType() != Request::MemoryType::Unspecified &&
+           (pkt->isWrite() || pkt->req->isLockedRMW()) && !pkt->isLLSC() &&
+           !pkt->cacheResponding() && system->isMemAddr(pkt->getAddr());
+}
+
+PacketPtr
+CoherentXBar::uncachedRead(PacketPtr original) const
+{
+    const auto size = system->cacheLineSize();
+    panic_if(original->getOffset(size) + original->getSize() > size,
+             "Uncached RAM request crosses a cache line");
+    auto req =
+        std::make_shared<Request>(original->getBlockAddr(size), size,
+                                  Request::PHYSICAL | Request::UNCACHEABLE,
+                                  original->req->requestorId());
+    req->memoryType(original->req->memoryType());
+    if (original->isSecure()) {
+        req->setFlags(Request::SECURE);
+    }
+    auto *pkt = new Packet(req, MemCmd::ReadExReq);
+    pkt->allocate();
+    return pkt;
+}
+
+PacketPtr
+CoherentXBar::uncachedWrite(PacketPtr original, PacketPtr acquired) const
+{
+    auto req = std::make_shared<Request>(*acquired->req);
+    auto *write = new Packet(req, MemCmd::WriteReq);
+    write->allocate();
+    write->setData(acquired->getConstPtr<uint8_t>());
+    auto *data = write->getPtr<uint8_t>() +
+                 original->getOffset(system->cacheLineSize());
+    // Ownership is held across the read and the acknowledged write. Apply
+    // a conditional functor once, even when the write subsequently retries.
+    if (original->isAtomicOp()) {
+        original->setData(data);
+        (*original->getAtomicOp())(data);
+    } else if (original->req->isSwap()) {
+        std::vector<uint8_t> replacement(original->getSize());
+        original->writeData(replacement.data());
+        original->setData(data);
+        bool replace = true;
+        if (original->req->isCondSwap()) {
+            const auto expected = original->req->getExtraData();
+            const uint32_t expected32 = expected;
+            panic_if(original->getSize() != 4 && original->getSize() != 8,
+                     "Invalid size for conditional swap");
+            replace = original->getSize() == 8
+                          ? std::memcmp(data, &expected, 8) == 0
+                          : std::memcmp(data, &expected32, 4) == 0;
+        }
+        if (replace) {
+            std::memcpy(data, replacement.data(), replacement.size());
+        }
+    } else {
+        const auto &enabled = original->req->getByteEnable();
+        for (unsigned i = 0; i < original->getSize(); ++i) {
+            if (enabled.empty() || enabled[i]) {
+                data[i] = original->getConstPtr<uint8_t>()[i];
+            }
+        }
+    }
+    return write;
+}
+
+bool
+CoherentXBar::startUncachedAccess(PacketPtr pkt, PortID source)
+{
+    if (uncachedAccess) {
+        uncachedRetries[source] = true;
+        return false;
+    }
+    prepareUncachedAccess(pkt, source);
+    const Tick arrival =
+        clockEdge(frontendLatency) + pkt->headerDelay + pkt->payloadDelay;
+    pkt->headerDelay = pkt->payloadDelay = 0;
+    schedule(uncachedSendEvent, arrival);
+    return true;
+}
+
+void
+CoherentXBar::prepareUncachedAccess(PacketPtr pkt, PortID source)
+{
+    uncachedAccess = std::make_unique<UncachedAccess>();
+    uncachedAccess->original = pkt;
+    uncachedAccess->source = source;
+    if (pkt->cmd == MemCmd::LockedRMWWriteReq) {
+        panic_if(!ownsUncachedLock(pkt, source),
+                 "Uncached locked write has no matching locked read");
+        auto found = uncachedLocks.find(uncachedKey(pkt));
+        uncachedAccess->packet = uncachedWrite(pkt, found->second.line.get());
+        uncachedAccess->ownedLine = uncachedAccess->packet;
+        uncachedAccess->writing = true;
+        uncachedLocks.erase(found);
+    } else {
+        uncachedAccess->packet = uncachedRead(pkt);
+    }
+}
+
+void
+CoherentXBar::retainUncachedRead(PacketPtr original, PacketPtr line,
+                                 PortID source)
+{
+    original->setData(line->getConstPtr<uint8_t>() +
+                      original->getOffset(system->cacheLineSize()));
+    const auto key = uncachedKey(original);
+    panic_if(uncachedLocks.count(key), "Duplicate uncached locked read");
+    uncachedLocks.emplace(key,
+                          UncachedLock{std::unique_ptr<Packet>(line), source,
+                                       original->req->requestorId()});
+}
+
+void
+CoherentXBar::sendUncached()
+{
+    auto *pkt = uncachedAccess->packet;
+    if (uncachedPort->sendTimingReq(pkt)) {
+        uncachedAccess->packet = nullptr;
+    }
+}
+
+bool
+CoherentXBar::UncachedPort::recvTimingResp(PacketPtr pkt)
+{
+    xbar.completeUncached(pkt);
+    return true;
+}
+
+void
+CoherentXBar::UncachedPort::recvReqRetry()
+{
+    xbar.sendUncached();
+}
+
+void
+CoherentXBar::completeUncached(PacketPtr pkt)
+{
+    auto *original = uncachedAccess->original;
+    if (!uncachedAccess->writing && !pkt->isError()) {
+        if (snoopFilter) {
+            snoopFilter->invalidateLine(pkt->getAddr(), pkt->isSecure());
+        }
+        if (original->cmd == MemCmd::LockedRMWReadReq) {
+            retainUncachedRead(original, pkt, uncachedAccess->source);
+            pkt = nullptr;
+        } else {
+            uncachedAccess->packet = uncachedWrite(original, pkt);
+            uncachedAccess->ownedLine = uncachedAccess->packet;
+            uncachedAccess->writing = true;
+            delete pkt;
+            schedule(uncachedSendEvent, clockEdge());
+            return;
+        }
+    }
+    original->makeResponse();
+    if (pkt && pkt->isError()) {
+        original->copyError(pkt);
+    }
+    const auto source = uncachedAccess->source;
+    delete pkt;
+    uncachedAccess.reset();
+    cpuSidePorts[source]->schedTimingResp(original,
+                                          clockEdge(responseLatency));
+    auto retries = std::exchange(
+        uncachedRetries, std::vector<bool>(cpuSidePorts.size(), false));
+    for (unsigned i = 0; i < retries.size(); ++i) {
+        if (retries[i]) {
+            cpuSidePorts[i]->sendRetryReq();
+        }
+    }
+    if (!uncachedAccess && uncachedLocks.empty() &&
+        drainState() == DrainState::Draining) {
+        signalDrainDone();
+    }
+}
+
+Tick
+CoherentXBar::atomicUncached(PacketPtr original, PortID source)
+{
+    panic_if(uncachedAccess, "Atomic access overlaps a timing UC transaction");
+    prepareUncachedAccess(original, source);
+    PacketPtr response = uncachedAccess->packet;
+    Tick latency = uncachedPort->sendAtomic(response);
+    if (!uncachedAccess->writing && !response->isError()) {
+        if (snoopFilter) {
+            snoopFilter->invalidateLine(response->getAddr(),
+                                        response->isSecure());
+        }
+        if (original->cmd == MemCmd::LockedRMWReadReq) {
+            retainUncachedRead(original, response, source);
+            response = nullptr;
+        } else {
+            auto *write = uncachedWrite(original, response);
+            uncachedAccess->writing = true;
+            delete response;
+            response = write;
+            latency += uncachedPort->sendAtomic(response);
+        }
+    }
+    original->makeResponse();
+    if (response && response->isError()) {
+        original->copyError(response);
+    }
+    delete response;
+    uncachedAccess.reset();
+    return latency;
+}
+
+DrainState
+CoherentXBar::drain()
+{
+    return uncachedAccess || !uncachedLocks.empty() ? DrainState::Draining
+                                                    : DrainState::Drained;
 }
 
 CoherentXBar::~CoherentXBar()
@@ -148,6 +403,25 @@ CoherentXBar::init()
 bool
 CoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
 {
+    if (cpu_side_port_id != uncachedPortId && !pkt->isExpressSnoop() &&
+        uncachedLocks.count(uncachedKey(pkt)) &&
+        !ownsUncachedLock(pkt, cpu_side_port_id)) {
+        uncachedRetries[cpu_side_port_id] = true;
+        return false;
+    }
+    if (uncachedAccess && cpu_side_port_id != uncachedPortId &&
+        !pkt->isExpressSnoop() &&
+        pkt->getBlockAddr(system->cacheLineSize()) ==
+            uncachedAccess->original->getBlockAddr(system->cacheLineSize()) &&
+        pkt->isSecure() == uncachedAccess->original->isSecure()) {
+        uncachedRetries[cpu_side_port_id] = true;
+        return false;
+    }
+    if (pointOfCoherency && cpu_side_port_id != uncachedPortId &&
+        cpuSidePorts[cpu_side_port_id]->isSnooping() &&
+        uncachedRamAccess(pkt)) {
+        return startUncachedAccess(pkt, cpu_side_port_id);
+    }
     // determine the source port based on the id
     ResponsePort *src_port = cpuSidePorts[cpu_side_port_id];
 
@@ -196,8 +470,11 @@ CoherentXBar::recvTimingReq(PacketPtr pkt, PortID cpu_side_port_id)
     // the request
     const bool is_destination = isDestination(pkt);
 
-    const bool snoop_caches = !system->bypassCaches() &&
-        pkt->cmd != MemCmd::WriteClean;
+    const bool snoop_caches =
+        !system->bypassCaches() && pkt->cmd != MemCmd::WriteClean &&
+        !(!pointOfCoherency && uncachedRamAccess(pkt)) &&
+        !(uncachedAccess && cpu_side_port_id == uncachedPortId &&
+          uncachedAccess->writing);
     if (snoop_caches) {
         assert(pkt->snoopDelay == 0);
 
@@ -742,6 +1019,18 @@ Tick
 CoherentXBar::recvAtomicBackdoor(PacketPtr pkt, PortID cpu_side_port_id,
                                  MemBackdoorPtr *backdoor)
 {
+    panic_if(cpu_side_port_id != uncachedPortId &&
+                 uncachedLocks.count(uncachedKey(pkt)) &&
+                 !ownsUncachedLock(pkt, cpu_side_port_id),
+             "Atomic request overlaps an unfinished uncached locked access");
+    if (pointOfCoherency && cpu_side_port_id != uncachedPortId &&
+        cpuSidePorts[cpu_side_port_id]->isSnooping() &&
+        uncachedRamAccess(pkt)) {
+        if (backdoor) {
+            *backdoor = nullptr;
+        }
+        return atomicUncached(pkt, cpu_side_port_id);
+    }
     DPRINTF(CoherentXBar, "%s: src %s packet %s\n", __func__,
             cpuSidePorts[cpu_side_port_id]->name(), pkt->print());
 
@@ -757,8 +1046,11 @@ CoherentXBar::recvAtomicBackdoor(PacketPtr pkt, PortID cpu_side_port_id,
     // the request
     const bool is_destination = isDestination(pkt);
 
-    const bool snoop_caches = !system->bypassCaches() &&
-        pkt->cmd != MemCmd::WriteClean;
+    const bool snoop_caches =
+        !system->bypassCaches() && pkt->cmd != MemCmd::WriteClean &&
+        !(!pointOfCoherency && uncachedRamAccess(pkt)) &&
+        !(uncachedAccess && cpu_side_port_id == uncachedPortId &&
+          uncachedAccess->writing);
     if (snoop_caches) {
         // forward to all snoopers but the source
         std::pair<MemCmd, Tick> snoop_result;
@@ -1022,6 +1314,29 @@ CoherentXBar::recvMemBackdoorReq(const MemBackdoorReq &req,
 void
 CoherentXBar::recvFunctional(PacketPtr pkt, PortID cpu_side_port_id)
 {
+    const auto locked = uncachedLocks.find(uncachedKey(pkt));
+    if (locked != uncachedLocks.end()) {
+        auto *line = locked->second.line.get();
+        if (pkt->trySatisfyFunctional(
+                line, line->getAddr(), line->isSecure(), line->getSize(),
+                pkt->isPrint() ? nullptr : line->getPtr<uint8_t>()) &&
+            pkt->isRead()) {
+            pkt->makeResponse();
+            return;
+        }
+    }
+    if (uncachedAccess && uncachedAccess->ownedLine) {
+        auto *line = uncachedAccess->ownedLine;
+        if (pkt->trySatisfyFunctional(
+                line, line->getAddr(), line->isSecure(), line->getSize(),
+                pkt->isPrint() ? nullptr : line->getPtr<uint8_t>()) &&
+            pkt->isRead()) {
+            pkt->makeResponse();
+            return;
+        }
+        // Functional writes must update both the owned transient copy and
+        // the actual memory/queued write through the existing path below.
+    }
     if (!pkt->isPrint()) {
         // don't do DPRINTFs on PrintReq as it clutters up the output
         DPRINTF(CoherentXBar, "%s: src %s packet %s\n", __func__,

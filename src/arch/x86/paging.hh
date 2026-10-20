@@ -10,10 +10,94 @@
 
 #include "base/amo.hh"
 #include "base/bitfield.hh"
+#include "base/logging.hh"
+#include "mem/request.hh"
 #include "sim/byteswap.hh"
 
 namespace gem5::X86ISA::paging
 {
+
+using MemoryType = Request::MemoryType;
+
+inline bool
+validPatType(uint8_t type)
+{
+    return type == 0 || type == 1 || (type >= 4 && type <= 7);
+}
+
+inline MemoryType
+memoryType(uint8_t encoding)
+{
+    switch (encoding) {
+        case 0:
+            return MemoryType::Uncacheable;
+        case 1:
+            return MemoryType::WriteCombining;
+        case 4:
+            return MemoryType::WriteThrough;
+        case 5:
+            return MemoryType::WriteProtected;
+        case 6:
+            return MemoryType::WriteBack;
+        default:
+            panic("Invalid resolved x86 memory type %u", encoding);
+    }
+}
+
+// SDM Vol. 3C 29.3.7.2 and Vol. 3A Table 12-7. The EPT type replaces
+// the MTRR input; host MTRRs do not participate. UC is not an unconditional
+// winner: for example, EPT UC combined with PAT WC produces WC.
+inline MemoryType
+effectiveEptType(bool cacheDisabled, uint8_t eptType, bool ignorePat,
+                 uint8_t patType)
+{
+    if (cacheDisabled) {
+        return MemoryType::Uncacheable;
+    }
+    if (ignorePat) {
+        return memoryType(eptType);
+    }
+    assert(validPatType(patType));
+    assert(eptType == 0 || eptType == 1 || (eptType >= 4 && eptType <= 6));
+    constexpr uint8_t combined[7][8] = {
+        // PAT: UC WC  -  - WT WP WB UC-
+        {0, 1, 0, 0, 0, 0, 0, 0}, // EPT UC
+        {0, 1, 0, 0, 0, 0, 1, 1}, // EPT WC
+        {},
+        {},                       // Reserved EPT encodings
+        {0, 1, 0, 0, 4, 5, 4, 0}, // EPT WT
+        {0, 1, 0, 0, 4, 5, 5, 1}, // EPT WP
+        {0, 1, 0, 0, 4, 5, 6, 0}, // EPT WB
+    };
+    return memoryType(combined[eptType][patType]);
+}
+
+inline uint8_t
+patType(uint64_t pat, unsigned index)
+{
+    assert(index < 8);
+    return uint8_t(pat >> (index * 8));
+}
+
+// WT uses the SDM-permitted invalidating write-around policy: reads may
+// cache, but a write does not allocate and reaches memory. WP also requires
+// write invalidation. WC bypasses caches without imposing UC ordering;
+// combining buffers are a separate microarchitectural timing choice.
+inline void
+applyMemoryType(Request &request, MemoryType type, bool write)
+{
+    request.memoryType(type);
+    if (type == MemoryType::Uncacheable ||
+        type == MemoryType::WriteCombining ||
+        (write && (type == MemoryType::WriteThrough ||
+                   type == MemoryType::WriteProtected))) {
+        request.setFlags(Request::UNCACHEABLE);
+    }
+    if (type == MemoryType::Uncacheable) {
+        request.setFlags(Request::STRICT_ORDER);
+    }
+    // Never clear unrelated caller/device constraints for a WB mapping.
+}
 
 inline bool
 validPaePdpte(uint64_t value, unsigned physicalBits)

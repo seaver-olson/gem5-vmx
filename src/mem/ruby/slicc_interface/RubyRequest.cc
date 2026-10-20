@@ -96,6 +96,13 @@ RubyRequest::functionalWrite(Packet *pkt)
     if (!pkt->hasData() || !m_pkt->hasData())
         return false;
 
+    // Atomic inputs/returned old values are not a buffered memory image.
+    // Keep functional writes from changing the pending operation itself.
+    if (m_pkt->isAtomicOp() || m_pkt->req->isSwap() ||
+        m_pkt->req->isLockedRMW()) {
+        return false;
+    }
+
     uint8_t *data =  m_pkt->getPtr<uint8_t>();
 
     if (pkt->isMaskedWrite() || m_pkt->isMaskedWrite()) {

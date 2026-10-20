@@ -44,6 +44,7 @@
 #include <iostream>
 #include <list>
 #include <unordered_map>
+#include <utility>
 
 #include "cpu/testers/rubytest/RubyTester.hh"
 #include "mem/ruby/common/Address.hh"
@@ -88,6 +89,7 @@ class Sequencer : public RubyPort
     typedef RubySequencerParams Params;
     Sequencer(const Params &);
     ~Sequencer();
+    void uncachedCallback(Addr address, DataBlock &data);
 
     /**
      * Proxy function to writeCallback that first
@@ -195,7 +197,11 @@ class Sequencer : public RubyPort
 
     RequestStatus makeRequest(PacketPtr pkt) override;
     virtual bool empty() const;
-    int outstandingCount() const override { return m_outstanding_count; }
+    int
+    outstandingCount() const override
+    {
+        return m_outstanding_count + m_uncached_locks.size();
+    }
 
     bool isDeadlockEventScheduled() const override
     { return deadlockCheckEvent.scheduled(); }
@@ -292,6 +298,9 @@ class Sequencer : public RubyPort
   protected:
     // RequestTable contains both read and write requests, handles aliasing
     std::unordered_map<Addr, std::list<SequencerRequest>> m_RequestTable;
+    // Reject local followers before they can queue ahead of an unlock.
+    std::unordered_map<Addr, std::pair<RequestorID, ContextID>>
+        m_uncached_locks;
     // UnadressedRequestTable contains "unaddressed" requests,
     // guaranteed not to alias each other
     std::unordered_map<uint64_t, SequencerRequest> m_UnaddressedRequestTable;

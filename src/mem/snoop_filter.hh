@@ -89,6 +89,8 @@ namespace gem5
 class SnoopFilter : public SimObject
 {
   public:
+    // Nonallocating exclusive ownership leaves no cached holder behind.
+    void invalidateLine(Addr addr, bool secure);
 
     // Change for systems with more than 256 ports tracked by this object
     static const int SNOOP_MASK_SIZE = 256;

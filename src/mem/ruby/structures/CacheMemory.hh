@@ -63,6 +63,7 @@ namespace gem5
 
 namespace ruby
 {
+class AbstractController;
 
 class CacheMemory : public SimObject
 {
@@ -116,7 +117,8 @@ class CacheMemory : public SimObject
     void flushEntries();
 
     // Returns with the physical address of the conflicting cache line
-    Addr cacheProbe(Addr address) const;
+    Addr cacheProbe(Addr address,
+                    const AbstractController *controller = nullptr) const;
 
     // looks an address up in the cache
     AbstractCacheEntry* lookup(Addr address);

@@ -50,6 +50,17 @@
 namespace gem5
 {
 
+void
+SnoopFilter::invalidateLine(Addr addr, bool secure)
+{
+    const Addr key = (addr & ~Addr(linesize - 1)) | (secure ? LineSecure : 0);
+    auto entry = cachedLocations.find(key);
+    if (entry != cachedLocations.end()) {
+        entry->second.holder = 0;
+        eraseIfNullEntry(entry);
+    }
+}
+
 const int SnoopFilter::SNOOP_MASK_SIZE;
 
 void

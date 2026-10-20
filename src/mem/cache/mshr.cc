@@ -557,7 +557,8 @@ MSHR::extractServiceableTargets(PacketPtr pkt)
         ready_targets.push_back(*it);
         // Leave the Locked RMW Read until the corresponding Locked Write
         // request comes in
-        if (it->pkt->cmd != MemCmd::LockedRMWReadReq) {
+        if (it->pkt->cmd != MemCmd::LockedRMWReadReq ||
+            it->pkt->req->isUncacheable()) {
             it = targets.erase(it);
             while (it != targets.end()) {
                 if (it->source == Target::FromCPU) {
@@ -574,7 +575,8 @@ MSHR::extractServiceableTargets(PacketPtr pkt)
         auto it = targets.begin();
         while (it != targets.end()) {
             ready_targets.push_back(*it);
-            if (it->pkt->cmd == MemCmd::LockedRMWReadReq) {
+            if (it->pkt->cmd == MemCmd::LockedRMWReadReq &&
+                !it->pkt->req->isUncacheable()) {
                 // Leave the Locked RMW Read until the corresponding Locked
                 // Write comes in. Also don't service any later targets as the
                 // line is now "locked".

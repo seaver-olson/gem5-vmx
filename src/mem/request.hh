@@ -101,6 +101,18 @@ class Request : public Extensible<Request>
     typedef uint8_t ArchFlagsType;
     typedef gem5::Flags<FlagsType> Flags;
 
+    // Resolved memory semantics, distinct from CPU ordering and transport
+    // flags. Unspecified preserves the existing policy for other ISAs.
+    enum class MemoryType : uint8_t
+    {
+        Unspecified,
+        Uncacheable,
+        WriteCombining,
+        WriteThrough,
+        WriteProtected,
+        WriteBack
+    };
+
     enum : FlagsType
     {
         // clang-format off
@@ -266,6 +278,9 @@ class Request : public Extensible<Request>
         /** TLBI_EXT_SYNC_COMP seems to be the largest value
             of FlagsType, so HAS_NO_ADDR's value is that << 4 */
         HAS_NO_ADDR                = 0x0008000000000000,
+        // Encoded metadata survives request copies and fragment creation,
+        // but is cleared with other translation flags on setVirt().
+        MEMORY_TYPE_BITS           = 0x0700000000000000,
         // clang-format on
     };
     static const FlagsType STORE_NO_DATA = CACHE_BLOCK_ZERO |
@@ -851,6 +866,20 @@ class Request : public Extensible<Request>
     {
         assert(hasPaddr() || hasVaddr());
         _flags.clear(flags);
+    }
+
+    MemoryType
+    memoryType() const
+    {
+        return static_cast<MemoryType>(FlagsType(_flags & MEMORY_TYPE_BITS) >>
+                                       56);
+    }
+
+    void
+    memoryType(MemoryType type)
+    {
+        _flags.clear(MEMORY_TYPE_BITS);
+        _flags.set(FlagsType(type) << 56);
     }
 
     void

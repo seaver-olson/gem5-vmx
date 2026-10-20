@@ -186,7 +186,8 @@ Walker::sendEptTiming(WalkerState *state, PacketPtr pkt)
     const Addr gpa = pkt->getAddr();
     const EptAccess access = pkt->req->isAtomicReturn() ?
         EptAccess::Write : EptAccess::Read;
-    const ept::LookupInput input(gpa, access, *state->snapshot->ept, true);
+    const ept::LookupInput input(gpa, access, *state->snapshot->ept, true,
+                                 state->snapshot->cr0.cd);
     // A rejected preflight can call back inline. Defer only that case: the
     // caller may still be inside recvPacket()/sendPackets() on this state.
     auto issuing = std::make_shared<bool>(true);
@@ -203,8 +204,18 @@ Walker::sendEptTiming(WalkerState *state, PacketPtr pkt)
                 }
                 pkt->req->setPaddr(result.hostPhysical);
                 pkt->setAddr(result.hostPhysical);
-                if (result.memoryType == 0)
-                    pkt->req->setFlags(Request::UNCACHEABLE);
+                const auto attributes = pkt->req->isAtomicReturn()
+                                            ? state->updateAttributes
+                                            : state->readAttributes;
+                const unsigned index =
+                    unsigned(attributes.pwt) | (unsigned(attributes.pcd) << 1);
+                paging::applyMemoryType(
+                    *pkt->req,
+                    paging::effectiveEptType(
+                        state->snapshot->cr0.cd, result.memoryType,
+                        result.ignorePat,
+                        paging::patType(state->snapshot->pat, index)),
+                    pkt->req->isAtomicReturn());
                 sendTiming(state, pkt);
             };
             if (*issuing) {
@@ -631,8 +642,11 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     // publishing the leaf. This also gives a failed compare a clean restart.
     if (doWrite && fault == NoFault && !functional) {
         updateAttributes = readAttributes;
-        RequestPtr update = std::make_shared<Request>(entryGpa,
-            dataSize, read->req->getFlags() | Request::ATOMIC_RETURN_OP,
+        const auto attributes = snapshot->ept
+                                    ? Request::Flags(Request::PHYSICAL)
+                                    : read->req->getFlags();
+        RequestPtr update = std::make_shared<Request>(
+            entryGpa, dataSize, attributes | Request::ATOMIC_RETURN_OP,
             walker->requestorId);
         if (dataSize == 8)
             update->setAtomicOpFunctor(
@@ -649,9 +663,9 @@ Walker::WalkerState::stepWalk(PacketPtr &write)
     if (doEndWalk) {
         endWalk();
     } else {
-        Request::Flags flags = read->req->getFlags();
+        Request::Flags flags = Request::PHYSICAL;
         readAttributes = {bool(pte.pwt), bool(pte.pcd)};
-        flags.set(Request::UNCACHEABLE, uncacheable);
+        flags.set(Request::UNCACHEABLE, uncacheable && !snapshot->ept);
         delete read;
         RequestPtr request = std::make_shared<Request>(
             nextRead, dataSize, flags, walker->requestorId);
@@ -718,8 +732,9 @@ Walker::WalkerState::setupWalk(Addr vaddr)
 
     // PCD can't be used if CR4.PCIDE=1 [sec 2.5
     // of Intel's Software Developer's manual]
-    if (uncacheable)
+    if (uncacheable && !snapshot->ept) {
         flags.set(Request::UNCACHEABLE);
+    }
 
     RequestPtr request = std::make_shared<Request>(
         topAddr, dataSize, flags, walker->requestorId);
@@ -735,7 +750,8 @@ Walker::WalkerState::translatePacket(PacketPtr packet, EptAccess access)
 {
     if (!snapshot->ept)
         return NoFault;
-    const ept::LookupInput input(packet->getAddr(), access, *snapshot->ept, true);
+    const ept::LookupInput input(packet->getAddr(), access, *snapshot->ept,
+                                 true, snapshot->cr0.cd);
     const auto result = functional ?
         ept::walkFunctional(*snapshot->port, walker->requestorId, input,
             physicalBits, snapshot->eptCapabilities) :
@@ -745,8 +761,16 @@ Walker::WalkerState::translatePacket(PacketPtr packet, EptAccess access)
         return ept::lookupFault(result, input, snapshot->linearAddress, false);
     packet->req->setPaddr(result.hostPhysical);
     packet->setAddr(result.hostPhysical);
-    if (result.memoryType == 0)
-        packet->req->setFlags(Request::UNCACHEABLE);
+    const auto attributes =
+        packet->req->isAtomicReturn() ? updateAttributes : readAttributes;
+    const unsigned index =
+        unsigned(attributes.pwt) | (unsigned(attributes.pcd) << 1);
+    paging::applyMemoryType(
+        *packet->req,
+        paging::effectiveEptType(snapshot->cr0.cd, result.memoryType,
+                                 result.ignorePat,
+                                 paging::patType(snapshot->pat, index)),
+        packet->req->isAtomicReturn());
     return NoFault;
 }
 

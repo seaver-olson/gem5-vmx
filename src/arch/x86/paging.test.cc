@@ -6,11 +6,70 @@
 #include <gtest/gtest.h>
 
 #include "arch/x86/paging.hh"
+#include "base/gtest/cur_tick_fake.hh"
 
 namespace gem5::X86ISA::paging
 {
 namespace
 {
+TEST(EptMemoryType, SdmCombinationTableAndOverrides)
+{
+    const uint8_t ept_types[] = {0, 1, 4, 5, 6};
+    const uint8_t pat_types[] = {0, 7, 1, 4, 6, 5};
+    // Independent SDM column order: UC, UC-, WC, WT, WB, WP.
+    const uint8_t expected[5][6] = {
+        {0, 0, 1, 0, 0, 0}, {0, 1, 1, 0, 1, 0}, {0, 0, 1, 4, 4, 5},
+        {0, 1, 1, 4, 5, 5}, {0, 0, 1, 4, 6, 5},
+    };
+    for (unsigned e = 0; e < 5; ++e) {
+        for (unsigned p = 0; p < 6; ++p) {
+            EXPECT_EQ(
+                effectiveEptType(false, ept_types[e], false, pat_types[p]),
+                memoryType(expected[e][p]));
+            EXPECT_EQ(
+                effectiveEptType(false, ept_types[e], true, pat_types[p]),
+                memoryType(ept_types[e]));
+            for (bool ignore_pat : {false, true}) {
+                EXPECT_EQ(effectiveEptType(true, ept_types[e], ignore_pat,
+                                           pat_types[p]),
+                          MemoryType::Uncacheable);
+            }
+        }
+    }
+    // Disabled/ignored PAT inputs are not consulted.
+    EXPECT_EQ(effectiveEptType(true, 6, false, 0xff), MemoryType::Uncacheable);
+    EXPECT_EQ(effectiveEptType(false, 6, true, 0xff), MemoryType::WriteBack);
+}
+
+TEST(EptMemoryType, PatSelectionAndRequestPolicy)
+{
+    GTestTickHandler ticks;
+    constexpr uint64_t pat = 0x0706050401000706;
+    for (unsigned index = 0; index < 8; ++index) {
+        EXPECT_EQ(patType(pat, index), (pat >> (8 * index)) & 0xff);
+    }
+    for (auto type : {MemoryType::Uncacheable, MemoryType::WriteCombining,
+                      MemoryType::WriteThrough, MemoryType::WriteProtected,
+                      MemoryType::WriteBack}) {
+        for (bool write : {false, true}) {
+            Request request(0x1000, 8, Request::PHYSICAL | Request::SECURE, 1);
+            applyMemoryType(request, type, write);
+            EXPECT_EQ(request.memoryType(), type);
+            EXPECT_EQ(request.isUncacheable(),
+                      type == MemoryType::Uncacheable ||
+                          type == MemoryType::WriteCombining ||
+                          (write && type != MemoryType::WriteBack));
+            EXPECT_EQ(request.isStrictlyOrdered(),
+                      type == MemoryType::Uncacheable);
+            EXPECT_TRUE(request.isSecure());
+        }
+    }
+    Request device(0x1000, 8, Request::UNCACHEABLE | Request::STRICT_ORDER, 1);
+    applyMemoryType(device, MemoryType::WriteBack, false);
+    EXPECT_TRUE(device.isUncacheable());
+    EXPECT_TRUE(device.isStrictlyOrdered());
+}
+
 TEST(PaePdpte, ReservedPresentAndIgnoredBits)
 {
     for (unsigned width : {32, 36, 48, 52}) {

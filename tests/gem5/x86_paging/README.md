@@ -219,9 +219,31 @@ Connect walkers to the CPU side of a coherent cache, as the standard x86
 hierarchies already do. The crossbar rejects incompatible atomic and timing
 requests with `unsupported raw SwapReq snoop`, before forwarding. Direct
 uncached-memory paths with no snoop destinations remain valid. UC requests
-retain their attributes; this does not add support for UC/cacheable aliases.
+retain their attributes. Typed uncached RAM updates through coherent caches
+acquire the authoritative line without allocating it, preserve neighboring
+bytes, and complete after a real memory write acknowledgement. Classic does
+this at the point of coherency; MESI Two Level uses its existing L1/directory
+path. Paired locked reads retain ownership until their matching writes, even
+for failed CMPXCHG. Typed uncached accesses explicitly reject other Ruby
+protocols and LL/SC instead of falling back to cacheable transactions.
 The focused suite includes filtered and broadcast negative-topology tests;
 only the specific diagnostic counts as the expected failure.
+
+EPT final accesses combine captured CR0.CD, EPT leaf type/ignore-PAT and the
+guest PAT selector. Each guest descriptor access resolves its own PWT/PCD
+attributes; raw EPT accesses use captured CD and EPTP. Requests retain the
+exact UC/WC/WT/WP/WB type. UC/WC bypass caches; WT/WP writes use invalidating
+write-around. Tests perform real final reads/writes and coherent readback,
+raw and conditional swaps, and a paired uncached RMW with a blocked peer and
+an independent A/D update. The native guest repeats with both live CD values
+and executes locked ADD and successful/failed CMPXCHG. The transition guest
+checks all PAT byte positions reject reserved encodings with #GP(0), without
+changing PAT, and accepts each legal encoding. These are correctness checks,
+not a calibrated WC-combining, non-WB throughput or bus-lock timing model.
+Accepted locked reads require matching writes; arbitrary mid-instruction
+checkpoint or abort is not a supported boundary. The corrected Ruby L1
+indexing also changes measurement baselines: a 64-byte line starts set
+indexing at address bit 6, not bit 64.
 
 The same suite runs `vmx_nmi`, built from the existing VM-entry guest helpers:
 

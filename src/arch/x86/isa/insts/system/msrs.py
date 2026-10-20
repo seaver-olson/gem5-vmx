@@ -52,6 +52,7 @@ def macroop WRMSR
     mov t2, t2, rax, dataSize=4
     slli t3, rdx, 32, dataSize=8
     or t2, t2, t3, dataSize=8
+    chkwrmsr rcx, t2, dataSize=8
     st t2, intseg, [8, rcx, t0], "IntAddrPrefixMSR << 3", \
         dataSize=8, addressSize=8
 };

@@ -72,7 +72,7 @@ class MMU : public BaseMMU
     Fault finishWalk(const RequestPtr &req, const TranslationContext &context,
                      const TlbEntry &entry, bool functional);
     Fault resolveEpt(const RequestPtr &req, const TranslationContext &context,
-                     bool functional);
+                     bool functional, uint8_t patIndex = 0);
     Fault finalizePhysical(const RequestPtr &req, Mode mode,
                            LocalApicBase apicBase, ContextID thread) const;
 

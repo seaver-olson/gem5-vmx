@@ -46,6 +46,7 @@
 #ifndef __MEM_COHERENT_XBAR_HH__
 #define __MEM_COHERENT_XBAR_HH__
 
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -299,6 +300,58 @@ class CoherentXBar : public BaseXBar
     /** Is this crossbar the point of unification? **/
     const bool pointOfUnification;
 
+    // A non-snooping internal requestor uses the ordinary crossbar layers
+    // and retries to acquire a line without installing a cache copy.
+    class UncachedPort : public RequestPort
+    {
+      private:
+        CoherentXBar &xbar;
+
+      public:
+        explicit UncachedPort(CoherentXBar &owner)
+            : RequestPort(owner.name() + ".uncached_ram"), xbar(owner)
+        {}
+        bool recvTimingResp(PacketPtr pkt) override;
+        void recvReqRetry() override;
+        void
+        recvRangeChange() override
+        {}
+    };
+    std::unique_ptr<UncachedPort> uncachedPort;
+    PortID uncachedPortId = InvalidPortID;
+    struct UncachedAccess
+    {
+        PacketPtr original;
+        PortID source;
+        PacketPtr packet = nullptr;
+        PacketPtr ownedLine = nullptr;
+        bool writing = false;
+    };
+    std::unique_ptr<UncachedAccess> uncachedAccess;
+    // Paired locked reads retain ownership without a cache fill. Keep this
+    // separate so nested page-table accesses to other lines can progress.
+    struct UncachedLock
+    {
+        std::unique_ptr<Packet> line;
+        PortID source;
+        RequestorID owner;
+    };
+    std::unordered_map<Addr, UncachedLock> uncachedLocks;
+    std::vector<bool> uncachedRetries;
+    EventFunctionWrapper uncachedSendEvent;
+
+    Addr uncachedKey(const PacketPtr pkt) const;
+    bool ownsUncachedLock(const PacketPtr pkt, PortID source) const;
+    bool uncachedRamAccess(const PacketPtr pkt) const;
+    void prepareUncachedAccess(PacketPtr pkt, PortID source);
+    void retainUncachedRead(PacketPtr original, PacketPtr line, PortID source);
+    bool startUncachedAccess(PacketPtr pkt, PortID source);
+    PacketPtr uncachedRead(PacketPtr original) const;
+    PacketPtr uncachedWrite(PacketPtr original, PacketPtr acquired) const;
+    void sendUncached();
+    void completeUncached(PacketPtr pkt);
+    Tick atomicUncached(PacketPtr pkt, PortID source);
+
     /**
      * Upstream caches need this packet until true is returned, so
      * hold it for deletion until a subsequent call
@@ -437,6 +490,8 @@ class CoherentXBar : public BaseXBar
   public:
 
     virtual void init();
+
+    DrainState drain() override;
 
     CoherentXBar(const CoherentXBarParams &p);
 

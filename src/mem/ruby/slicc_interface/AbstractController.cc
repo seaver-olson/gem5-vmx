@@ -43,6 +43,7 @@
 #include "debug/RubyQueue.hh"
 #include "mem/ruby/network/Network.hh"
 #include "mem/ruby/protocol/MemoryMsg.hh"
+#include "mem/ruby/structures/CacheMemory.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/system/Sequencer.hh"
 #include "sim/system.hh"
@@ -341,6 +342,12 @@ bool
 AbstractController::isBlocked(Addr addr) const
 {
     return m_is_blocking && (m_block_map.find(addr) != m_block_map.end());
+}
+
+Addr
+AbstractController::cacheProbeUnlocked(CacheMemory &cache, Addr address) const
+{
+    return cache.cacheProbe(address, this);
 }
 
 void

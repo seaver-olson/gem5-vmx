@@ -51,6 +51,7 @@
 #include "mem/cache/replacement_policies/weighted_lru_rp.hh"
 #include "mem/ruby/common/Address.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
+#include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "mem/ruby/system/RubySystem.hh"
 
 namespace gem5
@@ -382,7 +383,8 @@ CacheMemory::flushEntries()
 
 // Returns with the physical address of the conflicting cache line
 Addr
-CacheMemory::cacheProbe(Addr address) const
+CacheMemory::cacheProbe(Addr address,
+                        const AbstractController *controller) const
 {
     assert(address == makeLineAddress(address));
     assert(!cacheAvail(address));
@@ -393,8 +395,21 @@ CacheMemory::cacheProbe(Addr address) const
         candidates.push_back(static_cast<ReplaceableEntry*>(
                                                        m_cache[cacheSet][i]));
     }
-    return m_cache[cacheSet][m_replacementPolicy_ptr->
-                        getVictim(candidates)->getWay()]->m_Address;
+    auto *victim =
+        m_cache[cacheSet]
+               [m_replacementPolicy_ptr->getVictim(candidates)->getWay()];
+    if (controller && controller->isBlocked(victim->m_Address)) {
+        // A pinned RMW line cannot be a replacement candidate. Prefer the
+        // configured policy, then another unpinned way. Do not pass a sparse
+        // candidate vector to policies such as TreePLRU, which index by way.
+        for (auto *entry : m_cache[cacheSet]) {
+            if (!controller->isBlocked(entry->m_Address)) {
+                return entry->m_Address;
+            }
+        }
+        // All ways pinned: retain the usual controller probe stall.
+    }
+    return victim->m_Address;
 }
 
 // looks an address up in the cache

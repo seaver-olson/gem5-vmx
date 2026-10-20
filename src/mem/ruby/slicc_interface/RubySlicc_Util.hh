@@ -119,7 +119,10 @@ inline int max_tokens()
 inline bool
 isWriteRequest(RubyRequestType type)
 {
-    if ((type == RubyRequestType_ST) ||
+    if ((type == RubyRequestType_ST) || (type == RubyRequestType_UC_WRITE) ||
+        (type == RubyRequestType_UC_ATOMIC) ||
+        (type == RubyRequestType_UC_LOCKED_READ) ||
+        (type == RubyRequestType_UC_LOCKED_WRITE) ||
         (type == RubyRequestType_ATOMIC) ||
         (type == RubyRequestType_RMW_Read) ||
         (type == RubyRequestType_RMW_Write) ||
@@ -127,20 +130,20 @@ isWriteRequest(RubyRequestType type)
         (type == RubyRequestType_Locked_RMW_Read) ||
         (type == RubyRequestType_Locked_RMW_Write) ||
         (type == RubyRequestType_FLUSH)) {
-            return true;
+        return true;
     } else {
-            return false;
+        return false;
     }
 }
 
 inline bool
 isDataReadRequest(RubyRequestType type)
 {
-    if ((type == RubyRequestType_LD) ||
+    if ((type == RubyRequestType_LD) || (type == RubyRequestType_UC_READ) ||
         (type == RubyRequestType_Load_Linked)) {
-            return true;
+        return true;
     } else {
-            return false;
+        return false;
     }
 }
 

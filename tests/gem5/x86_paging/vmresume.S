@@ -118,6 +118,15 @@ ept_guest_read:
     mov 0x401000, %eax
 ept_guest_write:
     movl $0x12345678, 0x401000
+    movl $0x87654321, 0x401008
+    lock addl $1, 0x401000
+    mov $0x12345679, %eax
+    mov $0x1234567a, %edx
+    lock cmpxchgl %edx, 0x401000
+    xor %eax, %eax
+    mov $0xdeadbeef, %edx
+    lock cmpxchgl %edx, 0x401000
+    mov %eax, 0x40100c
 ept_guest_exit:
     vmcall
     ud2

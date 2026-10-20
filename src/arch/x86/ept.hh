@@ -38,11 +38,16 @@ struct LookupInput
     // Normal guest page-walk reads and A/D writes. PAE PDPTE-register loads
     // are separate accesses and must not set this flag (SDM 29.3.5).
     const bool pagingStructure;
+    // CR0.CD is a per-access snapshot, not part of the EPTP encoding.
+    const bool cacheDisabled;
 
     LookupInput(Addr guestPhysical, EptAccess access, const EptConfig &config,
-                bool pagingStructure = false)
-        : guestPhysical(guestPhysical), access(access), config(config),
-          pagingStructure(pagingStructure)
+                bool pagingStructure = false, bool cacheDisabled = false)
+        : guestPhysical(guestPhysical),
+          access(access),
+          config(config),
+          pagingStructure(pagingStructure),
+          cacheDisabled(cacheDisabled)
     {}
 };
 

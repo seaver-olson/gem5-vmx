@@ -187,8 +187,15 @@ test_ept_entry(uint64_t host_cr3)
     check((enter_guest(0) & 0x41) == 0x40, 105);
     check(read_field(0x4400) == 7 && !fault_vector, 106);
 
-    for (unsigned variant = 0; variant < 4; ++variant) {
+    uint64_t saved_cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(saved_cr0));
+    for (unsigned variant = 0; variant < 8; ++variant) {
         const unsigned ad = variant & 1;
+        // CD/NW are not loaded from the VMCS. Exercise both cached and
+        // uncached execution using the live CR0, clearing NW when CD=0.
+        const uint64_t cr0 =
+            (saved_cr0 & ~(3ull << 29)) | ((uint64_t)(variant >> 2) << 30);
+        __asm__ volatile("mov %0, %%cr0" ::"r"(cr0) : "memory");
         const uint64_t software = 1ull << 52;
         // GVA 0x400000/0x401000 -> GPA 0x2000000/0x2001000 -> ELF RAM.
         // Three guest paging pages also have distinct GPAs and HPAs.
@@ -207,6 +214,8 @@ test_ept_entry(uint64_t host_cr3)
         ept_tables[5][1] = (uint64_t)ept_data | 0x30;       // No access.
         ept_data[0] = 0;
         ept_data[1] = 0xfeedface;
+        ept_data[2] = 0;
+        ept_data[3] = 0;
         if (variant & 2) {
             // Establish clean resident lines without functional memory writes.
             for (unsigned i = 0; i < 3; ++i) {
@@ -246,7 +255,9 @@ test_ept_entry(uint64_t host_cr3)
         check(read_field(0x4402) == 18 &&
                   read_field(0x681e) == GUEST_IP(ept_guest_exit),
               113);
-        check(ept_data[0] == 0x12345678 && ept_data[1] == 0xfeedface, 114);
+        check(ept_data[0] == 0x1234567a && ept_data[1] == 0xfeedface &&
+                  ept_data[2] == 0x87654321 && ept_data[3] == 0x1234567a,
+              114);
 
         // Distinguish paging-structure faults (qualification bit 8 clear)
         // from the final instruction/data accesses above (bit 8 set).
@@ -279,6 +290,7 @@ test_ept_entry(uint64_t host_cr3)
               125);
         ept_tables[ad][0] = 0; // The next entry must capture its new root.
     }
+    __asm__ volatile("mov %0, %%cr0" ::"r"(saved_cr0) : "memory");
     uint32_t a = 0x80000008, b, c, d;
     __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
     if ((a & 0xff) == 52) {
@@ -353,6 +365,29 @@ test_vmx_capabilities(void)
         check(fault_vector == 13 && fault_error == 0, 212 + i);
         check(msr(readonly[i]) == before, 216 + i);
     }
+    const uint64_t pat = msr(0x277);
+    for (unsigned index = 0; index < 8; ++index) {
+        for (unsigned reserved = 0; reserved < 3; ++reserved) {
+            const uint64_t invalid = reserved == 0   ? 2
+                                     : reserved == 1 ? 3
+                                                     : 0x80;
+            const unsigned shift = index * 8;
+            fault_vector = fault_error = 0;
+            probe_wrmsr(0x277,
+                        (pat & ~(0xffull << shift)) | (invalid << shift));
+            check(fault_vector == 13 && fault_error == 0, 650 + index);
+            check(msr(0x277) == pat, 658 + index);
+        }
+    }
+    const unsigned legal_pat[] = {0, 1, 4, 5, 6, 7};
+    for (unsigned i = 0; i < sizeof(legal_pat) / sizeof(legal_pat[0]); ++i) {
+        const uint64_t value = 0x0101010101010101ull * legal_pat[i];
+        fault_vector = 0;
+        probe_wrmsr(0x277, value);
+        check(!fault_vector && msr(0x277) == value, 666 + i);
+    }
+    probe_wrmsr(0x277, pat);
+    check(!fault_vector && msr(0x277) == pat, 672);
     fault_vector = 0;
 }
 

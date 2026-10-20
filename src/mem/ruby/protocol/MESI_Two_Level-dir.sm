@@ -45,16 +45,26 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   state_declaration(State, desc="Directory states", default="Directory_State_I") {
     // Base states
     I, AccessPermission:Read_Write, desc="dir is the owner and memory is up-to-date, all other copies are Invalid";
-    ID, AccessPermission:Busy, desc="Intermediate state for DMA_READ when in I";
+    ID, AccessPermission:Maybe_Stale,
+        desc="Memory remains authoritative while an uncached read is pending";
     ID_W, AccessPermission:Busy, desc="Intermediate state for DMA_WRITE when in I";
 
     M, AccessPermission:Maybe_Stale, desc="memory copy may be stale, i.e. other modified copies may exist";
     IM, AccessPermission:Busy, desc="Intermediate State I>M";
     MI, AccessPermission:Busy, desc="Intermediate State M>I";
     M_DRD, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
-    M_DRDI, AccessPermission:Busy, desc="Intermediate State when there is a dma read";
+    M_DRDI, AccessPermission:Read_Only,
+        desc="Recalled data awaiting writeback acknowledgement";
     M_DWR, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
     M_DWRI, AccessPermission:Busy, desc="Intermediate State when there is a dma write";
+    UA_MEM, AccessPermission:Maybe_Stale,
+        desc="Uncached update awaiting memory data";
+    UA_RECALL, AccessPermission:Busy,
+        desc="Uncached update recalling cached data";
+    UA_WB, AccessPermission:Read_Only,
+        desc="Uncached update awaiting memory acknowledgement";
+    UC_HELD, AccessPermission:Read_Only,
+        desc="Authoritative line held across an uncached paired RMW";
   }
 
   // Events
@@ -66,6 +76,10 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 //added by SS for dma
     DMA_READ, desc="A DMA Read memory request";
     DMA_WRITE, desc="A DMA Write memory request";
+    UncachedAtomic, desc="A nonallocating write or atomic memory request";
+    LockedMemory, desc="Memory data for an uncached locked read";
+    LockedOwner, desc="Recalled data for an uncached locked read";
+    UncachedUnlock, desc="Matching uncached locked write";
     CleanReplacement, desc="Clean Replacement in L2 cache";
 
   }
@@ -83,6 +97,13 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     Addr PhysicalAddress, desc="physical address";
     State TBEState,        desc="Transient State";
     DataBlock DataBlk,     desc="Data to be written (DMA write only)";
+    DataBlock ReturnData,  desc="Value before an uncached atomic operation";
+    WriteMask AtomicMask, desc="Byte mask and optional atomic operations";
+    bool AtomicUpdate, desc="Apply a functor rather than a byte mask";
+    bool Locked, default="false", desc="An uncached paired RMW";
+    MachineID RecalledOwner, desc="Cached owner awaiting acknowledgement";
+    bool Recalled, default="false",
+        desc="A cached owner needs acknowledgement";
     int Len,               desc="...";
     MachineID Requestor,   desc="The DMA engine that sent the request";
   }
@@ -156,7 +177,8 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 
   void functionalRead(Addr addr, Packet *pkt) {
     TBE tbe := TBEs[addr];
-    if(is_valid(tbe)) {
+    if(is_valid(tbe) && tbe.TBEState != State:UA_MEM &&
+       tbe.TBEState != State:ID) {
       testAndRead(addr, tbe.DataBlk, pkt);
     } else {
       functionalMemoryRead(pkt);
@@ -210,6 +232,13 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
         } else if (in_msg.Type == CoherenceRequestType:DMA_WRITE) {
           trigger(Event:DMA_WRITE, makeLineAddress(in_msg.addr),
                   TBEs[makeLineAddress(in_msg.addr)]);
+        } else if (in_msg.Type == CoherenceRequestType:UC_ATOMIC ||
+                   in_msg.Type == CoherenceRequestType:UC_LOCKED_READ) {
+          trigger(Event:UncachedAtomic, makeLineAddress(in_msg.addr),
+                  TBEs[makeLineAddress(in_msg.addr)]);
+        } else if (in_msg.Type == CoherenceRequestType:UC_LOCKED_WRITE) {
+          trigger(Event:UncachedUnlock, makeLineAddress(in_msg.addr),
+                  TBEs[makeLineAddress(in_msg.addr)]);
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg);
           error("Invalid message");
@@ -223,7 +252,13 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
       peek(responseNetwork_in, ResponseMsg) {
         assert(in_msg.Destination.isElement(machineID));
         if (in_msg.Type == CoherenceResponseType:MEMORY_DATA) {
-          trigger(Event:Data, in_msg.addr, TBEs[in_msg.addr]);
+          TBE tbe := TBEs[in_msg.addr];
+          if (is_valid(tbe) && tbe.Locked &&
+              getState(tbe, in_msg.addr) == State:UA_RECALL) {
+            trigger(Event:LockedOwner, in_msg.addr, tbe);
+          } else {
+            trigger(Event:Data, in_msg.addr, tbe);
+          }
         } else if (in_msg.Type == CoherenceResponseType:ACK) {
           trigger(Event:CleanReplacement, in_msg.addr, TBEs[in_msg.addr]);
         } else {
@@ -238,10 +273,19 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   in_port(memQueue_in, MemoryMsg, responseFromMemory, rank = 2) {
     if (memQueue_in.isReady(clockEdge())) {
       peek(memQueue_in, MemoryMsg) {
+        // Partial writes retain their byte address at the memory port, but
+        // directory state and transient entries are keyed by cache line.
+        Addr line := makeLineAddress(in_msg.addr);
         if (in_msg.Type == MemoryRequestType:MEMORY_READ) {
-          trigger(Event:Memory_Data, in_msg.addr, TBEs[in_msg.addr]);
+          TBE tbe := TBEs[line];
+          if (is_valid(tbe) && tbe.Locked &&
+              getState(tbe, line) == State:UA_MEM) {
+            trigger(Event:LockedMemory, line, tbe);
+          } else {
+            trigger(Event:Memory_Data, line, tbe);
+          }
         } else if (in_msg.Type == MemoryRequestType:MEMORY_WB) {
-          trigger(Event:Memory_Ack, in_msg.addr, TBEs[in_msg.addr]);
+          trigger(Event:Memory_Ack, line, TBEs[line]);
         } else {
           DPRINTF(RubySlicc, "%s\n", in_msg.Type);
           error("Invalid message");
@@ -412,6 +456,9 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 
   action(drp_sendDMAData, "drp", desc="Send Data to DMA controller from incoming PUTX") {
     peek(responseNetwork_in, ResponseMsg) {
+      // Keep the authoritative line accessible to functional requests after
+      // returning the read, until its outstanding memory writeback retires.
+      tbe.DataBlk := in_msg.DataBlk;
       enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
         assert(is_valid(tbe));
         out_msg.addr := address;
@@ -424,6 +471,7 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   }
 
   action(v_allocateTBE, "v", desc="Allocate TBE") {
+    check_allocate(TBEs);
     peek(requestNetwork_in, RequestMsg) {
       TBEs.allocate(address);
       set_tbe(TBEs[address]);
@@ -431,19 +479,27 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
       tbe.PhysicalAddress := in_msg.addr;
       tbe.Len := in_msg.Len;
       tbe.Requestor := in_msg.Requestor;
+      tbe.AtomicMask := in_msg.AtomicMask;
+      tbe.AtomicUpdate := in_msg.AtomicUpdate;
+      tbe.Locked := in_msg.Type == CoherenceRequestType:UC_LOCKED_READ;
     }
   }
 
   action(qw_queueMemoryWBRequest_partialTBE, "qwt",
          desc="Queue off-chip writeback request") {
     peek(responseNetwork_in, ResponseMsg) {
+      // The recalled owner may have dirty bytes outside the new write.
+      // Merge the partial write into its authoritative full line before
+      // dropping that owner; forwarding only the new bytes loses its data.
+      DataBlock merged := in_msg.DataBlk;
+      merged.copyPartial(tbe.DataBlk, getOffset(tbe.PhysicalAddress), tbe.Len);
       enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
-        out_msg.addr := tbe.PhysicalAddress;
+        out_msg.addr := address;
         out_msg.Type := MemoryRequestType:MEMORY_WB;
         out_msg.Sender := in_msg.Sender;
         out_msg.MessageSize := MessageSizeType:Writeback_Data;
-        out_msg.DataBlk := tbe.DataBlk;
-        out_msg.Len := tbe.Len;
+        out_msg.DataBlk := merged;
+        out_msg.Len := 0;
       }
     }
   }
@@ -451,6 +507,144 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
   action(w_deallocateTBE, "w", desc="Deallocate TBE") {
     TBEs.deallocate(address);
     unset_tbe();
+  }
+
+  action(ua_updateMemory, "uam",
+         desc="Apply an uncached write or atomic to memory data") {
+    peek(memQueue_in, MemoryMsg) {
+      tbe.ReturnData := in_msg.DataBlk;
+      if (tbe.AtomicUpdate) {
+        tbe.DataBlk.atomicPartial(in_msg.DataBlk, tbe.AtomicMask, true);
+      } else {
+        DataBlock written := tbe.DataBlk;
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.DataBlk.copyPartial(written, tbe.AtomicMask);
+      }
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        out_msg.Sender := machineID;
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Len := 0;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      }
+    }
+  }
+
+  action(ua_updateOwner, "uao",
+         desc="Apply an uncached write or atomic to recalled data") {
+    peek(responseNetwork_in, ResponseMsg) {
+      tbe.Recalled := true;
+      tbe.RecalledOwner := in_msg.Sender;
+      tbe.ReturnData := in_msg.DataBlk;
+      if (tbe.AtomicUpdate) {
+        tbe.DataBlk.atomicPartial(in_msg.DataBlk, tbe.AtomicMask, true);
+      } else {
+        DataBlock written := tbe.DataBlk;
+        tbe.DataBlk := in_msg.DataBlk;
+        tbe.DataBlk.copyPartial(written, tbe.AtomicMask);
+      }
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        out_msg.Sender := in_msg.Sender;
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Len := 0;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      }
+    }
+  }
+
+  action(ua_complete, "uac",
+         desc="Complete after the uncached write retires") {
+    peek(memQueue_in, MemoryMsg) {
+      enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := CoherenceResponseType:DATA;
+        out_msg.Sender := machineID;
+        out_msg.DataBlk := tbe.ReturnData;
+        out_msg.Destination.add(tbe.Requestor);
+        out_msg.MessageSize := MessageSizeType:Response_Data;
+      }
+      if (tbe.Recalled) {
+        enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+          out_msg.addr := address;
+          out_msg.Type := CoherenceResponseType:MEMORY_ACK;
+          out_msg.Sender := machineID;
+          out_msg.Destination.add(tbe.RecalledOwner);
+          out_msg.MessageSize := MessageSizeType:Response_Control;
+        }
+      }
+    }
+  }
+
+  action(uc_fetchAfterClean, "ucf",
+         desc="Read memory after a clean owner retires") {
+    enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+      out_msg.addr := address;
+      out_msg.Type := MemoryRequestType:MEMORY_READ;
+      out_msg.Sender := tbe.Requestor;
+      out_msg.MessageSize := MessageSizeType:Request_Control;
+      out_msg.Len := 0;
+    }
+  }
+
+  action(ul_memory, "ulm", desc="Retain real memory data for a locked read") {
+    peek(memQueue_in, MemoryMsg) {
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.ReturnData := in_msg.DataBlk;
+    }
+  }
+
+  action(ul_owner, "ulo", desc="Retain recalled data for a locked read") {
+    peek(responseNetwork_in, ResponseMsg) {
+      tbe.DataBlk := in_msg.DataBlk;
+      tbe.ReturnData := in_msg.DataBlk;
+      tbe.Recalled := true;
+      tbe.RecalledOwner := in_msg.Sender;
+    }
+  }
+
+  action(ul_reply, "ulr", desc="Return locked data without a cache fill") {
+    enqueue(responseNetwork_out, ResponseMsg, to_mem_ctrl_latency) {
+      out_msg.addr := address;
+      out_msg.Type := CoherenceResponseType:DATA;
+      out_msg.Sender := machineID;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.Destination.add(tbe.Requestor);
+      out_msg.MessageSize := MessageSizeType:Response_Data;
+    }
+  }
+
+  action(ul_write, "ulw", desc="Write and release a matching uncached RMW") {
+    peek(requestNetwork_in, RequestMsg) {
+      assert(in_msg.Requestor == tbe.Requestor);
+      tbe.DataBlk.copyPartial(in_msg.DataBlk, in_msg.AtomicMask);
+      enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+        out_msg.addr := address;
+        out_msg.Type := MemoryRequestType:MEMORY_WB;
+        if (tbe.Recalled) {
+          out_msg.Sender := tbe.RecalledOwner;
+        } else {
+          out_msg.Sender := machineID;
+        }
+        out_msg.DataBlk := tbe.DataBlk;
+        out_msg.Len := 0;
+        out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      }
+    }
+  }
+
+  action(uc_writeAfterClean, "ucw",
+         desc="Write memory after a clean owner retires") {
+    enqueue(memQueue_out, MemoryMsg, to_mem_ctrl_latency) {
+      out_msg.addr := tbe.PhysicalAddress;
+      out_msg.Type := MemoryRequestType:MEMORY_WB;
+      out_msg.Sender := machineID;
+      out_msg.DataBlk := tbe.DataBlk;
+      out_msg.MessageSize := MessageSizeType:Writeback_Data;
+      out_msg.Len := tbe.Len;
+    }
   }
 
 
@@ -517,11 +711,18 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     kd_wakeUpDependents;
   }
 
-  transition({ID, ID_W, M_DRDI, M_DWRI, IM, MI}, {Fetch, Data} ) {
+  transition({ID, ID_W, M_DRDI, M_DWRI, IM, MI, UA_MEM, UA_WB, UC_HELD},
+             {Fetch, Data}) {
     z_stallAndWaitRequest;
   }
 
-  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI}, {DMA_WRITE, DMA_READ} ) {
+  transition({M_DRD, M_DWR, UA_RECALL}, Fetch) {
+    z_stallAndWaitRequest;
+  }
+
+  transition({ID, ID_W, M_DRD, M_DRDI, M_DWR, M_DWRI, IM, MI,
+              UA_MEM, UA_RECALL, UA_WB, UC_HELD},
+             {DMA_WRITE, DMA_READ, UncachedAtomic}) {
     zz_recycleDMAQueue;
   }
 
@@ -534,13 +735,19 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
 
   transition(M_DRD, Data, M_DRDI) {
     drp_sendDMAData;
-    w_deallocateTBE;
     qw_queueMemoryWBRequest;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(M_DRD, CleanReplacement, ID) {
+    a_sendAck;
+    uc_fetchAfterClean;
     k_popIncomingResponseQueue;
   }
 
   transition(M_DRDI, Memory_Ack, I) {
     aa_sendAck;
+    w_deallocateTBE;
     l_popMemQueue;
     kd_wakeUpDependents;
   }
@@ -556,9 +763,67 @@ machine(MachineType:Directory, "MESI Two Level directory protocol")
     k_popIncomingResponseQueue;
   }
 
+  transition(M_DWR, CleanReplacement, ID_W) {
+    a_sendAck;
+    uc_writeAfterClean;
+    k_popIncomingResponseQueue;
+  }
+
   transition(M_DWRI, Memory_Ack, I) {
     aa_sendAck;
     da_sendDMAAck;
+    w_deallocateTBE;
+    l_popMemQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(I, UncachedAtomic, UA_MEM) {
+    v_allocateTBE;
+    qf_queueMemoryFetchRequestDMA;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(M, UncachedAtomic, UA_RECALL) {
+    v_allocateTBE;
+    inv_sendCacheInvalidate;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(UA_MEM, Memory_Data, UA_WB) {
+    ua_updateMemory;
+    l_popMemQueue;
+  }
+
+  transition(UA_MEM, LockedMemory, UC_HELD) {
+    ul_memory;
+    ul_reply;
+    l_popMemQueue;
+  }
+
+  transition(UA_RECALL, LockedOwner, UC_HELD) {
+    ul_owner;
+    ul_reply;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(UC_HELD, UncachedUnlock, UA_WB) {
+    ul_write;
+    j_popIncomingRequestQueue;
+  }
+
+  transition(UA_RECALL, Data, UA_WB) {
+    ua_updateOwner;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(UA_RECALL, CleanReplacement, UA_MEM) {
+    a_sendAck;
+    uc_fetchAfterClean;
+    k_popIncomingResponseQueue;
+  }
+
+  transition(UA_WB, Memory_Ack, I) {
+    ua_complete;
     w_deallocateTBE;
     l_popMemQueue;
     kd_wakeUpDependents;

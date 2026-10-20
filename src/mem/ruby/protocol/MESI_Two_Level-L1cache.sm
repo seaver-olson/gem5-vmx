@@ -99,6 +99,10 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
     M_I, AccessPermission:Busy, desc="L1 replacing, waiting for ACK";
     SINK_WB_ACK, AccessPermission:Busy, desc="This is to sink WB_Acks from L2";
+    UC_WAIT, AccessPermission:Invalid,
+        desc="Nonallocating access at directory";
+    UC_HELD, AccessPermission:Invalid,
+        desc="Directory owns an uncached paired RMW line";
 
     // Transient States in which block is being prefetched
     PF_IS, AccessPermission:Busy, desc="Issued GETS, have not seen response yet";
@@ -117,6 +121,10 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     Load,            desc="Load request from the home processor";
     Ifetch,          desc="I-fetch request from the home processor";
     Store,           desc="Store request from the home processor";
+    Uncached,        desc="Nonallocating read or write";
+    UncachedDone,    desc="Directory completed a nonallocating access";
+    UncachedLocked,  desc="Directory granted an uncached locked read";
+    UncachedUnlock,  desc="Matching uncached locked write";
 
     Inv,           desc="Invalidate request from L2 bank";
 
@@ -169,6 +177,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
     bool isPrefetch,       desc="Set if this was caused by a prefetch";
     int pendingAcks, default="0", desc="number of pending acks";
     bool isLoadLinked, default="false", desc="Set if it was caused by a Load-Linked";
+    bool uncachedLocked, default="false", desc="An uncached locked read";
   }
 
   structure(TBETable, external="yes") {
@@ -185,6 +194,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
   Tick clockEdge();
   Tick cyclesToTicks(Cycles c);
+  MachineID mapAddressToMachine(Addr addr, MachineType mtype);
   Cycles ticksToCycles(Tick t);
   void set_cache_entry(AbstractCacheEntry a);
   void unset_cache_entry();
@@ -192,6 +202,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   void unset_tbe();
   void wakeUpBuffers(Addr a);
   void profileMsgDelay(int virtualNetworkType, Cycles c);
+  Addr cacheProbeUnlocked(CacheMemory cache, Addr address);
 
   // inclusive cache returns L1 entries only
   Entry getCacheEntry(Addr addr), return_by_pointer="yes" {
@@ -427,7 +438,15 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
         Entry cache_entry := getCacheEntry(in_msg.addr);
         TBE tbe := TBEs[in_msg.addr];
 
-        if(in_msg.Type == CoherenceResponseType:DATA_EXCLUSIVE) {
+        if (getState(tbe, cache_entry, in_msg.addr) == State:UC_WAIT &&
+            (in_msg.Type == CoherenceResponseType:DATA ||
+             in_msg.Type == CoherenceResponseType:ACK)) {
+          if (tbe.uncachedLocked) {
+            trigger(Event:UncachedLocked, in_msg.addr, cache_entry, tbe);
+          } else {
+            trigger(Event:UncachedDone, in_msg.addr, cache_entry, tbe);
+          }
+        } else if(in_msg.Type == CoherenceResponseType:DATA_EXCLUSIVE) {
           trigger(Event:Data_Exclusive, in_msg.addr, cache_entry, tbe);
         } else if(in_msg.Type == CoherenceResponseType:DATA) {
           if ((getState(tbe, cache_entry, in_msg.addr) == State:IS ||
@@ -499,7 +518,24 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
 
         // Check for data access to blocks in I-cache and ifetchs to blocks in D-cache
 
-        if (in_msg.Type == RubyRequestType:IFETCH) {
+        if (in_msg.Type == RubyRequestType:UC_READ ||
+            in_msg.Type == RubyRequestType:UC_WRITE ||
+            in_msg.Type == RubyRequestType:UC_ATOMIC ||
+            in_msg.Type == RubyRequestType:UC_LOCKED_READ ||
+            in_msg.Type == RubyRequestType:UC_LOCKED_WRITE) {
+          Entry entry := getCacheEntry(in_msg.LineAddress);
+          if (in_msg.Type == RubyRequestType:UC_LOCKED_WRITE) {
+            trigger(Event:UncachedUnlock, in_msg.LineAddress, entry,
+                    TBEs[in_msg.LineAddress]);
+          } else if (is_valid(entry)) {
+            // Retire a cached alias through the normal replacement protocol.
+            trigger(Event:L1_Replacement, in_msg.LineAddress, entry,
+                    TBEs[in_msg.LineAddress]);
+          } else {
+            trigger(Event:Uncached, in_msg.LineAddress, entry,
+                    TBEs[in_msg.LineAddress]);
+          }
+        } else if (in_msg.Type == RubyRequestType:IFETCH) {
           // ** INSTRUCTION ACCESS ***
 
           Entry L1Icache_entry := getL1ICacheEntry(in_msg.LineAddress);
@@ -526,7 +562,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
               // No room in the L1, so we need to make room in the L1
 
               // Check if the line we want to evict is not locked
-              Addr addr := L1Icache.cacheProbe(in_msg.LineAddress);
+              Addr addr := cacheProbeUnlocked(L1Icache, in_msg.LineAddress);
               check_on_cache_probe(mandatoryQueue_in, addr);
 
               trigger(Event:L1_Replacement, addr,
@@ -561,7 +597,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
               // No room in the L1, so we need to make room in the L1
 
               // Check if the line we want to evict is not locked
-              Addr addr := L1Dcache.cacheProbe(in_msg.LineAddress);
+              Addr addr := cacheProbeUnlocked(L1Dcache, in_msg.LineAddress);
               check_on_cache_probe(mandatoryQueue_in, addr);
 
               trigger(Event:L1_Replacement, addr,
@@ -583,6 +619,59 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   // ACTIONS
+  action(uc_allocate, "uca", desc="Allocate a nonallocating transaction") {
+    check_allocate(TBEs);
+    TBEs.allocate(address);
+    set_tbe(TBEs[address]);
+  }
+
+  action(uc_issue, "uci",
+         desc="Issue a coherent nonallocating memory access") {
+    peek(mandatoryQueue_in, RubyRequest) {
+      tbe.uncachedLocked := in_msg.Type == RubyRequestType:UC_LOCKED_READ;
+      enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
+        out_msg.addr := in_msg.PhysicalAddress;
+        // Reuse nonallocating directory transactions; this CPU's real L1
+        // remains the requestor, with no auxiliary port or DMA sequencer.
+        if (in_msg.Type == RubyRequestType:UC_LOCKED_READ) {
+          out_msg.Type := CoherenceRequestType:UC_LOCKED_READ;
+          out_msg.MessageSize := MessageSizeType:Request_Control;
+        } else if (in_msg.Type == RubyRequestType:UC_ATOMIC ||
+            in_msg.Type == RubyRequestType:UC_LOCKED_WRITE ||
+            in_msg.Type == RubyRequestType:UC_WRITE) {
+          if (in_msg.Type == RubyRequestType:UC_LOCKED_WRITE) {
+            out_msg.Type := CoherenceRequestType:UC_LOCKED_WRITE;
+          } else {
+            out_msg.Type := CoherenceRequestType:UC_ATOMIC;
+          }
+          out_msg.AtomicMask := in_msg.writeMask;
+          out_msg.AtomicUpdate := in_msg.Type == RubyRequestType:UC_ATOMIC;
+          out_msg.DataBlk := in_msg.WTData;
+          if (out_msg.AtomicUpdate) {
+            out_msg.MessageSize := MessageSizeType:Request_Control;
+          } else {
+            out_msg.MessageSize := MessageSizeType:Writeback_Data;
+          }
+        } else {
+          out_msg.Type := CoherenceRequestType:DMA_READ;
+          out_msg.MessageSize := MessageSizeType:Request_Control;
+        }
+        out_msg.Len := in_msg.Size;
+        out_msg.Requestor := machineID;
+        out_msg.Destination.add(
+            mapAddressToMachine(address, MachineType:Directory));
+      }
+    }
+  }
+
+  action(uc_complete, "ucc",
+         desc="Return the directory response without filling") {
+    peek(responseL1Network_in, ResponseMsg) {
+      DataBlock returned := in_msg.DataBlk;
+      sequencer.uncachedCallback(address, returned);
+    }
+  }
+
   action(a_issueGETS, "a", desc="Issue GETS") {
     peek(mandatoryQueue_in, RubyRequest) {
       enqueue(requestL1Network_out, RequestMsg, l1_request_latency) {
@@ -1069,7 +1158,7 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   //*****************************************************
 
   // Transitions for Load/Store/Replacement/WriteBack from transient states
-  transition({IS, IM, IS_I, M_I, SM, SINK_WB_ACK}, {Load, Ifetch, Store, L1_Replacement, Load_Linked}) {
+  transition({IS, IM, IS_I, M_I, SM, SINK_WB_ACK, UC_WAIT}, {Load, Ifetch, Store, L1_Replacement, Load_Linked}) {
     z_stallAndWaitMandatoryQueue;
   }
 
@@ -1094,11 +1183,49 @@ machine(MachineType:L1Cache, "MESI Directory L1 Cache CMP")
   }
 
   // Transitions from Idle
+  transition({IS, IM, IS_I, M_I, SM, SINK_WB_ACK, PF_IS, PF_IS_I,
+              PF_IM, PF_SM, LLSC_E, LLSC_M, UC_WAIT, UC_HELD}, Uncached) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition({NP, I}, Uncached, UC_WAIT) {
+    uc_allocate;
+    uc_issue;
+    k_popMandatoryQueue;
+  }
+
+  transition(UC_WAIT, UncachedDone, I) {
+    uc_complete;
+    s_deallocateTBE;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(UC_WAIT, UncachedLocked, UC_HELD) {
+    uc_complete;
+    o_popIncomingResponseQueue;
+    kd_wakeUpDependents;
+  }
+
+  transition(UC_HELD, UncachedUnlock, UC_WAIT) {
+    uc_issue;
+    k_popMandatoryQueue;
+  }
+
+  transition(UC_HELD, {Load, Store, Ifetch, L1_Replacement}) {
+    z_stallAndWaitMandatoryQueue;
+  }
+
+  transition({UC_WAIT, UC_HELD}, Inv) {
+    fi_sendInvAck;
+    l_popRequestQueue;
+  }
+
   transition({NP,I}, {L1_Replacement, PF_L1_Replacement}) {
     ff_deallocateL1CacheBlock;
   }
 
-  transition({S,E,M,IS,IM,SM,IS_I,PF_IS_I,M_I,SINK_WB_ACK,PF_IS,PF_IM,LLSC_E,LLSC_M},
+  transition({S,E,M,IS,IM,SM,IS_I,PF_IS_I,M_I,SINK_WB_ACK,PF_IS,PF_IM,LLSC_E,LLSC_M,UC_WAIT,UC_HELD},
              {PF_Load, PF_Store, PF_Ifetch}) {
       pq_popPrefetchQueue;
   }

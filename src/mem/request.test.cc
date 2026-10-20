@@ -27,10 +27,33 @@
 
 #include <gtest/gtest.h>
 
+#include "base/gtest/cur_tick_fake.hh"
 #include "mem/request.hh"
 
 namespace gem5
 {
+TEST(Request, MemoryTypeSurvivesCopiesAndResetsOnReuse)
+{
+    GTestTickHandler ticks;
+    Request original(0x1ff8, 16, Request::INST_FETCH, 1, 0x100, 0);
+    EXPECT_EQ(original.memoryType(), Request::MemoryType::Unspecified);
+    original.memoryType(Request::MemoryType::WriteThrough);
+    Request copied(original);
+    EXPECT_EQ(copied.memoryType(), Request::MemoryType::WriteThrough);
+    Request transported(0x3000, 8, original.getFlags(), 1);
+    EXPECT_EQ(transported.memoryType(), Request::MemoryType::WriteThrough);
+    RequestPtr first, second;
+    original.splitOnVaddr(0x2000, first, second);
+    EXPECT_EQ(first->memoryType(), Request::MemoryType::WriteThrough);
+    EXPECT_EQ(second->memoryType(), Request::MemoryType::WriteThrough);
+    first->memoryType(Request::MemoryType::WriteProtected);
+    EXPECT_EQ(second->memoryType(), Request::MemoryType::WriteThrough);
+    EXPECT_TRUE(first->isInstFetch());
+    copied.setVirt(0x4000, 8, 0, 1, 0x100);
+    EXPECT_EQ(copied.memoryType(), Request::MemoryType::Unspecified);
+    EXPECT_TRUE(copied.isInstFetch()); // Existing sticky-flag contract.
+}
+
 // TODO: This test file currently covers only the Request functionality
 // relevant to the copy constructor changes. Additional Request behavior
 // should be covered by future tests.

@@ -63,6 +63,62 @@ namespace gem5
 namespace ruby
 {
 
+namespace
+{
+// Keep a raw swap's input independent of its returned-old-value packet.
+// The Request owns this operation until the directory write is acknowledged.
+class UncachedSwap : public AtomicOpFunctor
+{
+  private:
+    std::vector<uint8_t> replacement;
+    std::vector<uint8_t> expected;
+
+  public:
+    explicit UncachedSwap(PacketPtr pkt) : replacement(pkt->getSize())
+    {
+        assert(!pkt->isMaskedWrite());
+        pkt->writeData(replacement.data());
+        if (pkt->req->isCondSwap()) {
+            panic_if(pkt->getSize() != 4 && pkt->getSize() != 8,
+                     "Invalid size for conditional swap");
+            expected.resize(pkt->getSize());
+            const uint64_t value = pkt->req->getExtraData();
+            const uint32_t value32 = value;
+            std::memcpy(expected.data(),
+                        expected.size() == 8
+                            ? static_cast<const void *>(&value)
+                            : &value32,
+                        expected.size());
+        }
+    }
+
+    void
+    operator()(uint8_t *data) override
+    {
+        if (expected.empty() ||
+            std::memcmp(data, expected.data(), expected.size()) == 0) {
+            std::memcpy(data, replacement.data(), replacement.size());
+        }
+    }
+
+    AtomicOpFunctor *
+    clone() override
+    {
+        return new UncachedSwap(*this);
+    }
+};
+
+bool
+isUncachedRequest(RubyRequestType type)
+{
+    return type == RubyRequestType_UC_READ ||
+           type == RubyRequestType_UC_WRITE ||
+           type == RubyRequestType_UC_ATOMIC ||
+           type == RubyRequestType_UC_LOCKED_READ ||
+           type == RubyRequestType_UC_LOCKED_WRITE;
+}
+} // anonymous namespace
+
 Sequencer::Sequencer(const Params &p)
     : RubyPort(p), m_IncompleteTimes(MachineType_NUM),
       deadlockCheckEvent([this]{ wakeup(); }, "Sequencer deadlock check")
@@ -490,7 +546,8 @@ Sequencer::writeCallbackCBusy(Addr address, DataBlock &data,
            ((seq_req.m_type == RubyRequestType_ATOMIC_RETURN) ||
             (seq_req.m_type == RubyRequestType_ATOMIC_NO_RETURN));
 
-        if ((noCoales || atomic_req) && !ruby_request) {
+        if ((noCoales || atomic_req || isUncachedRequest(seq_req.m_type)) &&
+            !ruby_request) {
             // Do not process follow-up requests
             // (e.g. if full line no present)
             // Reissue to the cache hierarchy
@@ -739,6 +796,33 @@ Sequencer::atomicCallbackCBusy(Addr address, DataBlock &data,
 }
 
 void
+Sequencer::uncachedCallback(Addr address, DataBlock &data)
+{
+    auto &requests = m_RequestTable.at(address);
+    auto &request = requests.front();
+    assert(isUncachedRequest(request.m_type));
+    if (request.m_type == RubyRequestType_UC_LOCKED_WRITE) {
+        m_uncached_locks.erase(address);
+    }
+    if (request.m_type != RubyRequestType_UC_READ) {
+        llscClearMonitor(address);
+    }
+    recordMissLatency(&request, true, MachineType_NUM, true, Cycles(0),
+                      Cycles(0), Cycles(0));
+    markRemoved();
+    hitCallback(&request, data, true, MachineType_NUM, true, -1, Cycles(0),
+                Cycles(0), Cycles(0), false);
+    requests.pop_front();
+    // An uncached response can never satisfy another queued access. Each
+    // one must reach the directory, even if the line address is identical.
+    if (requests.empty()) {
+        m_RequestTable.erase(address);
+    } else {
+        issueRequest(requests.front().pkt, requests.front().m_second_type);
+    }
+}
+
+void
 Sequencer::hitCallback(SequencerRequest *srequest, DataBlock &data,
                        bool llscSuccess, const MachineType mach,
                        const bool externalHit, const int cBusy,
@@ -778,6 +862,9 @@ Sequencer::hitCallback(SequencerRequest *srequest, DataBlock &data,
         data.setData(pkt);
     } else if (!pkt->isFlush() && !pkt->isCleanInvalidateRequest()) {
         if ((type == RubyRequestType_LD) || (type == RubyRequestType_IFETCH) ||
+            (type == RubyRequestType_UC_READ) ||
+            (type == RubyRequestType_UC_LOCKED_READ) ||
+            (type == RubyRequestType_UC_ATOMIC) ||
             (type == RubyRequestType_RMW_Read) ||
             (type == RubyRequestType_Locked_RMW_Read) ||
             (type == RubyRequestType_Load_Linked) ||
@@ -800,6 +887,9 @@ Sequencer::hitCallback(SequencerRequest *srequest, DataBlock &data,
            } else {
                DPRINTF(RubySequencer, "read data %s\n", data);
            }
+        } else if (type == RubyRequestType_UC_WRITE ||
+                   type == RubyRequestType_UC_LOCKED_WRITE) {
+            // Already written through the directory's real memory port.
         } else if (pkt->req->isSwap()) {
             assert(!pkt->isMaskedWrite());
             std::vector<uint8_t> overwrite_val(pkt->getSize());
@@ -991,8 +1081,8 @@ Sequencer::invL1()
 bool
 Sequencer::empty() const
 {
-    return m_RequestTable.empty() &&
-           m_UnaddressedRequestTable.empty();
+    return m_RequestTable.empty() && m_UnaddressedRequestTable.empty() &&
+           m_uncached_locks.empty();
 }
 
 RequestStatus
@@ -1008,7 +1098,26 @@ Sequencer::makeRequest(PacketPtr pkt)
     RubyRequestType primary_type = RubyRequestType_NULL;
     RubyRequestType secondary_type = RubyRequestType_NULL;
 
-    if (pkt->isLLSC()) {
+    panic_if(
+        pkt->req->isUncacheable() &&
+            pkt->req->memoryType() != Request::MemoryType::Unspecified &&
+            (pkt->isLLSC() ||
+             m_ruby_system->getProtocolInfo().getName() != "MESI_Two_Level"),
+        "Typed uncached Ruby accesses require MESI_Two_Level and "
+        "do not support LL/SC");
+
+    if (pkt->req->isUncacheable() && !pkt->isLLSC() &&
+        (pkt->isRead() || pkt->isWrite()) &&
+        m_ruby_system->getProtocolInfo().getName() == "MESI_Two_Level") {
+        primary_type = secondary_type =
+            pkt->req->isLockedRMW()
+                ? (pkt->isWrite() ? RubyRequestType_UC_LOCKED_WRITE
+                                  : RubyRequestType_UC_LOCKED_READ)
+            : pkt->isAtomicOp() || pkt->req->isSwap()
+                ? RubyRequestType_UC_ATOMIC
+            : pkt->isWrite() ? RubyRequestType_UC_WRITE
+                             : RubyRequestType_UC_READ;
+    } else if (pkt->isLLSC()) {
         // LL/SC instructions need to be handled carefully by the cache
         // coherence protocol to ensure they follow the proper semantics. In
         // particular, by identifying the operations as atomic, the protocol
@@ -1113,6 +1222,23 @@ Sequencer::makeRequest(PacketPtr pkt)
         }
     }
 
+    if (!pkt->req->isMemMgmt() && !pkt->req->hasNoAddr()) {
+        const auto line = makeLineAddress(pkt->getAddr());
+        const auto owner =
+            std::make_pair(pkt->req->requestorId(), pkt->req->hasContextId()
+                                                        ? pkt->req->contextId()
+                                                        : InvalidContextID);
+        const auto held = m_uncached_locks.find(line);
+        if (held != m_uncached_locks.end() &&
+            (primary_type != RubyRequestType_UC_LOCKED_WRITE ||
+             held->second != owner)) {
+            return RequestStatus_Aliased;
+        }
+        panic_if(primary_type == RubyRequestType_UC_LOCKED_WRITE &&
+                     held == m_uncached_locks.end(),
+                 "Uncached locked write has no matching read");
+    }
+
     // Check if the line is blocked for a Locked_RMW
     if (!pkt->req->isMemMgmt() &&
         m_controller->isBlocked(makeLineAddress(pkt->getAddr())) &&
@@ -1128,6 +1254,13 @@ Sequencer::makeRequest(PacketPtr pkt)
     // It is OK to receive RequestStatus_Aliased, it can be considered Issued
     if (status != RequestStatus_Ready && status != RequestStatus_Aliased)
         return status;
+    if (primary_type == RubyRequestType_UC_LOCKED_READ) {
+        m_uncached_locks.emplace(
+            makeLineAddress(pkt->getAddr()),
+            std::make_pair(pkt->req->requestorId(), pkt->req->hasContextId()
+                                                        ? pkt->req->contextId()
+                                                        : InvalidContextID));
+    }
     // non-aliased with any existing request in the request table, just issue
     // to the cache
     if (status != RequestStatus_Aliased)
@@ -1193,14 +1326,32 @@ Sequencer::issueRequest(PacketPtr pkt, RubyRequestType secondary_type)
                                             RubyAccessMode_Supervisor, pkt,
                                             PrefetchBit_No, proc_id, core_id);
 
-        if (pkt->isAtomicOp() &&
+        if (secondary_type == RubyRequestType_UC_WRITE ||
+            secondary_type == RubyRequestType_UC_LOCKED_WRITE) {
+            msg->m_WTData.setData(pkt);
+            const auto &enabled = pkt->req->getByteEnable();
+            for (unsigned i = 0; i < pkt->getSize(); ++i) {
+                if (enabled.empty() || enabled[i]) {
+                    msg->m_writeMask.setMask(getOffset(pkt->getAddr()) + i, 1);
+                }
+            }
+        }
+
+        if (secondary_type == RubyRequestType_UC_ATOMIC &&
+            pkt->req->isSwap() && !pkt->isAtomicOp() &&
+            !pkt->req->hasAtomicOpFunctor()) {
+            pkt->req->setAtomicOpFunctor(std::make_unique<UncachedSwap>(pkt));
+        }
+        if ((pkt->isAtomicOp() ||
+             secondary_type == RubyRequestType_UC_ATOMIC) &&
             ((secondary_type == RubyRequestType_ATOMIC_RETURN) ||
-             (secondary_type == RubyRequestType_ATOMIC_NO_RETURN))){
+             (secondary_type == RubyRequestType_ATOMIC_NO_RETURN) ||
+             (secondary_type == RubyRequestType_UC_ATOMIC))) {
             // Create the blocksize, access mask and atomicops
             uint32_t offset = getOffset(pkt->getAddr());
             std::vector<std::pair<int,AtomicOpFunctor*>> atomicOps;
-            atomicOps.push_back(std::make_pair<int,AtomicOpFunctor*>
-                                (offset, pkt->getAtomicOp()));
+            atomicOps.push_back(std::make_pair<int, AtomicOpFunctor *>(
+                offset, pkt->req->getAtomicOpFunctor()));
 
             msg->setWriteMask(offset, pkt->getSize(), atomicOps);
         }

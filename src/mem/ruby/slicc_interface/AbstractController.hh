@@ -74,6 +74,7 @@ class Network;
 class GPUCoalescer;
 class DMASequencer;
 class RubySystem;
+class CacheMemory;
 
 // used to communicate that an in_port peeked the wrong message type
 class RejectException: public std::exception
@@ -101,6 +102,7 @@ class AbstractController : public ClockedObject, public Consumer
     bool isBlocked(Addr) const;
     void unblock(Addr);
     bool isBlocked(Addr);
+    Addr cacheProbeUnlocked(CacheMemory &cache, Addr address) const;
 
     virtual MessageBuffer* getMandatoryQueue() const = 0;
     virtual MessageBuffer* getMemReqQueue() const = 0;

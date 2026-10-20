@@ -15,6 +15,12 @@ on:
             - src/arch/x86/**
             - src/arch/generic/mmu.*
             - src/mem/coherent_xbar.*
+            - src/mem/snoop_filter.*
+            - src/mem/request.*
+            - src/mem/packet.*
+            - src/mem/cache/**
+            - src/mem/ruby/**
+            - src/mem/SConscript
             - src/cpu/FuncUnit.py
             - src/cpu/op_class.hh
             - src/cpu/o3/**
@@ -22,6 +28,7 @@ on:
             - tests/gem5/vmx/**
             - tests/gem5/x86_paging/**
             - src/python/gem5/components/cachehierarchies/classic/**
+            - src/python/gem5/components/cachehierarchies/ruby/**
             - .github/workflows/vmx-tests.yaml
     pull_request:
         branches: [vmx-ext]
@@ -29,6 +36,12 @@ on:
             - src/arch/x86/**
             - src/arch/generic/mmu.*
             - src/mem/coherent_xbar.*
+            - src/mem/snoop_filter.*
+            - src/mem/request.*
+            - src/mem/packet.*
+            - src/mem/cache/**
+            - src/mem/ruby/**
+            - src/mem/SConscript
             - src/cpu/FuncUnit.py
             - src/cpu/op_class.hh
             - src/cpu/o3/**
@@ -36,6 +49,7 @@ on:
             - tests/gem5/vmx/**
             - tests/gem5/x86_paging/**
             - src/python/gem5/components/cachehierarchies/classic/**
+            - src/python/gem5/components/cachehierarchies/ruby/**
             - .github/workflows/vmx-tests.yaml
     schedule:
         # Weekly, Monday 06:17 UTC. Off-the-hour to avoid the top-of-hour
@@ -62,7 +76,7 @@ jobs:
 
             - name: Build VMX unit tests
               run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt build/X86/arch/x86/paging.test.opt build/X86/arch/x86/ept.test.opt
-                  -j "$(nproc)"
+                  build/X86/mem/request.test.opt build/X86/mem/packet.test.opt -j "$(nproc)"
 
             - name: Run vmx_utils.test
               run: build/X86/arch/x86/vmx_utils.test.opt --gtest_output=xml:vmx_utils.test.xml
@@ -76,6 +90,12 @@ jobs:
             - name: Run ept.test
               run: build/X86/arch/x86/ept.test.opt --gtest_output=xml:ept.test.xml
 
+            - name: Run request.test
+              run: build/X86/mem/request.test.opt --gtest_output=xml:request.test.xml
+
+            - name: Run packet.test
+              run: build/X86/mem/packet.test.opt --gtest_output=xml:packet.test.xml
+
             - name: Upload gtest results
               if: always()
               uses: actions/upload-artifact@v7
@@ -86,6 +106,8 @@ jobs:
                       vmcs.test.xml
                       paging.test.xml
                       ept.test.xml
+                      request.test.xml
+                      packet.test.xml
 
     paging-full-system:
         name: Disk-free paging CPU and memory matrix

@@ -151,7 +151,8 @@ class MMU::WalkContinuation :
 
     bool done() const { return completed; }
 
-    void startFinal(Addr guestPhysical)
+    void
+    startFinal(Addr guestPhysical, uint8_t pat_index = 0)
     {
         req->setPaddr(guestPhysical);
         if (!snapshot->ept) {
@@ -164,24 +165,33 @@ class MMU::WalkContinuation :
             (snapshot->accessMode == BaseMMU::Write ||
              (snapshot->flags & Request::READ_MODIFY_WRITE)) ?
             EptAccess::Write : EptAccess::Read;
-        const ept::LookupInput input(guestPhysical, access, *snapshot->ept);
-        ept::walkTiming(*snapshot->port, req->requestorId(), input,
-            snapshot->physicalBits, snapshot->eptCapabilities,
+        const ept::LookupInput input(guestPhysical, access, *snapshot->ept,
+                                     false, snapshot->cr0.cd);
+        ept::walkTiming(
+            *snapshot->port, req->requestorId(), input, snapshot->physicalBits,
+            snapshot->eptCapabilities,
             [self = shared_from_this()] {
                 return !self->squashed() &&
                     self->snapshot->generation == self->cache.generation(
                         self->snapshot->tag.thread);
             },
-            [self = shared_from_this(), input](const ept::WalkResult &result) {
+            [self = shared_from_this(), input,
+             pat_index](const ept::WalkResult &result) {
                 if (result.status != ept::WalkStatus::Mapping) {
                     self->complete(ept::lookupFault(result, input,
                         self->snapshot->linearAddress, true));
                     return;
                 }
                 self->req->setPaddr(result.hostPhysical);
-                if (result.memoryType == 0)
-                    self->req->setFlags(Request::UNCACHEABLE |
-                                        Request::STRICT_ORDER);
+                const auto &context = *self->snapshot;
+                const auto pat = context.cr0.pg
+                                     ? paging::patType(context.pat, pat_index)
+                                     : 6;
+                paging::applyMemoryType(
+                    *self->req,
+                    paging::effectiveEptType(context.cr0.cd, result.memoryType,
+                                             result.ignorePat, pat),
+                    input.access == EptAccess::Write);
                 self->complete(self->mmu.finalizePhysical(self->req,
                     self->snapshot->accessMode, self->snapshot->apicBase,
                     self->snapshot->tag.thread));
@@ -205,10 +215,14 @@ class MMU::WalkContinuation :
                 complete(std::make_shared<ReExec>());
             } else {
                 cache.insert(result->entry.vaddr, result->entry, result->context);
-                if (result->entry.uncacheable)
-                    req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+                if (result->entry.uncacheable && !snapshot->ept) {
+                    req->setFlags(Request::UNCACHEABLE |
+                                  Request::STRICT_ORDER);
+                }
                 startFinal(result->entry.paddr |
-                    (snapshot->linearAddress & mask(result->entry.logBytes)));
+                               (snapshot->linearAddress &
+                                mask(result->entry.logBytes)),
+                           result->entry.patIndex());
             }
         } else {
             complete(fault);
@@ -418,6 +432,11 @@ MMU::translate(const RequestPtr &req,
 
     Addr vaddr = req->getVaddr();
     DPRINTF(TLB, "Translating vaddr %#x.\n", vaddr);
+    const bool ept_active = FullSystem && static_cast<ISA *>(tc->getIsaPtr())
+                                              ->vmxState()
+                                              .eptConfig()
+                                              .has_value();
+    uint8_t pat_index = 0;
 
     // Port proxies (debugger, pseudo-instructions, workload loaders) name
     // linear addresses on the simulator's behalf. Like the original
@@ -633,8 +652,10 @@ MMU::translate(const RequestPtr &req,
             Addr paddr = entry->paddr | (vaddr & mask(entry->logBytes));
             DPRINTF(TLB, "Translated %#x -> %#x.\n", vaddr, paddr);
             req->setPaddr(paddr);
-            if (entry->uncacheable)
+            pat_index = entry->patIndex();
+            if (entry->uncacheable && !ept_active) {
                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+            }
         } else {
             //Use the address which already has segmentation applied.
             DPRINTF(TLB, "Paging disabled.\n");
@@ -648,19 +669,18 @@ MMU::translate(const RequestPtr &req,
         req->setPaddr(vaddr);
     }
 
-    if (FullSystem &&
-        static_cast<ISA *>(tc->getIsaPtr())->vmxState().eptConfig()) {
+    if (ept_active) {
         auto snapshot = captureContext(req, tc, cache, mode, completionMode,
                                        vaddr, vaddr, debugAccess);
         if (timing) {
             auto continuation = std::make_shared<WalkContinuation>(
                 *this, cache, req, tc, translation, snapshot);
-            continuation->startFinal(req->getPaddr());
+            continuation->startFinal(req->getPaddr(), pat_index);
             completedInline = continuation->done();
             delayedResponse = !completedInline;
             return NoFault;
         }
-        return resolveEpt(req, *snapshot, functional);
+        return resolveEpt(req, *snapshot, functional, pat_index);
     }
     return finalizePhysical(req, tc, mode);
 }
@@ -673,14 +693,15 @@ MMU::finishWalk(const RequestPtr &req, const TranslationContext &context,
     // checked against its captured context. Completion never re-enters
     // translate() with a null asynchronous continuation.
     req->setPaddr(entry.paddr | (context.linearAddress & mask(entry.logBytes)));
-    if (entry.uncacheable)
+    if (entry.uncacheable && !context.ept) {
         req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
-    return resolveEpt(req, context, functional);
+    }
+    return resolveEpt(req, context, functional, entry.patIndex());
 }
 
 Fault
 MMU::resolveEpt(const RequestPtr &req, const TranslationContext &context,
-                bool functional)
+                bool functional, uint8_t pat_index)
 {
     if (context.ept) {
         const EptAccess access = context.accessMode == BaseMMU::Execute ?
@@ -688,7 +709,8 @@ MMU::resolveEpt(const RequestPtr &req, const TranslationContext &context,
             (context.accessMode == BaseMMU::Write ||
              (context.flags & Request::READ_MODIFY_WRITE)) ?
             EptAccess::Write : EptAccess::Read;
-        const ept::LookupInput input(req->getPaddr(), access, *context.ept);
+        const ept::LookupInput input(req->getPaddr(), access, *context.ept,
+                                     false, context.cr0.cd);
         const auto result = functional ?
             ept::walkFunctional(*context.port, req->requestorId(), input,
                 context.physicalBits, context.eptCapabilities) :
@@ -697,8 +719,13 @@ MMU::resolveEpt(const RequestPtr &req, const TranslationContext &context,
         if (result.status != ept::WalkStatus::Mapping)
             return ept::lookupFault(result, input, context.linearAddress, true);
         req->setPaddr(result.hostPhysical);
-        if (result.memoryType == 0)
-            req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
+        const auto pat =
+            context.cr0.pg ? paging::patType(context.pat, pat_index) : 6;
+        paging::applyMemoryType(
+            *req,
+            paging::effectiveEptType(context.cr0.cd, result.memoryType,
+                                     result.ignorePat, pat),
+            access == EptAccess::Write);
     }
     return finalizePhysical(req, context.accessMode, context.apicBase,
                             context.tag.thread);

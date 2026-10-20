@@ -203,6 +203,12 @@ enumeration(RubyRequestType, desc="...", default="RubyRequestType_NULL") {
   hasNoAddr,          desc="Request for timing purposes in VIPERSequencer hitCallback and processReadCallback but reads no address";
   Stash_Unique,       desc="Stash Only request type";
   Stash_Shared,       desc="Stash Only request type";
+  // Append new types so existing cache-recorded request IDs stay stable.
+  UC_READ,           desc="Coherent, nonallocating read";
+  UC_WRITE,          desc="Coherent, nonallocating write";
+  UC_ATOMIC,         desc="Coherent, nonallocating atomic update";
+  UC_LOCKED_READ,    desc="Acquire nonallocating paired RMW ownership";
+  UC_LOCKED_WRITE,   desc="Complete a nonallocating paired RMW";
 }
 
 bool isWriteRequest(RubyRequestType type);

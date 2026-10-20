@@ -457,7 +457,7 @@ BaseCache::recvTimingReq(PacketPtr pkt)
     // the delay provided by the crossbar
     Tick forward_time = clockEdge(forwardLatency) + pkt->headerDelay;
 
-    if (pkt->cmd == MemCmd::LockedRMWWriteReq) {
+    if (pkt->cmd == MemCmd::LockedRMWWriteReq && !pkt->req->isUncacheable()) {
         // For LockedRMW accesses, we mark the block inaccessible after the
         // read (see below), to make sure no one gets in before the write.
         // Now that the write is here, mark it accessible again, so the
@@ -555,9 +555,16 @@ BaseCache::recvTimingResp(PacketPtr pkt)
     DPRINTF(Cache, "%s: Handling response %s\n", __func__,
             pkt->print());
 
+    if (pkt->req->isUncacheable() && pkt->req->isLockedRMW() &&
+        (pkt->cmd == MemCmd::LockedRMWWriteResp || is_error)) {
+        uncachedLocks.erase({pkt->getBlockAddr(blkSize), pkt->isSecure()});
+        schedMemSideSendEvent(clockEdge());
+    }
+
     // if this is a write, we should be looking at an uncacheable
     // write
-    if (pkt->isWrite() && pkt->cmd != MemCmd::LockedRMWWriteResp) {
+    if (pkt->isWrite() && (pkt->req->isUncacheable() ||
+                           pkt->cmd != MemCmd::LockedRMWWriteResp)) {
         assert(pkt->req->isUncacheable());
         handleUncacheableWriteResp(pkt);
         return;
@@ -901,14 +908,35 @@ BaseCache::cmpAndSwap(CacheBlk *blk, PacketPtr pkt)
     }
 }
 
+bool
+BaseCache::mayIssueUncached(QueueEntry *entry) const
+{
+    const auto held = uncachedLocks.find({entry->blkAddr, entry->isSecure});
+    if (held == uncachedLocks.end() || entry->order <= held->second.order) {
+        return true;
+    }
+    const auto *pkt = entry->getTarget()->pkt;
+    const auto &owner = held->second.request;
+    const auto context = [](const RequestPtr &req) {
+        return req->hasContextId() ? req->contextId() : InvalidContextID;
+    };
+    return pkt->cmd == MemCmd::LockedRMWWriteReq &&
+           pkt->req->isUncacheable() &&
+           pkt->req->requestorId() == owner->requestorId() &&
+           context(pkt->req) == context(owner);
+}
+
 QueueEntry*
 BaseCache::getNextQueueEntry()
 {
     // Check both MSHR queue and write buffer for potential requests,
     // note that null does not mean there is no request, it could
     // simply be that it is not ready
-    MSHR *miss_mshr  = mshrQueue.getNext();
-    WriteQueueEntry *wq_entry = writeBuffer.getNext();
+    const auto eligible = [this](QueueEntry *entry) {
+        return mayIssueUncached(entry);
+    };
+    MSHR *miss_mshr = mshrQueue.getNext(eligible);
+    WriteQueueEntry *wq_entry = writeBuffer.getNext(eligible);
 
     // If we got a write buffer request ready, first priority is a
     // full write buffer, otherwise we favour the miss requests
@@ -916,7 +944,8 @@ BaseCache::getNextQueueEntry()
         // need to search MSHR queue for conflicting earlier miss.
         MSHR *conflict_mshr = mshrQueue.findPending(wq_entry);
 
-        if (conflict_mshr && conflict_mshr->order < wq_entry->order) {
+        if (conflict_mshr && eligible(conflict_mshr) &&
+            conflict_mshr->order < wq_entry->order) {
             // Service misses in order until conflict is cleared.
             return conflict_mshr;
 
@@ -928,7 +957,7 @@ BaseCache::getNextQueueEntry()
     } else if (miss_mshr) {
         // need to check for conflicting earlier writeback
         WriteQueueEntry *conflict_mshr = writeBuffer.findPending(miss_mshr);
-        if (conflict_mshr) {
+        if (conflict_mshr && eligible(conflict_mshr)) {
             // not sure why we don't check order here... it was in the
             // original code but commented out.
 
@@ -1912,8 +1941,11 @@ BaseCache::invalidateVisitor(CacheBlk &blk)
 Tick
 BaseCache::nextQueueReadyTime() const
 {
-    Tick nextReady = std::min(mshrQueue.nextReadyTime(),
-                              writeBuffer.nextReadyTime());
+    const auto eligible = [this](QueueEntry *entry) {
+        return mayIssueUncached(entry);
+    };
+    Tick nextReady = std::min(mshrQueue.nextReadyTime(eligible),
+                              writeBuffer.nextReadyTime(eligible));
 
     // Don't signal prefetch ready time if no MSHRs available
     // Will signal once enoguh MSHRs are deallocated
@@ -1933,6 +1965,13 @@ BaseCache::sendMSHRQueuePacket(MSHR* mshr)
 
     // use request from 1st target
     PacketPtr tgt_pkt = mshr->getTarget()->pkt;
+
+    if (tgt_pkt->req->isUncacheable() &&
+        tgt_pkt->cmd == MemCmd::LockedRMWReadReq) {
+        uncachedLocks.try_emplace(
+            std::make_pair(mshr->blkAddr, mshr->isSecure),
+            UncachedLock{mshr->order, tgt_pkt->req});
+    }
 
     DPRINTF(Cache, "%s: MSHR %s\n", __func__, tgt_pkt->print());
 

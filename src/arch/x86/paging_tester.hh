@@ -103,6 +103,10 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     void setupEpt(bool presetAD, bool eptAD = false);
     void finishEpt();
     void eptMmuCases();
+    void eptMemoryTypeCase(unsigned scenario, BaseMMU::Mode mode,
+                           bool functional, bool warm, bool primed = false);
+    void eptUncachedSwap(unsigned size, bool conditional, bool match);
+    void eptUncachedPair(bool lockedPeer);
     void eptMmuAccess(BaseMMU::Mode mode, bool functional, bool warm,
                       EptTest test, unsigned level = 0, bool primed = false);
     void eptMmuTiming(unsigned point, Injection inject, bool warm = false,
@@ -111,9 +115,9 @@ class PagingTester : public SimObject, public BaseMMU::Translation
                            AlreadySet, Replace, Revoke, Denied, Absent,
                            Misconfig, UpdateError,
                            Retry, CancelQueued, CancelIssued };
-    void eptAdCase(EptAdTest test);
+    void eptAdCase(EptAdTest test, bool cacheDisabled = false);
     void eptAdGuest(bool denied, bool functional, bool writing = false,
-                    bool presetAD = true);
+                    bool presetAD = true, bool cacheDisabled = false);
     void eptTimingLifecycle(bool retry, bool cancel, unsigned stop);
     void eptTimingConcurrent();
     void next();

@@ -116,6 +116,12 @@ input_file = Path(m5.options.outdir) / "functional-input.bin"
 input_file.write_bytes(bytes.fromhex("0011223344556677"))
 board.readfile = str(input_file)
 root = board._pre_instantiate()
+if not args.classic:
+    for controller in hierarchy.ruby_system.l1_controllers:
+        for cache in (controller.L1Icache, controller.L1Dcache):
+            assert int(cache.start_index_bit) == (
+                int(board.cache_line_size).bit_length() - 1
+            )
 if args.fixture:
     if args.cpu not in ("atomic", "timing"):
         parser.error("The direct fixture uses an atomic or timing context")

@@ -226,9 +226,36 @@ class Queue : public Drainable, public Named
         return readyList.front();
     }
 
+    template <class Eligible>
+    Entry *
+    getNext(Eligible eligible) const
+    {
+        for (auto *entry : readyList) {
+            if (entry->readyTime > curTick()) {
+                break;
+            }
+            if (eligible(entry)) {
+                return entry;
+            }
+        }
+        return nullptr;
+    }
+
     Tick nextReadyTime() const
     {
         return readyList.empty() ? MaxTick : readyList.front()->readyTime;
+    }
+
+    template <class Eligible>
+    Tick
+    nextReadyTime(Eligible eligible) const
+    {
+        for (auto *entry : readyList) {
+            if (eligible(entry)) {
+                return entry->readyTime;
+            }
+        }
+        return MaxTick;
     }
 
     /**

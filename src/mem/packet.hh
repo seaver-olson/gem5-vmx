@@ -1465,6 +1465,13 @@ class Packet : public Printable, public Extensible<Packet>
     bool
     trySatisfyFunctional(PacketPtr other)
     {
+        // An atomic packet carries an operation's input or returned old
+        // value, not an authoritative memory image. Neither supply that
+        // payload to a functional read nor overwrite it with a debug write.
+        if (other->isAtomicOp() || other->req->isSwap() ||
+            other->req->isLockedRMW()) {
+            return false;
+        }
         if (other->isMaskedWrite()) {
             // Do not forward data if overlapping with a masked write
             if (_isSecure == other->isSecure() &&

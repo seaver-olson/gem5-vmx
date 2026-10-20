@@ -48,6 +48,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <map>
 #include <string>
 
 #include "base/addr_range.hh"
@@ -968,6 +969,16 @@ class BaseCache : public ClockedObject
 
     /** Increasing order number assigned to each incoming request. */
     uint64_t order;
+
+    // A shared cache must not send a conflicting miss while an uncached
+    // RMW owns the line: downstream retry would block its matching write.
+    struct UncachedLock
+    {
+        Counter order;
+        RequestPtr request;
+    };
+    std::map<std::pair<Addr, bool>, UncachedLock> uncachedLocks;
+    bool mayIssueUncached(QueueEntry *entry) const;
 
     /** Stores time the cache blocked for statistics. */
     Cycles blockedCycle;

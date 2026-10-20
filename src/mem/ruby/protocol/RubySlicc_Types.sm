@@ -127,6 +127,7 @@ structure (NetDest, external = "yes", non_obj="yes", implicit_ctor="m_ruby_syste
 }
 
 structure (Sequencer, external = "yes") {
+  void uncachedCallback(Addr, DataBlock);
   void stashCallback(Addr);
   void readCallback(Addr, DataBlock);
   void readCallback(Addr, DataBlock, bool);

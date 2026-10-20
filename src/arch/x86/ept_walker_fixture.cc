@@ -1,6 +1,4 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
-#include "arch/x86/paging_tester.hh"
-
 #include <algorithm>
 #include <array>
 
@@ -10,6 +8,8 @@
 #include "arch/x86/ldstflags.hh"
 #include "arch/x86/mmu.hh"
 #include "arch/x86/pagetable_walker.hh"
+#include "arch/x86/paging.hh"
+#include "arch/x86/paging_tester.hh"
 #include "arch/x86/tlb.hh"
 #include "base/logging.hh"
 #include "mem/packet_access.hh"
@@ -132,6 +132,29 @@ PagingTester::finishEpt()
 void
 PagingTester::eptMmuCases()
 {
+    for (unsigned size : {1, 2, 4, 8}) {
+        cases.emplace_back([=, this] { eptUncachedSwap(size, false, true); });
+        if (size >= 4) {
+            for (bool match : {false, true}) {
+                cases.emplace_back(
+                    [=, this] { eptUncachedSwap(size, true, match); });
+            }
+        }
+    }
+    if (system->isTimingMode() && system->threads.size() > 1) {
+        for (bool locked : {false, true}) {
+            cases.emplace_back([=, this] { eptUncachedPair(locked); });
+        }
+    }
+    for (unsigned scenario = 0; scenario < 8; ++scenario) {
+        for (auto mode : {BaseMMU::Read, BaseMMU::Write, BaseMMU::Execute}) {
+            for (unsigned path = 0; path < 3; ++path) {
+                cases.emplace_back([=, this] {
+                    eptMemoryTypeCase(scenario, mode, path == 2, path == 1);
+                });
+            }
+        }
+    }
     for (auto mode : {BaseMMU::Read, BaseMMU::Write, BaseMMU::Execute}) {
         for (bool functional : {false, true}) {
             for (bool warm : {false, true}) {
@@ -191,29 +214,424 @@ PagingTester::eptMmuCases()
         }
         cases.emplace_back([this] { eptMmuTiming(4, SquashRead); });
     }
-    for (auto test : {EptAdTest::Read, EptAdTest::Write, EptAdTest::Execute,
-                     EptAdTest::Large2M, EptAdTest::Large1G, EptAdTest::FiveLevel,
-                     EptAdTest::AlreadySet, EptAdTest::Replace, EptAdTest::Revoke,
-                     EptAdTest::Denied, EptAdTest::Absent, EptAdTest::Misconfig,
-                     EptAdTest::UpdateError}) {
-        cases.emplace_back([=, this] { eptAdCase(test); });
-    }
-    if (system->isTimingMode()) {
-        for (auto test : {EptAdTest::Retry, EptAdTest::CancelQueued,
-                          EptAdTest::CancelIssued}) {
-            cases.emplace_back([=, this] { eptAdCase(test); });
+    for (bool cd : {false, true}) {
+        for (auto test :
+             {EptAdTest::Read, EptAdTest::Write, EptAdTest::Execute,
+              EptAdTest::Large2M, EptAdTest::Large1G, EptAdTest::FiveLevel,
+              EptAdTest::AlreadySet, EptAdTest::Replace, EptAdTest::Revoke,
+              EptAdTest::Denied, EptAdTest::Absent, EptAdTest::Misconfig,
+              EptAdTest::UpdateError}) {
+            cases.emplace_back([=, this] { eptAdCase(test, cd); });
         }
-    }
-    for (bool denied : {false, true}) {
-        for (bool functional : {false, true}) {
-            cases.emplace_back([=, this] { eptAdGuest(denied, functional); });
+        if (system->isTimingMode()) {
+            for (auto test : {EptAdTest::Retry, EptAdTest::CancelQueued,
+                              EptAdTest::CancelIssued}) {
+                cases.emplace_back([=, this] { eptAdCase(test, cd); });
+            }
         }
+        for (bool denied : {false, true}) {
+            for (bool functional : {false, true}) {
+                cases.emplace_back([=, this] {
+                    eptAdGuest(denied, functional, false, true, cd);
+                });
+            }
+        }
+        cases.emplace_back(
+            [=, this] { eptAdGuest(false, false, false, false, cd); });
     }
-    cases.emplace_back([this] { eptAdGuest(false, false, false, false); });
 }
 
 void
-PagingTester::eptAdCase(EptAdTest test)
+PagingTester::eptMemoryTypeCase(unsigned scenario, BaseMMU::Mode mode,
+                                bool functional, bool warm, bool primed)
+{
+    using Type = Request::MemoryType;
+    const uint8_t ept_types[] = {6, 6, 6, 1, 4, 5, 0, 5};
+    const Type expected[] = {Type::Uncacheable,    Type::WriteBack,
+                             Type::Uncacheable,    Type::WriteCombining,
+                             Type::WriteThrough,   Type::WriteProtected,
+                             Type::WriteCombining, Type::WriteCombining};
+    const bool cd = scenario == 2;
+    const bool ignore = scenario == 1;
+    const unsigned selector = scenario == 1 ? 3 : scenario == 7 ? 2 : 0;
+    uint64_t pat = 0x0007040600070406ULL;
+    if (scenario == 0 || scenario == 6) {
+        pat = (pat & ~0xffULL) | (scenario == 6 ? 1 : 0);
+    }
+    if (!primed) {
+        setupEpt(true);
+        CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+        cr0.cd = cd;
+        tc->setMiscRegNoEffect(misc_reg::Cr0, cr0);
+        tc->setMiscRegNoEffect(misc_reg::Pat, pat);
+        tc->setMiscRegNoEffect(misc_reg::Cr3, Tables | (ignore ? 24 : 0));
+        for (unsigned level = 0; level < 4; ++level) {
+            const unsigned attributes = level == 3 ? selector : level + 1;
+            descriptor(level, descriptor(level) | ((attributes & 3) << 3));
+            if (ignore) {
+                const Addr address = EptTableLeaves + 8 * level;
+                auto leaf = system->physProxy.read<uint64_t>(
+                    address, ByteOrder::little);
+                system->physProxy.write<uint64_t>(address, leaf | 64,
+                                                  ByteOrder::little);
+            }
+        }
+        system->physProxy.write<uint64_t>(
+            EptDataLeaf,
+            HostData | 7 | (uint64_t(ept_types[scenario]) << 3) | 128 |
+                (ignore ? 64 : 0),
+            ByteOrder::little);
+    }
+    auto *cache =
+        static_cast<TLB *>(mode == BaseMMU::Execute ? mmu->itb : mmu->dtb);
+    panic_if(bool(cache->lookup(Virtual, false, {tc->contextId(), 0})) !=
+                 primed,
+             "EPT memory-type case missed its intended TLB path");
+    // The existing interposer observes the data walker only. Classic's
+    // shared I/D TLB exposes fetch packets too; Ruby's independent I-walker
+    // is still checked by its returned type and captured-state assertions.
+    const unsigned expected_tables =
+        primed || (mode == BaseMMU::Execute && mmu->itb != mmu->dtb) ? 0 : 4;
+    auto counts = std::make_shared<std::array<unsigned, 2>>();
+    inspectAttributes = [=](PacketPtr packet) {
+        const bool guest = packet->getAddr() >= HostTables &&
+                           packet->getAddr() < HostTables + 4 * 4096;
+        ++(*counts)[guest];
+        const auto attrs = PagingPort::attributes(packet);
+        const auto type =
+            guest ? paging::effectiveEptType(
+                        cd, 6, ignore,
+                        paging::patType(pat, unsigned(attrs.pwt) |
+                                                 (unsigned(attrs.pcd) << 1)))
+                  : (cd ? Type::Uncacheable : Type::WriteBack);
+        panic_if(
+            packet->req->memoryType() != type ||
+                packet->req->isUncacheable() != (type == Type::Uncacheable ||
+                                                 type == Type::WriteCombining),
+            "EPT memory-type case %u: wrong table request type", scenario);
+    };
+    auto flags = accessFlags;
+    if (mode == BaseMMU::Execute) {
+        flags.set(Request::INST_FETCH);
+    }
+    auto req = std::make_shared<Request>(Virtual, 1, flags,
+                                         system->getRequestorId(this), Virtual,
+                                         tc->contextId());
+    const Tick start = curTick();
+    const auto verify = [=, this](const Fault &fault, const RequestPtr &out,
+                                  ThreadContext *context,
+                                  BaseMMU::Mode returned) {
+        Request policy(0, 1, 0, req->requestorId());
+        paging::applyMemoryType(policy, expected[scenario],
+                                mode == BaseMMU::Write);
+        panic_if(fault || out != req || context != tc || returned != mode ||
+                     out->getPaddr() != HostData + (Virtual & 4095) ||
+                     out->memoryType() != expected[scenario] ||
+                     out->isUncacheable() != policy.isUncacheable() ||
+                     out->isStrictlyOrdered() != policy.isStrictlyOrdered() ||
+                     (*counts)[1] != expected_tables ||
+                     (functional && curTick() != start),
+                 "EPT memory-type case %u: wrong final type or captured state",
+                 scenario);
+        CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+        cr0.cd = cd;
+        tc->setMiscRegNoEffect(misc_reg::Cr0, cr0);
+        tc->setMiscRegNoEffect(misc_reg::Pat, pat);
+        if (warm && !primed) {
+            schedule(new EventFunctionWrapper(
+                         [=, this] {
+                             eptMemoryTypeCase(scenario, mode, false, true,
+                                               true);
+                         },
+                         name() + ".ept_type_warm", true),
+                     curTick() + 1);
+        } else {
+            // Exercise the resolved policy on a real final memory request,
+            // not only on the MMU's returned flags. A WB readback must see
+            // the write, including across a second coherent cache endpoint.
+            inspectAttributes = {};
+            auto *packet = mode == BaseMMU::Write ? Packet::createWrite(out)
+                                                  : Packet::createRead(out);
+            packet->allocate();
+            if (mode == BaseMMU::Write) {
+                packet->setLE<uint8_t>(0xa5);
+            }
+            auto &physical = tlb->getWalker()->pagingPort();
+            const auto accessed = [=, this](PacketPtr response,
+                                            bool cancelled) {
+                panic_if(cancelled || response->isError() ||
+                             (mode != BaseMMU::Write &&
+                              response->getLE<uint8_t>() != 0x90),
+                         "EPT memory-type case %u: wrong final data",
+                         scenario);
+                delete response;
+                auto req = std::make_shared<Request>(
+                    out->getPaddr(), 1, Request::PHYSICAL, out->requestorId());
+                req->memoryType(Type::WriteBack);
+                auto *readback = Packet::createRead(req);
+                readback->allocate();
+                const auto checked = [=, this](PacketPtr pkt, bool cancelled) {
+                    panic_if(cancelled || pkt->isError() ||
+                                 pkt->getLE<uint8_t>() !=
+                                     (mode == BaseMMU::Write ? 0xa5 : 0x90),
+                             "EPT memory-type case %u: incoherent readback",
+                             scenario);
+                    delete pkt;
+                    finishEpt();
+                };
+                auto *peer = &tlb->getWalker()->pagingPort();
+                if (system->threads.size() > 1) {
+                    auto *other =
+                        static_cast<MMU *>(system->threads[1]->getMMUPtr());
+                    peer = &other->getDataWalker()->pagingPort();
+                }
+                if (functional) {
+                    peer->sendFunctional(readback);
+                    checked(readback, false);
+                } else if (system->isTimingMode()) {
+                    peer->submit(readback, [] { return true; }, checked);
+                } else {
+                    peer->sendAtomic(readback);
+                    checked(readback, false);
+                }
+            };
+            if (functional) {
+                physical.sendFunctional(packet);
+                accessed(packet, false);
+            } else if (system->isTimingMode()) {
+                physical.submit(packet, [] { return true; }, accessed);
+            } else {
+                physical.sendAtomic(packet);
+                accessed(packet, false);
+            }
+        }
+    };
+    awaiting = true;
+    if (functional) {
+        verify(mmu->translateFunctional(req, tc, mode), req, tc, mode);
+    } else if (system->isTimingMode()) {
+        auto callback = std::make_unique<EptTranslation>(verify);
+        auto *raw = callback.get();
+        continuations.push_back(std::move(callback));
+        mmu->translateTiming(req, tc, raw, mode);
+        // Mutate live registers after admission; every stage must use the
+        // captured PAT/CD values, including the final EPT continuation.
+        tc->setMiscRegNoEffect(misc_reg::Pat, 0);
+        CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+        cr0.cd = !cd;
+        tc->setMiscRegNoEffect(misc_reg::Cr0, cr0);
+    } else {
+        verify(mmu->translateAtomic(req, tc, mode), req, tc, mode);
+    }
+}
+
+void
+PagingTester::eptUncachedSwap(unsigned size, bool conditional, bool match)
+{
+    constexpr Addr Address = HostData + 8;
+    constexpr uint64_t Old = 0x1020304050607080;
+    constexpr uint64_t New = 0xfedcba9876543210;
+    constexpr uint64_t Neighbor = 0x8877665544332211;
+    setup(Long);
+    system->physProxy.write<uint64_t>(Address + 8, Neighbor,
+                                      ByteOrder::little);
+    const auto requestor = system->getRequestorId(this);
+    auto &port = tlb->getWalker()->pagingPort();
+    auto *peer = &port;
+    if (system->threads.size() > 1) {
+        auto *other = static_cast<MMU *>(system->threads[1]->getMMUPtr());
+        peer = &other->getDataWalker()->pagingPort();
+    }
+    auto seed_req =
+        std::make_shared<Request>(Address, 8, Request::PHYSICAL, requestor);
+    seed_req->memoryType(Request::MemoryType::WriteBack);
+    auto *seed = Packet::createWrite(seed_req);
+    seed->allocate();
+    seed->setLE<uint64_t>(Old);
+    const auto seeded = [=, this](PacketPtr response, bool cancelled) {
+        panic_if(cancelled || response->isError(), "Swap seed failed");
+        delete response;
+        auto req = std::make_shared<Request>(
+            Address, size,
+            Request::PHYSICAL |
+                (conditional ? Request::MEM_SWAP_COND : Request::MEM_SWAP),
+            requestor);
+        paging::applyMemoryType(*req, paging::MemoryType::Uncacheable, true);
+        if (conditional) {
+            req->setExtraData((Old & mask(size * 8)) ^ !match);
+        }
+        auto *swap = new Packet(req, MemCmd::SwapReq);
+        swap->allocate();
+        swap->setUintX(New, ByteOrder::little);
+        const auto checked = [=, this](PacketPtr pkt, bool cancelled) {
+            const uint64_t expected =
+                !conditional || match
+                    ? (Old & ~mask(size * 8)) | (New & mask(size * 8))
+                    : Old;
+            panic_if(cancelled || pkt->isError() ||
+                         pkt->getUintX(ByteOrder::little) !=
+                             (Old & mask(size * 8)) ||
+                         system->physProxy.read<uint64_t>(
+                             Address, ByteOrder::little) != expected ||
+                         system->physProxy.read<uint64_t>(
+                             Address + 8, ByteOrder::little) != Neighbor,
+                     "UC swap returned wrong old data or corrupted its line");
+            delete pkt;
+            awaiting = false;
+            schedule(nextEvent, curTick() + 1);
+        };
+        auto &physical = tlb->getWalker()->pagingPort();
+        if (system->isTimingMode()) {
+            physical.submit(swap, [] { return true; }, checked);
+        } else {
+            physical.sendAtomic(swap);
+            checked(swap, false);
+        }
+    };
+    awaiting = true;
+    if (system->isTimingMode()) {
+        peer->submit(seed, [] { return true; }, seeded);
+    } else {
+        peer->sendAtomic(seed);
+        seeded(seed, false);
+    }
+}
+
+void
+PagingTester::eptUncachedPair(bool lockedPeer)
+{
+    constexpr Addr Address = HostData;
+    constexpr uint64_t Old = 0x1122334455667788;
+    constexpr uint64_t Other = 0xaabbccddeeff0011;
+    constexpr uint64_t Entry = 0x12345007;
+    setup(Long);
+    system->physProxy.write<uint64_t>(Address + 8, Other, ByteOrder::little);
+    system->physProxy.write<uint64_t>(Address + 64, Entry, ByteOrder::little);
+    auto *port = &tlb->getWalker()->pagingPort();
+    auto *other = static_cast<MMU *>(system->threads[1]->getMMUPtr());
+    auto *peer = &other->getDataWalker()->pagingPort();
+    const auto requestor = system->getRequestorId(this);
+    const auto packet = [=](Addr address, MemCmd cmd, Request::Flags flags) {
+        auto req = std::make_shared<Request>(
+            address, 8, flags | Request::PHYSICAL, requestor);
+        paging::applyMemoryType(*req,
+                                flags.isSet(Request::LOCKED_RMW) ||
+                                        flags.isSet(Request::ATOMIC_RETURN_OP)
+                                    ? paging::MemoryType::Uncacheable
+                                    : paging::MemoryType::WriteBack,
+                                true);
+        auto *pkt = new Packet(req, cmd);
+        pkt->allocate();
+        return pkt;
+    };
+    auto *seed = packet(Address, MemCmd::WriteReq, 0);
+    seed->setLE<uint64_t>(Old);
+    awaiting = true;
+    peer->submit(
+        seed, [] { return true; },
+        [=, this](PacketPtr pkt, bool cancel) {
+            panic_if(cancel || pkt->isError(), "Locked seed failed");
+            delete pkt;
+            port->submit(
+                packet(Address, MemCmd::LockedRMWReadReq, Request::LOCKED_RMW),
+                [] { return true; },
+                [=, this](PacketPtr pkt, bool cancel) {
+                    panic_if(cancel || pkt->isError() ||
+                                 pkt->getLE<uint64_t>() != Old,
+                             "Uncached locked read lost a dirty owner");
+                    delete pkt;
+                    system->physProxy.write<uint64_t>(Address + 8, ~Other,
+                                                      ByteOrder::little);
+                    auto completed =
+                        std::make_shared<std::array<unsigned, 2>>();
+                    const auto done = [=, this](unsigned endpoint,
+                                                PacketPtr pkt,
+                                                bool cancelled) {
+                        panic_if(cancelled || pkt->isError() ||
+                                     ++(*completed)[endpoint] != 1,
+                                 "Uncached locked pair did not retire exactly "
+                                 "once");
+                        delete pkt;
+                        if ((*completed)[0] && (*completed)[1]) {
+                            panic_if(
+                                system->physProxy.read<uint64_t>(
+                                    Address, ByteOrder::little) != Other ||
+                                    system->physProxy.read<uint64_t>(
+                                        Address + 8, ByteOrder::little) !=
+                                        ~Other,
+                                "Locked write lost a peer or adjacent bytes");
+                            awaiting = false;
+                            schedule(nextEvent, curTick() + 1);
+                        }
+                    };
+                    auto *contender =
+                        packet(Address,
+                               lockedPeer ? MemCmd::LockedRMWReadReq
+                                          : MemCmd::WriteReq,
+                               lockedPeer ? Request::Flags(Request::LOCKED_RMW)
+                                          : Request::Flags());
+                    contender->setLE<uint64_t>(Other);
+                    peer->submit(
+                        contender, [] { return true; },
+                        [=](PacketPtr pkt, bool cancelled) {
+                            if (!lockedPeer) {
+                                done(1, pkt, cancelled);
+                                return;
+                            }
+                            panic_if(cancelled || pkt->isError() ||
+                                         pkt->getLE<uint64_t>() != Old + 1,
+                                     "Competing locked read preceded unlock");
+                            delete pkt;
+                            auto *write =
+                                packet(Address, MemCmd::LockedRMWWriteReq,
+                                       Request::LOCKED_RMW);
+                            write->setLE<uint64_t>(Other);
+                            peer->submit(
+                                write, [] { return true; },
+                                [=](PacketPtr pkt, bool cancelled) {
+                                    done(1, pkt, cancelled);
+                                });
+                        });
+                    // A real A/D update on another HPA must still make
+                    // progress while the target line remains exclusively held
+                    // by the CPU.
+                    auto *update = packet(Address + 64, MemCmd::SwapReq,
+                                          Request::ATOMIC_RETURN_OP);
+                    update->req->setExtraData(Entry);
+                    update->req->setAtomicOpFunctor(
+                        std::make_unique<paging::ConditionalUpdate<uint64_t>>(
+                            Entry, 32));
+                    port->submit(
+                        update, [] { return true; },
+                        [=, this](PacketPtr pkt, bool cancelled) {
+                            panic_if(
+                                cancelled || pkt->isError() ||
+                                    pkt->getLE<uint64_t>() != Entry ||
+                                    (*completed)[1] ||
+                                    system->physProxy.read<uint64_t>(
+                                        Address, ByteOrder::little) != Old ||
+                                    system->physProxy.read<uint64_t>(
+                                        Address + 64, ByteOrder::little) !=
+                                        (Entry | 32),
+                                "Locked ownership blocked paging or admitted "
+                                "a peer");
+                            delete pkt;
+                            auto *write =
+                                packet(Address, MemCmd::LockedRMWWriteReq,
+                                       Request::LOCKED_RMW);
+                            write->setLE<uint64_t>(Old + 1);
+                            port->submit(
+                                write, [] { return true; },
+                                [=](PacketPtr pkt, bool cancelled) {
+                                    done(0, pkt, cancelled);
+                                });
+                        });
+                });
+        });
+}
+
+void
+PagingTester::eptAdCase(EptAdTest test, bool cacheDisabled)
 {
     setup(Long);
     constexpr uint64_t A = 1ULL << 8, D = 1ULL << 9;
@@ -228,7 +646,7 @@ PagingTester::eptAdCase(EptAdTest test)
         test == EptAdTest::FiveLevel ? EptAccess::Read : EptAccess::Write;
     const Addr gpa = 0x123456789abcULL |
         (levels == 5 ? 1ULL << 48 : 0);
-    // Fresh pages keep the UC case separate from WB aliases in the cache.
+    // Reuse the same real pages across memory types to cover cached aliases.
     const Addr root = 0x1800000 + unsigned(test) * 0x10000;
     std::array<uint8_t, 5 * 4096> zero{};
     system->physProxy.writeBlob(root, zero.data(), zero.size());
@@ -253,7 +671,7 @@ PagingTester::eptAdCase(EptAdTest test)
              test == EptAdTest::Misconfig ? 2 : 0));
     const auto config = *ept::decodeEptp(root | ((levels - 1) << 3) | 64 |
         (test == EptAdTest::Write ? 0 : 6), Caps, 48);
-    const ept::LookupInput input(gpa, access, config);
+    const ept::LookupInput input(gpa, access, config, false, cacheDisabled);
     auto &port = tlb->getWalker()->pagingPort();
     const auto requestor = system->getRequestorId(this);
     std::vector<uint64_t> before;
@@ -279,10 +697,15 @@ PagingTester::eptAdCase(EptAdTest test)
         const auto slot = std::find(descriptors.begin(), descriptors.end(),
                                     packet->getAddr());
         panic_if(pendingPackets || slot == descriptors.end() ||
-                 packet->getSize() != 8 ||
-                 packet->req->getPaddr() != packet->getAddr() ||
-                 !packet->req->getFlags().isSet(Request::PHYSICAL) ||
-                 packet->req->isUncacheable() != (config.memoryType == 0),
+                     packet->getSize() != 8 ||
+                     packet->req->getPaddr() != packet->getAddr() ||
+                     !packet->req->getFlags().isSet(Request::PHYSICAL) ||
+                     packet->req->isUncacheable() !=
+                         (cacheDisabled || config.memoryType == 0) ||
+                     packet->req->memoryType() !=
+                         (cacheDisabled || config.memoryType == 0
+                              ? Request::MemoryType::Uncacheable
+                              : Request::MemoryType::WriteBack),
                  "EPT A/D sent an incorrect physical request");
         const bool update = packet->req->isAtomicReturn();
         panic_if(packet->cmd != (update ? MemCmd::SwapReq : MemCmd::ReadReq),
@@ -293,6 +716,34 @@ PagingTester::eptAdCase(EptAdTest test)
         if (packet->getAddr() != descriptors.back() || progress->armed)
             return;
         progress->armed = true;
+        if (test == EptAdTest::Read && cacheDisabled &&
+            system->isTimingMode()) {
+            const auto slots = descriptors;
+            // Inspect real coherent state while an uncached conditional
+            // update is in flight, not just after its response. A and D
+            // may advance; descriptor addresses/rights/software bits may not.
+            for (Tick delay : {1, 20000, 40000, 60000, 80000, 120000}) {
+                schedule(new EventFunctionWrapper(
+                             [=, this] {
+                                 if (progress->callbacks) {
+                                     return;
+                                 }
+                                 for (unsigned i = 0; i < slots.size(); ++i) {
+                                     const auto value =
+                                         system->physProxy.read<uint64_t>(
+                                             slots[i], ByteOrder::little);
+                                     panic_if((value & ~(A | D)) !=
+                                                  (before[i] & ~(A | D)),
+                                              "Functional read at %#x "
+                                              "returned %#x; expected %#x "
+                                              "apart from A/D",
+                                              slots[i], value, before[i]);
+                                 }
+                             },
+                             name() + ".ept_ad_functional", true),
+                         curTick() + delay);
+            }
+        }
         if (test == EptAdTest::Replace || test == EptAdTest::Revoke) {
             // Change the root rights as well: resuming at the old leaf would
             // return stale permissions even if it noticed the new PFN.
@@ -415,8 +866,49 @@ PagingTester::eptAdCase(EptAdTest test)
         inspectAttributes = {};
         inspectResponse = {};
         squash = {};
-        awaiting = false;
-        schedule(nextEvent, curTick() + 1);
+        const auto done = [this] {
+            awaiting = false;
+            schedule(nextEvent, curTick() + 1);
+        };
+        if (test == EptAdTest::Read && cacheDisabled) {
+            // Reuse the authoritative descriptor to check a real masked
+            // uncached write. Disabled bytes include its address and rights.
+            const Addr address = descriptors.back();
+            const Addr neighbor = address ^ 8;
+            const auto expected =
+                descriptor(descriptors.size() - 1) & ~(0xffULL << 56);
+            const auto adjacent =
+                system->physProxy.read<uint64_t>(neighbor, ByteOrder::little);
+            auto req = std::make_shared<Request>(address, 8, Request::PHYSICAL,
+                                                 requestor);
+            paging::applyMemoryType(*req, paging::MemoryType::Uncacheable,
+                                    true);
+            std::vector<bool> enabled(8, false);
+            enabled.back() = true;
+            req->setByteEnable(enabled);
+            auto *pkt = new Packet(req, MemCmd::WriteReq);
+            pkt->allocate();
+            pkt->setLE<uint64_t>(0);
+            const auto check = [=, this](PacketPtr response, bool cancelled) {
+                panic_if(cancelled || response->isError() ||
+                             system->physProxy.read<uint64_t>(
+                                 address, ByteOrder::little) != expected ||
+                             system->physProxy.read<uint64_t>(
+                                 neighbor, ByteOrder::little) != adjacent,
+                         "Masked UC write changed disabled or adjacent bytes");
+                delete response;
+                done();
+            };
+            auto &physical = tlb->getWalker()->pagingPort();
+            if (system->isTimingMode()) {
+                physical.submit(pkt, [] { return true; }, check);
+            } else {
+                physical.sendAtomic(pkt);
+                check(pkt, false);
+            }
+        } else {
+            done();
+        }
     };
     observedAtomicLatency = 0;
     awaiting = true;
@@ -431,10 +923,15 @@ PagingTester::eptAdCase(EptAdTest test)
 }
 
 void
-PagingTester::eptAdGuest(bool denied, bool functional, bool writing, bool presetAD)
+PagingTester::eptAdGuest(bool denied, bool functional, bool writing,
+                         bool presetAD, bool cacheDisabled)
 {
-    if (!writing)
+    if (!writing) {
         setupEpt(presetAD, true);
+        CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+        cr0.cd = cacheDisabled;
+        tc->setMiscRegNoEffect(misc_reg::Cr0, cr0);
+    }
     // Preset guest A/D tests EPT write permission on an ordinary table read.
     // The additional cold write sets both guest and EPT A/D from clear bits.
     if (denied) {
@@ -452,6 +949,10 @@ PagingTester::eptAdGuest(bool denied, bool functional, bool writing, bool preset
     auto updates = std::make_shared<unsigned>(0);
     auto tableReads = std::make_shared<unsigned>(0);
     inspectAttributes = [=](PacketPtr pkt) {
+        panic_if(pkt->req->memoryType() !=
+                     (cacheDisabled ? Request::MemoryType::Uncacheable
+                                    : Request::MemoryType::WriteBack),
+                 "EPT A/D used the wrong captured table memory type");
         if (pkt->req->isAtomicReturn())
             ++*updates;
         else if (pkt->getAddr() >= HostTables &&
@@ -508,9 +1009,13 @@ PagingTester::eptAdGuest(bool denied, bool functional, bool writing, bool preset
                  "Warm guest write did not issue exactly one EPT dirty update");
         awaiting = false;
         if (!denied && !functional && !writing && presetAD) {
-            schedule(new EventFunctionWrapper([this] {
-                eptAdGuest(false, false, true);
-            }, name() + ".ept_ad_warm", true), curTick() + 1);
+            schedule(new EventFunctionWrapper(
+                         [=, this] {
+                             eptAdGuest(false, false, true, true,
+                                        cacheDisabled);
+                         },
+                         name() + ".ept_ad_warm", true),
+                     curTick() + 1);
         } else {
             finishEpt();
         }

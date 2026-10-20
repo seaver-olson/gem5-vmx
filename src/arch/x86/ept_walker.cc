@@ -80,12 +80,16 @@ struct WalkState
     nextPacket(RequestorID requestor) const
     {
         Request::Flags flags = Request::PHYSICAL;
-        flags.set(Request::UNCACHEABLE, input.config.memoryType == 0);
         if (update)
             flags.set(Request::ATOMIC_RETURN_OP);
         auto request = std::make_shared<Request>(
             update ? update->address : address, sizeof(uint64_t), flags,
             requestor);
+        paging::applyMemoryType(
+            *request,
+            input.cacheDisabled ? paging::MemoryType::Uncacheable
+                                : paging::memoryType(input.config.memoryType),
+            update.has_value());
         if (update) {
             request->setAtomicOpFunctor(
                 std::make_unique<paging::ConditionalUpdate<uint64_t>>(

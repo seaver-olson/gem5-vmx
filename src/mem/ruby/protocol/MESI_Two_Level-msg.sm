@@ -45,6 +45,9 @@ enumeration(CoherenceRequestType, desc="...") {
   FLUSH, desc="Flush request";
   FLUSH_NP, desc="Flush request (not present in L1 and L0)";
   FLUSH_DATA, desc="Get data for flush request";
+  UC_ATOMIC, desc="Nonallocating write or atomic update at the directory";
+  UC_LOCKED_READ, desc="Acquire a line for an uncached paired RMW";
+  UC_LOCKED_WRITE, desc="Write and release an uncached paired RMW";
 }
 
 // CoherenceResponseType
@@ -71,6 +74,8 @@ structure(RequestMsg, desc="...", interface="Message") {
   NetDest Destination,          desc="What components receive the request, includes MachineType and num";
   MessageSizeType MessageSize,  desc="size category of the message";
   DataBlock DataBlk,            desc="Data for the cache line (if PUTX)";
+  WriteMask AtomicMask,         desc="Byte mask and optional atomic operations";
+  bool AtomicUpdate, default="false", desc="Apply functor rather than byte mask";
   int Len;
   bool Dirty, default="false",  desc="Dirty bit";
   PrefetchBit Prefetch,         desc="Is this a prefetch request";

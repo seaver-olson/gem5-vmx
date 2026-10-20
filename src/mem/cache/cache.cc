@@ -327,7 +327,7 @@ Cache::handleTimingReqMiss(PacketPtr pkt, CacheBlk *blk, Tick forward_time,
 {
 
     // These should always hit due to the earlier Locked Read
-    assert(pkt->cmd != MemCmd::LockedRMWWriteReq);
+    assert(pkt->cmd != MemCmd::LockedRMWWriteReq || pkt->req->isUncacheable());
     if (pkt->req->isUncacheable()) {
         // ignore any existing MSHR if we are dealing with an
         // uncacheable request
@@ -1060,12 +1060,12 @@ Cache::handleSnoop(PacketPtr pkt, CacheBlk *blk, bool is_timing,
     bool invalidate = pkt->isInvalidate();
     [[maybe_unused]] bool needs_writable = pkt->needsWritable();
 
-    // at the moment we could get an uncacheable write which does not
-    // have the invalidate flag, and we need a suitable way of dealing
-    // with this case
-    panic_if(invalidate && pkt->req->isUncacheable(),
-             "%s got an invalidating uncacheable snoop request %s",
-             name(), pkt->print());
+    // The PoC can acquire exclusive, nonallocating ownership before an
+    // uncached RAM update. Ordinary uncached writes are not snoop atomics.
+    panic_if(invalidate && pkt->req->isUncacheable() &&
+                 pkt->cmd != MemCmd::ReadExReq,
+             "%s got an invalidating uncacheable snoop request %s", name(),
+             pkt->print());
 
     uint32_t snoop_delay = 0;
 
@@ -1285,16 +1285,16 @@ Cache::recvTimingSnoopReq(PacketPtr pkt)
 
     // Inform request(Prefetch, CleanEvict or Writeback) from below of
     // MSHR hit, set setBlockCached.
-    if (mshr && pkt->mustCheckAbove()) {
+    if (mshr && !mshr->isUncacheable() && pkt->mustCheckAbove()) {
         DPRINTF(Cache, "Setting block cached for %s from lower cache on "
                 "mshr hit\n", pkt->print());
         pkt->setBlockCached();
         return;
     }
 
-    // Let the MSHR itself track the snoop and decide whether we want
-    // to go ahead and do the regular cache snoop
-    if (mshr && mshr->handleSnoop(pkt, order++)) {
+    // An uncached MSHR will not install a line and cannot own snoop data.
+    // Let cacheable MSHRs track and defer snoops in the ordinary way.
+    if (mshr && !mshr->isUncacheable() && mshr->handleSnoop(pkt, order++)) {
         DPRINTF(Cache, "Deferring snoop on in-service MSHR to blk %#llx (%s)."
                 "mshrs: %s\n", blk_addr, is_secure ? "s" : "ns",
                 mshr->print());
@@ -1306,7 +1306,9 @@ Cache::recvTimingSnoopReq(PacketPtr pkt)
 
     //We also need to check the writeback buffers and handle those
     WriteQueueEntry *wb_entry = writeBuffer.findMatch(blk_addr, is_secure);
-    if (wb_entry) {
+    // An uncached write is an outstanding operation, not a cached copy to
+    // supply to its own downstream ownership snoop.
+    if (wb_entry && !wb_entry->isUncacheable()) {
         DPRINTF(Cache, "Snoop hit in writeback to addr %#llx (%s)\n",
                 pkt->getAddr(), is_secure ? "s" : "ns");
         // Expect to see only Writebacks and/or CleanEvicts here, both of

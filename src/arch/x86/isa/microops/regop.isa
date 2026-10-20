@@ -1738,6 +1738,34 @@ let {{
             MiscRegDest = SrcReg1;
         '''
 
+    class Chkwrmsr(RegOp):
+        operand_types = (FoldedSrc1Op, FoldedSrc2Op)
+
+        def getAllocator(self, microFlags):
+            # Minor must not issue the local MSR store before this check.
+            return super().getAllocator(microFlags + [
+                "IsNonSpeculative", "IsReadBarrier", "IsWriteBarrier"])
+
+        code = '''
+            if (uint32_t(SrcReg1) == 0x277) {
+                for (unsigned i = 0; i < 8; ++i) {
+                    if (!paging::validPatType(uint8_t(SrcReg2 >> (8 * i)))) {
+                        auto *tc = xc->tcBase();
+                        auto &vmx = static_cast<ISA *>(tc->getIsaPtr())
+                                        ->vmxState();
+                        HandyM5Reg m5reg = M5Reg;
+                        // A permitted WRMSR intercept precedes MSR-specific
+                        // data checks; a CPL violation still wins first.
+                        fault = m5reg.cpl == 0 &&
+                                    vmx.wrmsrCausesExit(tc, 0x277)
+                                    ? vmx.msrExitFault(false, 0x277)
+                                    : std::make_shared<GeneralProtection>(0);
+                        break;
+                    }
+                }
+            }
+        '''
+
     class Chks(RegOp):
         operand_types = (FoldedSrc1Op, FoldedSrc2Op, Imm8Op)
         def __init__(self, src1, src2, imm=0, flags=None,
