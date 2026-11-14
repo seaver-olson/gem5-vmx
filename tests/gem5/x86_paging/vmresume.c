@@ -55,12 +55,34 @@ controls(uint32_t reg, uint32_t wanted)
     return (wanted | (uint32_t)allowed) & (allowed >> 32);
 }
 
+#if defined(VMX_MIGRATE_TEST) || defined(VMX_MSR_TEST)
+uint8_t ap_stack[8192] __attribute__((aligned(16)));
+extern uint8_t ap_boot[], ap_boot_end[], ap_gdtr[], ap_root[];
+
+static void
+start_ap(uint64_t cr3, uint64_t gdt)
+{
+    check(ap_boot_end - ap_boot < 4096, 613);
+    volatile uint8_t *boot = (volatile uint8_t *)0x8000;
+    for (unsigned i = 0; i < (unsigned)(ap_boot_end - ap_boot); ++i) {
+        boot[i] = ap_boot[i];
+    }
+    *(volatile uint64_t *)(gdt + 40) = 0x00cf9b000000ffff;
+    *(volatile uint32_t *)(boot + (ap_gdtr - ap_boot) + 2) = gdt;
+    *(volatile uint32_t *)(boot + (ap_root - ap_boot)) = cr3;
+    __asm__ volatile("mfence" ::: "memory");
+    volatile uint32_t *apic = (volatile uint32_t *)0xfee00000;
+    apic[0x310 / 4] = 1u << 24;
+    apic[0x300 / 4] = 0xc500;
+    while (apic[0x300 / 4] & (1u << 12)) {}
+    apic[0x300 / 4] = 0x608;
+}
+#endif
+
 #ifdef VMX_MIGRATE_TEST
 static uint32_t ap_on[1024] __attribute__((aligned(4096)));
 static uint32_t bsp_vmcs[1024] __attribute__((aligned(4096)));
-uint8_t ap_stack[8192] __attribute__((aligned(16)));
 static volatile unsigned migration_done;
-extern uint8_t ap_boot[], ap_boot_end[], ap_gdtr[], ap_root[];
 
 static void
 migration_entry(unsigned runs, uint64_t eptp)
@@ -121,20 +143,7 @@ test_vmx_migrate(uint64_t cr3, uint64_t gdt)
     check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 612);
     field(0x681e, 0xfeedface);
 
-    check(ap_boot_end - ap_boot < 4096, 613);
-    volatile uint8_t *boot = (volatile uint8_t *)0x8000;
-    for (unsigned i = 0; i < (unsigned)(ap_boot_end - ap_boot); ++i) {
-        boot[i] = ap_boot[i];
-    }
-    *(volatile uint64_t *)(gdt + 40) = 0x00cf9b000000ffff;
-    *(volatile uint32_t *)(boot + (ap_gdtr - ap_boot) + 2) = gdt;
-    *(volatile uint32_t *)(boot + (ap_root - ap_boot)) = cr3;
-    __asm__ volatile("mfence" ::: "memory");
-    volatile uint32_t *apic = (volatile uint32_t *)0xfee00000;
-    apic[0x310 / 4] = 1u << 24;
-    apic[0x300 / 4] = 0xc500; // INIT, asserted, physical destination 1.
-    while (apic[0x300 / 4] & (1u << 12)) {}
-    apic[0x300 / 4] = 0x608; // SIPI vector 8 -> physical 0x8000.
+    start_ap(cr3, gdt);
     for (unsigned i = 0; !migration_done && i < 1000000; ++i) {
         __asm__ volatile("pause" ::: "memory");
     }
@@ -152,6 +161,334 @@ test_vmx_migrate(uint64_t cr3, uint64_t gdt)
         __asm__ volatile("pause" ::: "memory");
     }
     check(migration_done == 2, 618);
+}
+#endif
+
+#ifdef VMX_MSR_TEST
+struct MsrItem
+{
+    uint32_t index, reserved;
+    uint64_t value;
+};
+static volatile struct MsrItem entry_msrs[512] __attribute__((aligned(4096)));
+static volatile struct MsrItem store_msrs[512] __attribute__((aligned(4096)));
+static volatile struct MsrItem host_msrs[512] __attribute__((aligned(4096)));
+static uint64_t msr_ept[4][512] __attribute__((aligned(4096)));
+static volatile unsigned msr_abort_mode, msr_ap_ready, msr_host_returned;
+static volatile unsigned msr_timed_wakeup, msr_quiesce_stage;
+static volatile uint32_t msr_region_word;
+extern void msr_guest_fault(void);
+
+static void
+msr_write(uint32_t index, uint64_t value)
+{
+    __asm__ volatile("wrmsr" ::"c"(index), "a"((uint32_t)value),
+                     "d"((uint32_t)(value >> 32))
+                     : "memory");
+}
+
+static void
+msr_lists(unsigned entries, unsigned stores, unsigned loads)
+{
+    field(0x200a, (uint64_t)entry_msrs);
+    field(0x2006, (uint64_t)store_msrs);
+    field(0x2008, (uint64_t)host_msrs);
+    field(0x4014, entries);
+    field(0x400e, stores);
+    field(0x4010, loads);
+}
+
+static void
+msr_enter(unsigned resume, uint64_t reason)
+{
+    field(0x681e, (uint64_t)guest_entry);
+    check(enter_guest(resume) == 0, 700);
+    check(read_field(0x4402) == reason, 701);
+}
+
+void
+msr_abort_observer(void)
+{
+    msr_ap_ready = 1;
+    volatile uint32_t *apic = (volatile uint32_t *)0xfee00000;
+    if (msr_timed_wakeup) {
+        while (!msr_quiesce_stage) {
+            __asm__ volatile("pause" ::: "memory");
+        }
+        // Repeat until the BSP acknowledges its early wake. An IPI sent
+        // before it actually suspends must not leave it waiting for the
+        // original timer, which must remain pending across the checkpoint.
+        while (msr_quiesce_stage != 2) {
+            apic[0x310 / 4] = 0;
+            apic[0x300 / 4] = 0x4040;
+            while (apic[0x300 / 4] & (1u << 12)) {}
+        }
+    }
+    volatile uint32_t *indicator = &vmcs_region[1];
+    for (unsigned i = 0; !*indicator && i < 1000000; ++i) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+    const unsigned expected =
+        msr_abort_mode == 1 || msr_abort_mode == 4 ? 1 : 4;
+    check(*indicator == expected, 750);
+    if (msr_abort_mode == 3 || msr_abort_mode == 5) {
+        // A late entry failure must skip the exit-store area entirely.
+        check(store_msrs[0].value == 0xfeedface, 751);
+    } else {
+        check(store_msrs[0].value == 0x22, 752);
+    }
+    check(store_msrs[2].value == 0xfeedface, 753);
+    check(vmcs_region[0] == on_region[0] && vmcs_region[2] == msr_region_word,
+          754);
+    // None of these events may restart a VMX-aborted logical processor.
+    const uint32_t events[] = {0x4400, 0xc500, 0x608, 0x4200, 0x4040};
+    for (unsigned round = 0; round < 2; ++round) {
+        for (unsigned e = 0; e < sizeof(events) / sizeof(events[0]); ++e) {
+            apic[0x310 / 4] = 0;
+            apic[0x300 / 4] = events[e];
+            while (apic[0x300 / 4] & (1u << 12)) {}
+            for (unsigned i = 0; i < 1000; ++i) {
+                __asm__ volatile("pause" ::: "memory");
+            }
+            check(!msr_host_returned && *indicator == expected, 755);
+        }
+        check(guest_runs == (msr_abort_mode >= 3 ? 0 : 1), 756);
+        // The harness may checkpoint here; repeat the wakeup attempts after
+        // drain/resume or restore. CPU 0 must remain halted throughout.
+        __asm__ volatile(".byte 0x0f, 0x04; .word 0x21" ::"D"(0ull)
+                         : "memory");
+    }
+    for (;;) {
+        __asm__ volatile("hlt");
+    }
+}
+
+static void
+test_vmx_msrs(uint64_t cr3, uint64_t gdt, uint64_t pointer)
+{
+    uint64_t input = 0;
+    __asm__ volatile(".byte 0x0f, 0x04; .word 0x50" ::"D"((uint64_t)&input),
+                     "S"(8ull), "d"(0ull)
+                     : "rax", "memory");
+    __asm__ volatile("xor %%eax, %%eax; cpuid" ::
+                         : "rax", "rbx", "rcx", "rdx", "memory");
+    msr_abort_mode = input & 0xff;
+    msr_timed_wakeup = (input >> 8) & 1;
+    entry_msrs[0] = (struct MsrItem){0xc0000103, 0, 0x22};
+    store_msrs[0] = (struct MsrItem){0xc0000103, 0, 0xfeedface};
+    store_msrs[1] = (struct MsrItem){0xdead, 0, 0xfeedface};
+    store_msrs[2] = (struct MsrItem){0xc0000103, 0, 0xfeedface};
+    host_msrs[0] = (struct MsrItem){0x174, 0, 0x55};
+    host_msrs[1] = (struct MsrItem){0xdead, 0, 0};
+    if (msr_abort_mode) {
+        check(msr_abort_mode <= 5, 757);
+        msr_region_word = vmcs_region[2];
+        msr_lists(1, msr_abort_mode == 2 ? 1 : 3, 2);
+        if (msr_abort_mode == 3) {
+            entry_msrs[0].index = 0xdead;
+        }
+        if (msr_abort_mode == 5) {
+            field(0x6820, 0); // Invalid guest state, before entry-list loads.
+        }
+        if (msr_abort_mode == 4) {
+            field(0x681e, (uint64_t)msr_guest_fault);
+            field(0x4004, 1u << 6);
+        }
+        start_ap(cr3, gdt);
+        while (!msr_ap_ready) {
+            __asm__ volatile("pause" ::: "memory");
+        }
+        if (msr_timed_wakeup) {
+            // IF remains clear: a fixed IPI wakes quiescence without
+            // dispatching a handler. Keep its original 10 ms timer alive.
+            msr_quiesce_stage = 1;
+            __asm__ volatile(".byte 0x0f, 0x04; .word 0x02" ::"D"(10000000ull)
+                             : "memory");
+            msr_quiesce_stage = 2;
+        }
+        enter_guest(0);
+        msr_host_returned = 1;
+        check(0, 758); // An architectural abort cannot return here.
+    }
+
+    // All three zero counts ignore even unusable addresses.
+    msr_lists(0, 0, 0);
+    field(0x200a, ~0ull);
+    field(0x2006, ~0ull);
+    field(0x2008, ~0ull);
+    msr_enter(0, 18);
+
+    uint32_t a = 0x80000008, b, c, d;
+    __asm__ volatile("cpuid" : "+a"(a), "=b"(b), "=c"(c), "=d"(d));
+    const uint64_t beyond = 1ull << (a & 0xff);
+    const unsigned counts[] = {0x4014, 0x400e, 0x4010};
+    const unsigned addresses[] = {0x200a, 0x2006, 0x2008};
+    const uint64_t invalid[] = {1, beyond, beyond - 16, ~15ull};
+    for (unsigned area = 0; area < 3; ++area) {
+        for (unsigned bad = 0; bad < 4; ++bad) {
+            msr_lists(0, 0, 0);
+            msr_write(0xc0000103, 0xabcdef);
+            field(addresses[area], invalid[bad]);
+            field(counts[area], bad >= 2 ? 2 : 1);
+            check((enter_guest(1) & 0x41) == 0x40, 702);
+            check(read_field(0x4400) == 7, 703);
+            check(msr(0xc0000103) == 0xabcdef, 704);
+        }
+    }
+
+    // Duplicate MSRs prove list order. Stores observe guest values before
+    // host VMCS fields and host MSR-list loads can replace them.
+    entry_msrs[0] = (struct MsrItem){0xc0000103, 0, 0x11};
+    entry_msrs[1] = (struct MsrItem){0x174, 0, 0x22};
+    entry_msrs[2] = (struct MsrItem){0xc0000103, 0, 0x33};
+    store_msrs[0] = (struct MsrItem){0xc0000103, 0, 0xfeedface};
+    store_msrs[1] = (struct MsrItem){0x174, 0, 0xfeedface};
+    host_msrs[0] = (struct MsrItem){0xc0000103, 0, 0x44};
+    host_msrs[1] = (struct MsrItem){0x174, 0, 0x55};
+    host_msrs[2] = (struct MsrItem){0xc0000103, 0, 0x66};
+    msr_lists(3, 2, 3);
+    for (unsigned i = 0; i < 2; ++i) {
+        msr_enter(1, 18);
+        check(store_msrs[0].value == 0x33 && store_msrs[1].value == 0x22, 705);
+        check(store_msrs[0].index == 0xc0000103 &&
+                  store_msrs[1].index == 0x174 && !store_msrs[0].reserved &&
+                  !store_msrs[1].reserved,
+              706);
+        check(msr(0xc0000103) == 0x66 && msr(0x174) == 0x55, 707);
+    }
+
+    // A fault-triggered exit uses the same store/load lists as VMCALL.
+    field(0x4004, 1u << 6);
+    field(0x681e, (uint64_t)msr_guest_fault);
+    check(enter_guest(1) == 0 && read_field(0x4402) == 0, 708);
+    check(store_msrs[0].value == 0x33 && msr(0xc0000103) == 0x66, 709);
+    field(0x4004, 0);
+
+    // FS/GS bases may be stored even though VMX forbids loading them here.
+    field(0x680e, 0x12340000);
+    field(0x6810, 0x22340000);
+    store_msrs[0] = (struct MsrItem){0xc0000100, 0, 0};
+    store_msrs[1] = (struct MsrItem){0xc0000101, 0, 0};
+    store_msrs[2] = (struct MsrItem){0x480, 0, 0};
+    msr_lists(0, 3, 0);
+    msr_enter(1, 18);
+    check(store_msrs[0].value == 0x12340000 &&
+              store_msrs[1].value == 0x22340000 &&
+              store_msrs[2].value == msr(0x480),
+          724);
+    store_msrs[0].index = 0xc0000103;
+    msr_lists(3, 1, 3);
+
+    // Item 2 fails after item 1, without running item 3 or guest injection.
+    // A late entry failure recovers host MSRs, skips stores and guest saves,
+    // and leaves a clear VMCS's launch state clear.
+    const struct MsrItem bad_items[] = {
+        {0xdead, 0, 0},
+        {0x174, 1, 0},
+        {0xc0000100, 0, 0},
+        {0xc0000101, 0, 0},
+        {0x800, 0, 0},
+        {0x8ff, 0, 0},
+        {0x480, 0, 0},
+        {0x3a, 0, 0},
+        {0x9b, 0, 0},
+        {0xc0000080, 0, 1ull << 63},
+        {0xc0000080, 0, msr(0xc0000080) ^ (1u << 8)},
+        {0x277, 0, 2},
+        {0xc0000103, 0, 1ull << 32},
+        {0xc0000102, 0, 1ull << 48},
+        {0x2ff, 0, 2},
+        {0x200, 0, 2},
+        {0x201, 0, 1},
+        {0x250, 0, 2},
+        {0x1d9, 0, 1ull << 63},
+    };
+    for (unsigned bad = 0; bad < sizeof(bad_items) / sizeof(bad_items[0]);
+         ++bad) {
+        check(!(op_vmclear((uint64_t)&pointer, 0, 0) & 0x41), 710);
+        check(!(op_vmptrld((uint64_t)&pointer, 0, 0) & 0x41), 711);
+        entry_msrs[0] = (struct MsrItem){0xc0000102, 0, 0x11110000};
+        entry_msrs[1] = bad_items[bad];
+        entry_msrs[2] = (struct MsrItem){0xc0000102, 0, 0x22220000};
+        store_msrs[0].value = 0xfeedface;
+        field(0x482a, 0x1234);
+        field(0x4016, 0x80000306);
+        msr_enter(0, 0x80000022);
+        check(read_field(0x6400) == 2, 712);
+        check(msr(0xc0000102) == 0x11110000, 713);
+        check(msr(0xc0000103) == 0x66 && store_msrs[0].value == 0xfeedface,
+              714);
+        check(read_field(0x482a) == 0x1234 && read_field(0x4016) == 0x80000306,
+              715);
+        check((op_vmresume(0, 0, 0) & 0x41) == 0x40 && read_field(0x4400) == 5,
+              716);
+    }
+    field(0x4016, 0);
+
+    // Invalid guest state must perform the same host recovery.
+    field(0x6820, 0);
+    msr_write(0xc0000102, 0x33330000);
+    msr_enter(0, 0x80000021);
+    check(msr(0xc0000102) == 0x33330000 && msr(0xc0000103) == 0x66 &&
+              store_msrs[0].value == 0xfeedface,
+          717);
+    field(0x6820, 2);
+
+    // Capacity field zero recommends 512, not zero entries.
+    check(((msr(0x485) >> 25) & 7) == 0, 718);
+    for (unsigned i = 0; i < 512; ++i) {
+        entry_msrs[i] = (struct MsrItem){0xc0000103, 0, 0x1000 + i};
+        store_msrs[i] = (struct MsrItem){0xc0000103, 0, 0xfeedface};
+        host_msrs[i] = (struct MsrItem){0xc0000103, 0, 0x2000 + i};
+    }
+    msr_lists(512, 512, 512);
+    msr_enter(0, 18);
+    for (unsigned i = 0; i < 512; ++i) {
+        check(store_msrs[i].value == 0x11ff &&
+                  store_msrs[i].index == 0xc0000103 && !store_msrs[i].reserved,
+              719);
+    }
+    check(msr(0xc0000103) == 0x21ff, 720);
+
+    // Failed VMRESUME must preserve the already-launched state too.
+    entry_msrs[0].index = 0xdead;
+    msr_lists(1, 0, 0);
+    msr_enter(1, 0x80000022);
+    check(read_field(0x6400) == 1, 725);
+    entry_msrs[0].index = 0xc0000103;
+    msr_enter(1, 18);
+
+    // EFER.LMA writes are ignored. TSC uses ordinary MSR side effects.
+    const uint64_t efer = msr(0xc0000080);
+    entry_msrs[0] = (struct MsrItem){0xc0000080, 0, efer ^ (1u << 10)};
+    entry_msrs[1] = (struct MsrItem){0x10, 0, 1000000};
+    store_msrs[0] = (struct MsrItem){0xc0000080, 0, 0};
+    store_msrs[1] = (struct MsrItem){0x10, 0, 0};
+    host_msrs[0] = (struct MsrItem){0x10, 0, 2000000};
+    msr_lists(2, 2, 1);
+    msr_enter(1, 18);
+    check(store_msrs[0].value == efer, 721);
+    check(store_msrs[1].value >= 1000000 && store_msrs[1].value < 2000000 &&
+              msr(0x10) >= 2000000,
+          722);
+
+    // List pointers are HPAs even while EPT denies access to those GPAs.
+    msr_ept[0][0] = (uint64_t)msr_ept[1] | 7;
+    msr_ept[1][0] = (uint64_t)msr_ept[2] | 7;
+    msr_ept[2][0] = (uint64_t)msr_ept[3] | 7;
+    for (unsigned i = 0; i < 512; ++i) {
+        msr_ept[3][i] = (uint64_t)i * 4096 | 0x37;
+    }
+    msr_ept[3][(uint64_t)entry_msrs / 4096] = 0;
+    msr_ept[3][(uint64_t)store_msrs / 4096] = 0;
+    msr_ept[3][(uint64_t)host_msrs / 4096] = 0;
+    field(0x201a, (uint64_t)msr_ept | 0x1e);
+    field(0x401e, 2);
+    field(0x4002, controls(0x48e, 1u << 31));
+    msr_enter(1, 18);
+    check(store_msrs[0].value == efer, 723);
+    field(0x4002, controls(0x48e, 0));
+    msr_lists(0, 0, 0);
 }
 #endif
 
@@ -942,6 +1279,8 @@ paging_test(void)
     test_vmx_address(cr3);
 #elif defined(VMX_MIGRATE_TEST)
     test_vmx_migrate(cr3, gdtr.base);
+#elif defined(VMX_MSR_TEST)
+    test_vmx_msrs(cr3, gdtr.base, pointer);
 #else
     /* Launch once, then resume twice. Check saved RIP, exit reason and a
      * memory side effect so duplicated or skipped guest execution fails. */

@@ -36,7 +36,7 @@ guest_exit:
     vmcall
     ud2
 
-#ifdef VMX_MIGRATE_TEST
+#if defined(VMX_MIGRATE_TEST) || defined(VMX_MSR_TEST)
 // A real INIT/SIPI starts CPU 1 here, not at a copied ThreadContext.
 // The BSP copies this position-independent bootstrap to physical 0x8000.
 .code16
@@ -74,7 +74,11 @@ ap_protected:
 .code64
 ap_long:
     movabs $(ap_stack + 8192), %rsp
+#ifdef VMX_MSR_TEST
+    movabs $msr_abort_observer, %rax
+#else
     movabs $migration_ap, %rax
+#endif
     call *%rax
 1:  hlt
     jmp 1b
@@ -85,6 +89,13 @@ ap_gdtr:
 ap_root:
     .long 0
 ap_boot_end:
+#endif
+
+#ifdef VMX_MSR_TEST
+.global msr_guest_fault
+msr_guest_fault:
+    ud2
+
 #endif
 
 // Normalize the exception frame, record the injected payload, then exit.

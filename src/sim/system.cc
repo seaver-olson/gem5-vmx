@@ -76,6 +76,12 @@ std::vector<System *> System::systemList;
 void
 System::Threads::Thread::resume()
 {
+    // An interrupt may have ended timed quiescence early. The original
+    // timer must not resurrect a thread which has since halted.
+    if (context->status() != ThreadContext::Suspended) {
+        return;
+    }
+
     DPRINTFS(Quiesce, context->getCpuPtr(), "activating\n");
     context->activate();
 }

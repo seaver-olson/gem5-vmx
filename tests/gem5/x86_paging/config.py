@@ -57,6 +57,7 @@ parser.add_argument(
         "vmx_transition",
         "vmx_nmi",
         "vmx_address",
+        "vmx_msrs",
         "paging",
         "legacy",
         "pae",

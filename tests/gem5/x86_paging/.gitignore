@@ -6,6 +6,7 @@
 /vmx_nmi.elf
 /vmx_address.elf
 /vmx_migrate.elf
+/vmx_msrs.elf
 /legacy.elf
 /pae.elf
 /gdb.elf

@@ -31,6 +31,7 @@ parser.add_argument(
         "ept_entry",
         "vmx_nmi",
         "vmx_migrate",
+        "vmx_msrs",
     ],
     default="paging",
 )
@@ -48,7 +49,17 @@ parser.add_argument(
 parser.add_argument("--ept-only", action="store_true")
 parser.add_argument("--restore", type=Path)
 parser.add_argument("--vmx-root-checkpoint", action="store_true")
+parser.add_argument(
+    "--msr-abort",
+    choices=["store", "load", "entry", "fault-store", "guest-state"],
+    help="Use a second CPU to check the MSR-list VMX-abort state",
+)
+parser.add_argument("--msr-abort-checkpoint", action="store_true")
 args = parser.parse_args()
+if args.msr_abort and args.guest != "vmx_msrs":
+    parser.error("--msr-abort requires --guest vmx_msrs")
+if args.msr_abort_checkpoint and not args.msr_abort:
+    parser.error("--msr-abort-checkpoint requires --msr-abort")
 if args.vmx_root_checkpoint and args.guest != "vmx_migrate":
     parser.error("--vmx-root-checkpoint requires --guest vmx_migrate")
 args.fixture |= args.transport
@@ -98,7 +109,11 @@ board = X86Board(
         }[args.cpu],
         isa=ISA.X86,
         num_cores=(
-            2 if args.fixture_peers or args.guest == "vmx_migrate" else 1
+            2
+            if args.fixture_peers
+            or args.guest == "vmx_migrate"
+            or args.msr_abort
+            else 1
         ),
     ),
     memory=SingleChannelDDR3_1600(size="64MiB"),
@@ -113,7 +128,20 @@ board.workload = X86FsWorkload(
     load_addr_mask=0xFFFFFFFFFFFFFFFF,
 )
 input_file = Path(m5.options.outdir) / "functional-input.bin"
-input_file.write_bytes(bytes.fromhex("0011223344556677"))
+if args.guest == "vmx_msrs":
+    mode = (
+        ["store", "load", "entry", "fault-store", "guest-state"].index(
+            args.msr_abort
+        )
+        + 1
+        if args.msr_abort
+        else 0
+    )
+    # Checkpoint cases leave a timed-quiesce wakeup pending before aborting.
+    mode |= int(args.msr_abort_checkpoint) << 8
+    input_file.write_bytes(mode.to_bytes(8, "little"))
+else:
+    input_file.write_bytes(bytes.fromhex("0011223344556677"))
 board.readfile = str(input_file)
 root = board._pre_instantiate()
 if not args.classic:
@@ -135,7 +163,84 @@ if args.fixture:
         board.paging_tester.cpu_side, board.paging_tester.mem_side
     )
 m5.instantiate(str(args.restore) if args.restore else None)
+if args.msr_abort:
+    cpu = board.get_processor().get_cores()[0].get_simobject()
+    stopped_insts = cpu.totalInsts()
+    wake_deadline = None
+
+    def abort_error(phase, message):
+        raise RuntimeError(
+            f"VMX abort ({args.cpu}, {args.msr_abort}, {phase}): {message}"
+        )
+
+    def abort_event(event, phase, cause="m5_exit instruction encountered"):
+        if event.getCause() != cause or event.getCode() != 0:
+            abort_error(
+                phase,
+                f"expected {cause!r} code=0; got {event.getCause()!r} "
+                f"code={event.getCode()}",
+            )
+
+    def abort_stopped(phase):
+        actual = cpu.totalInsts()
+        if actual != stopped_insts:
+            abort_error(
+                phase,
+                f"expected {stopped_insts} retired instructions; got "
+                f"{actual} (delta={actual - stopped_insts})",
+            )
+
+    def abort_checkpoint(path):
+        state = configparser.ConfigParser(interpolation=None)
+        state.read(path / "m5.cpt")
+        if not state.getboolean(str(cpu.isa[0]) + ".vmx", "vmxAborted"):
+            abort_error("checkpoint", "expected vmxAborted=true")
+        status = state.getint(str(cpu) + ".xc.0", "_status")
+        if status != 3:
+            abort_error("checkpoint", f"expected Halted (3); got {status}")
+        deadline = state.getint("board", "quiesceEndTick_0")
+        if deadline <= m5.curTick():
+            abort_error(
+                "checkpoint",
+                f"expected pending wakeup after tick {m5.curTick()}; "
+                f"got deadline {deadline}",
+            )
+        return deadline
+
+    if args.restore:
+        wake_deadline = abort_checkpoint(args.restore)
+
 event = m5.simulate(10_000_000_000)
+if args.msr_abort:
+    abort_event(event, "observer marker")
+    if not args.restore:
+        # Capture before drain: retiring work while checkpointing is a bug.
+        stopped_insts = cpu.totalInsts()
+        if args.msr_abort_checkpoint:
+            checkpoint = Path(m5.options.outdir) / "checkpoint"
+            m5.checkpoint(str(checkpoint))
+            wake_deadline = abort_checkpoint(checkpoint)
+        else:
+            m5.drain()
+        abort_stopped("first drain")
+        event = m5.simulate(10_000_000_000)
+        abort_event(event, "second observer marker")
+    # CPU 1 repeated forbidden wakeups after drain/resume or restoration.
+    abort_stopped("second observer round")
+    m5.drain()
+    abort_stopped("second drain")
+    if wake_deadline is not None:
+        if wake_deadline <= m5.curTick():
+            abort_error("timer", "wakeup expired before timer check")
+        # Allow 1 us after the callback for an incorrectly activated CPU to
+        # execute; ending one tick after the deadline can hide a wakeup.
+        event = m5.simulate(wake_deadline - m5.curTick() + 1_000_000)
+        abort_event(event, "timer", "simulate() limit reached")
+        abort_stopped("expired timer")
+        m5.drain()
+        abort_stopped("drain after timer")
+    print("PAGING RESULT: VMX-abort shutdown verified")
+    raise SystemExit(0)
 if args.guest == "vmx_migrate" and not args.restore:
     if event.getCause() != "m5_exit instruction encountered":
         raise RuntimeError(

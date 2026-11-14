@@ -14,6 +14,7 @@
 #include "arch/x86/page_size.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/regs/msr.hh"
 #include "arch/x86/utility.hh"
 #include "arch/x86/vmcs_store.hh"
 #include "arch/x86/vmx_utils.hh"
@@ -114,10 +115,14 @@ constexpr VmcsField VmcsHostCr4 = VmcsField::HostCr4;
 constexpr VmcsField VmcsHostIa32Efer = VmcsField::HostIa32Efer;
 constexpr VmcsField VmcsVmEntryControls = VmcsField::VmEntryControls;
 constexpr VmcsField VmcsVmEntryIntrInfoField = VmcsField::VmEntryIntrInfoField;
-constexpr VmcsField VmcsVmEntryMsrLoadCount = VmcsField::VmEntryMsrLoadCount;
 constexpr VmcsField VmcsVmExitControls = VmcsField::VmExitControls;
-constexpr VmcsField VmcsVmExitMsrStoreCount = VmcsField::VmExitMsrStoreCount;
-constexpr VmcsField VmcsVmExitMsrLoadCount = VmcsField::VmExitMsrLoadCount;
+// In MsrArea order: entry load, exit store, exit load.
+constexpr std::array MsrAreas{
+    std::pair{VmcsField::VmEntryMsrLoadCount,
+              VmcsField::VmEntryMsrLoadAddress},
+    std::pair{VmcsField::VmExitMsrStoreCount,
+              VmcsField::VmExitMsrStoreAddress},
+    std::pair{VmcsField::VmExitMsrLoadCount, VmcsField::VmExitMsrLoadAddress}};
 constexpr VmcsField VmcsSecondaryVmExecControl =
     VmcsField::SecondaryVmExecControl;
 constexpr VmcsField VmcsCr3TargetCount = VmcsField::Cr3TargetCount;
@@ -644,6 +649,15 @@ VmxExitFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
     }
 }
 
+void
+VmxAbortFault::invoke(ThreadContext *tc, const StaticInstPtr &inst)
+{
+    // A local shutdown, not a normal VM exit or a simulator-wide failure.
+    // Interrupts cannot wake this state. Full CPU/APIC RESET recovery is
+    // not implemented; INIT must not substitute for it.
+    tc->halt();
+}
+
 VmxState::VmEntryValidationResult
 VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
 {
@@ -720,18 +734,23 @@ VmxState::validateVmEntry(ThreadContext *tc, Vmcs &vmcs) const
     }
 
     const uint64_t cr3TargetCount = readOrZero(vmcs, VmcsCr3TargetCount);
-    if (cr3TargetCount != 0 ||
-            readOrZero(vmcs, VmcsVmExitMsrStoreCount) != 0 ||
-            readOrZero(vmcs, VmcsVmExitMsrLoadCount) != 0) {
+    if (cr3TargetCount != 0) {
         return failInstruction(
                 VmxInstructionError::VmEntryInvalidControlFields);
     }
-    // Unlike the counts above, an unsupported nonzero VM-entry MSR-load
-    // count is deliberately not rejected here: SDM Vol. 3C 26.4 places MSR
-    // loading after guest-state loading and before event injection, so on
-    // real hardware this is a late failure, not an invalid-control-field
-    // VM fail. vmEntry() checks it at the correct point and fails with the
-    // dedicated VmEntryMsrLoad exit reason instead.
+    // SDM rev. 093, 29.2.1.2-3. Validate all three complete physical ranges
+    // before loading guest state, even if entry later fails for another
+    // reason. Counts of zero ignore their corresponding addresses.
+    const unsigned list_bits =
+        bits(isa->readMiscRegNoEffect(misc_reg::VmxBasic), 48) ? 32
+                                                               : physical_bits;
+    for (const auto &[count, address] : MsrAreas) {
+        if (!vmx::validMsrArea(readOrZero(vmcs, address),
+                               readOrZero(vmcs, count), list_bits)) {
+            return failInstruction(
+                VmxInstructionError::VmEntryInvalidControlFields);
+        }
+    }
 
     {
         // SDM Vol. 3C 26.2.1.3: validate the VM-entry event-injection
@@ -1290,6 +1309,60 @@ VmxState::loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const
     return true;
 }
 
+uint32_t
+VmxState::transferMsrs(ThreadContext *tc, Vmcs &vmcs, MsrArea area) const
+{
+    const bool store = area == MsrArea::ExitStore;
+    const auto &[count_field, address_field] =
+        MsrAreas[static_cast<unsigned>(area)];
+    const uint32_t count = readOrZero(vmcs, count_field);
+    const Addr base = readOrZero(vmcs, address_field);
+    // These are implicit host-physical VMX state accesses, never guest
+    // linear accesses or EPT lookups. Like the existing VMX state helpers,
+    // use the CPU's coherent functional port at the serialized transition.
+    // This implements architectural semantics, not MSR-list memory timing.
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    for (uint64_t i = 0; i < count; ++i) {
+        const Addr address = base + i * 16;
+        uint64_t header;
+        proxy.readBlob(address, &header, sizeof(header));
+        header = letoh(header);
+        const uint32_t index = header;
+        if (!vmx::validMsrItemHeader(header, store)) {
+            return i + 1;
+        }
+        uint64_t value;
+        if (store) {
+            if (!readMsr(tc, index, value)) {
+                return i + 1;
+            }
+            value = htole(value);
+            // Preserve the index/reserved header and every other entry.
+            proxy.writeBlob(address + 8, &value, sizeof(value));
+        } else {
+            proxy.readBlob(address + 8, &value, sizeof(value));
+            if (!writeMsr(tc, index, letoh(value))) {
+                return i + 1;
+            }
+        }
+    }
+    return 0;
+}
+
+Fault
+VmxState::abort(ThreadContext *tc, uint32_t indicator)
+{
+    // SDM 30.7: only the indicator at offset 4 is written to the opaque
+    // VMCS region. Other processors must remain able to diagnose it.
+    PortProxy proxy(tc, tc->getSystemPtr()->cacheLineSize());
+    const uint32_t encoded = htole(indicator);
+    proxy.writeBlob(currentVmcsPtr + 4, &encoded, sizeof(encoded));
+    vmxAborted = true;
+    activeEptConfig.reset();
+    DPRINTF(VMX, "VMX abort %u on VMCS %#x\n", indicator, currentVmcsPtr);
+    return std::make_shared<VmxAbortFault>();
+}
+
 VmxResult
 VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
         VmxExitReason reason, uint64_t qualification)
@@ -1303,7 +1376,7 @@ VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
     // retain their previous values; clearing them here loses architecturally
     // visible diagnostic state. For a VM-entry failure due to MSR loading,
     // the qualification instead reports the 1-based index of the
-    // VM-entry MSR-load-area entry that caused the failure (SDM 26.4).
+    // VM-entry MSR-load-area entry that caused the failure (SDM 29.8).
 
     Addr hostRip = 0;
     panic_if(!loadHostState(tc, vmcs, hostRip),
@@ -1311,6 +1384,11 @@ VmxState::failVmEntry(ThreadContext *tc, Vmcs &vmcs,
 
     inVmxNonRoot = false;
     activeEptConfig.reset();
+    // SDM 29.8: recover host MSRs even after invalid guest state or failed
+    // entry MSR loading. Do not save guest MSRs on this path.
+    if (transferMsrs(tc, vmcs, MsrArea::ExitLoad)) {
+        return VmxResult::propagateFault(abort(tc, 4));
+    }
     DPRINTF(VMX, "VM-entry failed after entry began: reason %u "
             "encoded %#x host RIP %#x VMCS %#x\n",
             toInt(reason), encodedReason, hostRip, currentVmcsPtr);
@@ -1392,13 +1470,10 @@ VmxState::vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize)
     }
     static_cast<ISA *>(tc->getIsaPtr())->endEventDelivery();
 
-    // SDM Vol. 3C 26.4: VM-entry MSR loading happens after guest-state
-    // loading and before event injection. MSR-load-area processing itself
-    // is not implemented, so a nonzero count fails entry here, as a late
-    // failure reporting the first MSR-load-area entry (SDM 26.7), rather
-    // than proceeding to inject the requested event.
-    if (readOrZero(*vmcs, VmcsVmEntryMsrLoadCount) != 0) {
-        return failVmEntry(tc, *vmcs, VmxExitReason::VmEntryMsrLoad, 1);
+    // SDM 29.4/29.8: completed items remain loaded; a failing item reports
+    // its one-based index. Launch state and event injection come later.
+    if (const auto failed = transferMsrs(tc, *vmcs, MsrArea::EntryLoad)) {
+        return failVmEntry(tc, *vmcs, VmxExitReason::VmEntryMsrLoad, failed);
     }
 
     // Entry-time configuration must already be stable if the injected event
@@ -1575,6 +1650,11 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
     isa->endEventDelivery();
     guestIret.reset();
 
+    // Save guest MSRs before any host register/MSR state is installed.
+    if (transferMsrs(tc, *vmcs, MsrArea::ExitStore)) {
+        abort(tc, 1);
+        return true;
+    }
     Addr hostRipValue = 0;
     if (!loadHostState(tc, *vmcs, hostRipValue)) {
         return false;
@@ -1582,6 +1662,10 @@ VmxState::vmexit(ThreadContext *tc, const VmxExitInfo &exitInfo,
 
     inVmxNonRoot = false;
     activeEptConfig.reset();
+    if (transferMsrs(tc, *vmcs, MsrArea::ExitLoad)) {
+        abort(tc, 4);
+        return true;
+    }
 
     if (hostRip) {
         *hostRip = hostRipValue;
@@ -1599,7 +1683,11 @@ VmxState::vmexitEvent(ThreadContext *tc, const VmxExitInfo &exitInfo)
         return false;
     }
 
-    redirectNow(tc, hostRip);
+    if (vmxAborted) {
+        VmxAbortFault().invoke(tc);
+    } else {
+        redirectNow(tc, hostRip);
+    }
     return true;
 }
 
@@ -1624,6 +1712,10 @@ VmxState::vmexitInstruction(ExecContext *xc, VmxExitReason reason,
     Addr hostRip = 0;
     panic_if(!vmexit(xc->tcBase(), exitInfo, &hostRip),
             "Instruction-triggered VM exit could not load host state");
+
+    if (vmxAborted) {
+        return VmxResult::propagateFault(std::make_shared<VmxAbortFault>());
+    }
 
     redirectNextPc(xc->tcBase(), hostRip);
     return VmxResult::successRedirect(hostRip);
@@ -2333,6 +2425,7 @@ VmxState::reset()
     if (owner && logicalProcessor != InvalidContextID) {
         owner->getX86VmcsStore().release(logicalProcessor);
     }
+    // Also clears vmxAborted through its false default member initializer.
     *this = VmxState{};
     attach(owner);
 }
@@ -2343,6 +2436,7 @@ VmxState::serialize(CheckpointOut &cp) const
     panic_if(activeEptConfig,
              "Checkpointing an active EPT guest is not implemented");
     SERIALIZE_SCALAR(vmxActive);
+    SERIALIZE_SCALAR(vmxAborted);
     SERIALIZE_SCALAR(inVmxNonRoot);
     SERIALIZE_SCALAR(vmxonRegion);
     SERIALIZE_SCALAR(currentVmcsPtr);
@@ -2362,6 +2456,7 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits,
                       ContextID processor)
 {
     logicalProcessor = processor;
+    vmxAborted = false;
     activeEptConfig.reset();
     guestIret.reset();
     // If VMX is inactive, ignore any stale serialized VMX state.
@@ -2374,6 +2469,7 @@ VmxState::unserialize(CheckpointIn &cp, unsigned physical_bits,
     }
 
     size_t numVmcsRegions = 0;
+    UNSERIALIZE_OPT_SCALAR(vmxAborted);
     if (!UNSERIALIZE_OPT_SCALAR(inVmxNonRoot)) {
         inVmxNonRoot = false;
     }

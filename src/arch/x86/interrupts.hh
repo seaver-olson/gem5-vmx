@@ -211,6 +211,7 @@ class Interrupts : public BaseInterrupts
     using Params = X86LocalApicParams;
 
     void setThreadContext(ThreadContext *_tc) override;
+    bool isWakeUp() const override;
 
     /*
      * Initialize this object by registering it with the IO APIC.

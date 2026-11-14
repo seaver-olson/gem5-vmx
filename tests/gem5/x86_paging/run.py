@@ -24,13 +24,24 @@ def main():
         help="Run expanded transport fixtures separately from baseline",
     )
     parser.add_argument("--vmx-operands-only", action="store_true")
+    parser.add_argument("--vmx-msrs-only", action="store_true")
     parser.add_argument(
         "--ept-only",
         action="store_true",
         help="Run EPT fixtures and guest entry/exit tests",
     )
     args = parser.parse_args()
-    if sum((args.transport_only, args.vmx_operands_only, args.ept_only)) > 1:
+    if (
+        sum(
+            (
+                args.transport_only,
+                args.vmx_operands_only,
+                args.ept_only,
+                args.vmx_msrs_only,
+            )
+        )
+        > 1
+    ):
         parser.error("Select only one focused suite")
     suite = Path(__file__).resolve().parent
     subprocess.run(["make", "-C", str(suite)], check=True)
@@ -226,6 +237,76 @@ def main():
                         f"vmx-operands-{cpu}-ruby",
                         "ruby.py",
                         ["--cpu", cpu, "--guest", "vmx_operands"],
+                    )
+                )
+    if args.vmx_msrs_only:
+        cases = []
+        for cpu in ("atomic", "timing", "minor", "o3"):
+            cases.append(
+                (
+                    f"vmx-msrs-{cpu}",
+                    "config.py",
+                    ["--cpu", cpu, "--guest", "vmx_msrs", "--caches"],
+                )
+            )
+            for abort in (
+                "store",
+                "load",
+                "entry",
+                "fault-store",
+                "guest-state",
+            ):
+                cases.append(
+                    (
+                        f"vmx-msrs-{cpu}-abort-{abort}",
+                        "ruby.py",
+                        [
+                            "--cpu",
+                            cpu,
+                            "--classic",
+                            "l1",
+                            "--guest",
+                            "vmx_msrs",
+                            "--msr-abort",
+                            abort,
+                        ],
+                    )
+                )
+        for cpu in ("timing", "o3"):
+            cases.append(
+                (
+                    f"vmx-msrs-{cpu}-ruby",
+                    "ruby.py",
+                    ["--cpu", cpu, "--guest", "vmx_msrs"],
+                )
+            )
+        # Preserve both store-abort (still non-root) and load-abort (root)
+        # shutdown through checkpoint/restore, including a stale timed wake.
+        for cpu in ("atomic", "timing", "minor", "o3"):
+            for abort in ("store", "load"):
+                source = f"vmx-msrs-{cpu}-checkpoint-{abort}"
+                options = [
+                    "--cpu",
+                    cpu,
+                    "--classic",
+                    "l1",
+                    "--guest",
+                    "vmx_msrs",
+                    "--msr-abort",
+                    abort,
+                ]
+                cases.append(
+                    (source, "ruby.py", options + ["--msr-abort-checkpoint"])
+                )
+                cases.append(
+                    (
+                        f"vmx-msrs-{cpu}-restore-{abort}",
+                        "ruby.py",
+                        options
+                        + [
+                            "--restore",
+                            str(args.outdir / source / "checkpoint"),
+                        ],
                     )
                 )
     if args.ept_only:

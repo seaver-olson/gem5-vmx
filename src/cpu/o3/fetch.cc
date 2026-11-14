@@ -295,7 +295,10 @@ Fetch::startupStage()
 void
 Fetch::clearStates(ThreadID tid)
 {
-    fetchStatus[tid] = Running;
+    const auto status = cpu->tcBase(tid)->status();
+    const bool halted = status == gem5::ThreadContext::Halting ||
+                        status == gem5::ThreadContext::Halted;
+    fetchStatus[tid] = halted ? Idle : Running;
     set(pc[tid], cpu->pcState(tid));
     fetchOffset[tid] = 0;
     macroop[tid] = NULL;
@@ -329,7 +332,12 @@ Fetch::resetStage()
 
     // Setup PC and nextPC with initial state.
     for (ThreadID tid = 0; tid < numThreads; ++tid) {
-        fetchStatus[tid] = Running;
+        // A restored halted thread has no active context to drive fetch
+        // into its drained state later.
+        const auto status = cpu->tcBase(tid)->status();
+        const bool halted = status == gem5::ThreadContext::Halting ||
+                            status == gem5::ThreadContext::Halted;
+        fetchStatus[tid] = halted ? Idle : Running;
         set(pc[tid], cpu->pcState(tid));
         fetchOffset[tid] = 0;
         macroop[tid] = NULL;

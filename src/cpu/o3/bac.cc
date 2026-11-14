@@ -159,7 +159,12 @@ BAC::startupStage()
 void
 BAC::clearStates(ThreadID tid)
 {
-    bacStatus[tid] = Running;
+    // Thread removal and checkpoint startup must leave terminal contexts
+    // idle so they can drain without executing another instruction.
+    const auto status = cpu->tcBase(tid)->status();
+    const bool halted = status == gem5::ThreadContext::Halting ||
+                        status == gem5::ThreadContext::Halted;
+    bacStatus[tid] = halted ? Idle : Running;
     set(bacPC[tid], cpu->pcState(tid));
 
     stalls[tid].fetch = false;

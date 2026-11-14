@@ -25,6 +25,7 @@ on:
             - src/cpu/op_class.hh
             - src/cpu/o3/**
             - src/cpu/minor/**
+            - src/sim/system.cc
             - tests/gem5/vmx/**
             - tests/gem5/x86_paging/**
             - src/python/gem5/components/cachehierarchies/classic/**
@@ -46,6 +47,7 @@ on:
             - src/cpu/op_class.hh
             - src/cpu/o3/**
             - src/cpu/minor/**
+            - src/sim/system.cc
             - tests/gem5/vmx/**
             - tests/gem5/x86_paging/**
             - src/python/gem5/components/cachehierarchies/classic/**
@@ -135,6 +137,8 @@ jobs:
               run: python3 tests/gem5/x86_paging/run.py --ept-only --outdir m5out-ept-walker
             - name: Run native VMX operand regressions
               run: python3 tests/gem5/x86_paging/run.py --vmx-operands-only --outdir m5out-vmx-operands
+            - name: Run VMX MSR-transition and abort regressions
+              run: python3 tests/gem5/x86_paging/run.py --vmx-msrs-only --outdir m5out-vmx-msrs
             - name: Run VM entry latency and Minor compatibility regressions
               run: python3 tests/gem5/x86_paging/vmresume.py
             - name: Run debugger paging regressions
@@ -159,6 +163,7 @@ jobs:
                       m5out-paging-transport/
                       m5out-ept-walker/
                       m5out-vmx-operands/
+                      m5out-vmx-msrs/
                       m5out-vmresume/
                       m5out-paging-matrix/provenance.json
                       m5out-paging-matrix/signature.json

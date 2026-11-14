@@ -205,6 +205,8 @@ ISA::clear()
         regVal[misc_reg::VmxExitCtls];
     regVal[misc_reg::VmxTrueEntryCtls] =
         regVal[misc_reg::VmxEntryCtls];
+    // A.6: bits 27:25 = 0 recommend up to 512 MSRs in each transition
+    // area. This is not a zero-entry limit; counts themselves are 32 bits.
     regVal[misc_reg::VmxMisc] = 0;
     regVal[misc_reg::VmxCr0Fixed0] = (1ULL << 0) | (1ULL << 5) |
         (1ULL << 31);

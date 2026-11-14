@@ -177,6 +177,18 @@ class VmxExitFault : public FaultBase
             nullStaticInstPtr) override;
 };
 
+class VmxAbortFault : public FaultBase
+{
+  public:
+    const char *
+    name() const override
+    {
+        return "vmx_abort";
+    }
+    void invoke(ThreadContext *tc,
+                const StaticInstPtr &inst = nullStaticInstPtr) override;
+};
+
 enum class VmxStatus : uint8_t
 {
     Success,
@@ -256,6 +268,8 @@ class VmxState
     static constexpr Addr InvalidVmcsPointer = ~Addr(0);
 
     bool vmxActive = false;
+    // VMX-abort shutdown is local to this processor and persists until reset.
+    bool vmxAborted = false;
     bool inVmxNonRoot = false;
     Addr vmxonRegion = 0;
     Addr currentVmcsPtr = InvalidVmcsPointer;
@@ -310,6 +324,14 @@ class VmxState
     bool loadGuestState(ThreadContext *tc, Vmcs &vmcs, Addr &guestRip) const;
     bool loadHostState(ThreadContext *tc, Vmcs &vmcs, Addr &hostRip) const;
     void saveGuestState(ThreadContext *tc, Vmcs &vmcs, uint64_t rflags) const;
+    enum class MsrArea
+    {
+        EntryLoad,
+        ExitStore,
+        ExitLoad
+    };
+    uint32_t transferMsrs(ThreadContext *tc, Vmcs &vmcs, MsrArea area) const;
+    Fault abort(ThreadContext *tc, uint32_t indicator);
     VmxResult failVmEntry(ThreadContext *tc, Vmcs &vmcs,
             VmxExitReason reason, uint64_t qualification = 0);
     VmxResult vmEntry(ExecContext *xc, bool launch, uint8_t instructionSize);
@@ -333,6 +355,11 @@ class VmxState
     }
     void reset();
     bool active() const { return vmxActive; }
+    bool
+    aborted() const
+    {
+        return vmxAborted;
+    }
     bool nonRootActive() const { return inVmxNonRoot; }
     const std::optional<EptConfig> &eptConfig() const
     { return activeEptConfig; }

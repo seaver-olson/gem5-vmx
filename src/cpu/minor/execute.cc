@@ -1535,11 +1535,18 @@ Execute::evaluate()
              *  called first */
             if (commit_info.drainState != NotDraining) {
                 if (commit_info.drainState == DrainCurrentInst) {
-                    /* Commit only micro-ops, don't kill anything else */
-                    commit(commit_tid, true, false, branch);
+                    /* A halted thread cannot finish its current macro-op.
+                     * Discard its remaining work through the normal drain
+                     * path, including any outstanding memory accesses. */
+                    ThreadContext *thread = cpu.getContext(commit_tid);
+                    if (thread->status() != ThreadContext::Halted) {
+                        commit(commit_tid, true, false, branch);
+                    }
 
-                    if (isInbetweenInsts(commit_tid))
+                    if (thread->status() == ThreadContext::Halted ||
+                        isInbetweenInsts(commit_tid)) {
                         setDrainState(commit_tid, DrainHaltFetch);
+                    }
 
                     /* Discard any generated branch */
                     branch = BranchData::bubble();
@@ -1783,6 +1790,15 @@ Execute::getCommittingThread()
 
     for (auto tid : priority_list) {
         ExecuteThreadInfo &ex_info = executeInfo[tid];
+        // Drain control must progress even after a halt has emptied the
+        // instruction queue. Round-robin/random scheduling would otherwise
+        // skip the thread before it can stop fetch.
+        if (ex_info.drainState == DrainHaltFetch ||
+            (ex_info.drainState == DrainCurrentInst &&
+             cpu.getContext(tid)->status() == ThreadContext::Halted)) {
+            commitPriority = tid;
+            return tid;
+        }
         bool can_commit_insts = !ex_info.inFlightInsts->empty();
         if (can_commit_insts) {
             QueuedInst *head_inflight_inst = &(ex_info.inFlightInsts->front());
@@ -1914,10 +1930,12 @@ Execute::drain()
              * or waiting on an unbufferable memory operation.
              * Otherwise we can go straight to DrainHaltFetch
              */
-            if (isInbetweenInsts(tid))
+            if (cpu.getContext(tid)->status() == ThreadContext::Halted ||
+                isInbetweenInsts(tid)) {
                 setDrainState(tid, DrainHaltFetch);
-            else
+            } else {
                 setDrainState(tid, DrainCurrentInst);
+            }
         }
     }
     return (isDrained() ? 0 : 1);

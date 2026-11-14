@@ -291,6 +291,12 @@ IEW::startupStage()
 void
 IEW::clearStates(ThreadID tid)
 {
+    // The exit trap must have squashed this thread before it is removed.
+    assert(insts[tid].empty());
+    assert(skidBuffer[tid].empty());
+    dispatchStatus[tid] = Running;
+    fetchRedirect[tid] = false;
+
     toRename->iewInfo[tid].usedIQ = true;
     toRename->iewInfo[tid].freeIQEntries =
         instQueue.numFreeEntries(tid);

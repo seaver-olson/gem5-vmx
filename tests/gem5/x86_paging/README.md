@@ -337,6 +337,58 @@ priority. Advertised EPTP, secondary controls and guest-physical exit fields
 are accessible even while EPT is disabled. This is operand execution coverage;
 the separate entry guests cover VM entry/exit.
 
+The VMX MSR-transition regression runs separately:
+
+```
+python3 tests/gem5/x86_paging/run.py --vmx-msrs-only --outdir /tmp/vmx-msrs
+```
+
+It exercises entry-load, exit-store, and exit-load lists with real guest
+memory on Atomic, TimingSimple, Minor, and O3, plus timing/O3 under Ruby.
+Checks include zero counts, alignment/address-range failures, ordered
+duplicate MSRs, preserved store headers, entry failure at later items,
+partial progress, guest-state and launch-state preservation, and host-list
+recovery without guest stores after late entry failure. The same guest also
+checks 512-entry lists, TSC side effects, EFER.LMA preservation, legal FS/GS
+stores, and host-physical list access independent of EPT permissions.
+
+Abort cases reuse the existing INIT/SIPI bootstrap. A second CPU verifies
+indicator 1 for exit-store failure and 4 for exit-load failure, including
+host-list failure during late VM-entry recovery. It checks earlier/later
+store values and proves that NMI, INIT, SIPI, SMI, and fixed interrupts cannot
+restart the aborted CPU. Other CPUs continue; an abort does not terminate
+the simulator. The observer repeats those wakeups across drain/resume;
+the harness records CPU 0's instruction count before draining and checks
+that it stays unchanged afterward. Store-abort and load-abort cases also
+checkpoint and restore on all four CPU models.
+
+Checkpoint cases leave a timed-quiesce event pending by waking CPU 0 early
+with a fixed interrupt before inducing the abort. The harness checks that
+the original timer is still pending in the checkpoint, runs beyond its
+deadline in both the source and restored simulations, and verifies that
+CPU 0 remains stopped. This covers a simulator wakeup path separate from
+the local APIC. These 42 cases use one hardware thread per CPU.
+
+Real hardware requires RESET to recover from a VMX abort. Complete CPU and
+local APIC RESET recovery is unsupported here. gem5 represents abort
+shutdown with its halted thread status and a persistent VMX-abort flag;
+the tests cover shutdown, drain, and checkpoint persistence, not recovery.
+INIT is not used as a substitute for RESET.
+
+`VmxState::serialize()` writes `vmxAborted` alongside VMX operation and
+current-VMCS state; `unserialize()` restores it (older checkpoints without
+the field default to false). The CPU separately checkpoints its halted
+thread status. Active EPT guest checkpointing remains unsupported; a VMX
+abort clears the active EPT context before entering shutdown.
+
+The implementation follows Intel SDM September 2026 rev. 093, Volume 3C
+29.2.1.2-3 (29-5/29-6), 29.4 (29-19/29-20), 29.8 (29-28/29-29), 30.4
+(30-29), 30.6 (30-33/30-34), and 30.7 (30-34/30-35), plus Volume 3D A.6
+(A-7). `IA32_VMX_MISC[27:25]=0` recommends 512 entries per area; it does not
+disable lists or impose an architectural 512-entry count check. List memory
+uses coherent functional host-physical requests at the serialized VMX
+transition, not guest paging or EPT; list-access latency is not modeled.
+
 The focused VM entry regression adds a minimal no-EPT launch/resume/VMCALL
 round trip, plus #UD, VMfailInvalid and VMfailValid checks for both entry
 instructions:

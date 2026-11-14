@@ -229,6 +229,11 @@ void
 X86ISA::Interrupts::requestInterrupt(uint8_t vector,
         uint8_t deliveryMode, bool level)
 {
+    // SDM 30.7: unlike HLT or ordinary shutdown, only RESET wakes a VMX
+    // abort. In particular INIT/SIPI must not restart the aborted CPU.
+    if (!isWakeUp()) {
+        return;
+    }
     /*
      * Fixed and lowest-priority delivery mode interrupts are handled
      * using the IRR/ISR registers, checking against the TPR, etc.
@@ -684,8 +689,18 @@ X86ISA::Interrupts::eligibleUnmaskable() const
 }
 
 bool
+X86ISA::Interrupts::isWakeUp() const
+{
+    auto *isa = dynamic_cast<ISA *>(tc->getIsaPtr());
+    return !isa || !isa->vmxState().aborted();
+}
+
+bool
 X86ISA::Interrupts::checkInterrupts() const
 {
+    if (!isWakeUp()) {
+        return false;
+    }
     // A VMX guest's most recent VM entry may have armed a one-instruction
     // STI-shadow/MOV-SS-shadow withholds maskable interrupts; NMI blocking
     // and the MOV-SS shadow are handled by eligibleUnmaskable(). Queued
@@ -717,6 +732,9 @@ X86ISA::Interrupts::checkInterrupts() const
 bool
 X86ISA::Interrupts::checkInterruptsRaw() const
 {
+    if (!isWakeUp()) {
+        return false;
+    }
     return pendingUnmaskableInt || pendingExtInt ||
         (IRRV > ISRV && bits(IRRV, 7, 4) >
          bits(regs[APIC_TASK_PRIORITY], 7, 4));
