@@ -233,13 +233,22 @@ class MMU::WalkContinuation :
 namespace
 {
 
-bool
-readOnlyVmxMsr(Addr msr)
+Cycles
+localMsrAccess(bool read, uint32_t address, ThreadContext *tc, PacketPtr pkt)
 {
-    // IA32_VMX_BASIC through IA32_VMX_EPT_VPID_CAP and the true-control MSRs
-    // are read-only. Unsupported optional VMX MSRs are absent from the MSR
-    // map and therefore fault on both reads and writes.
-    return (msr >= 0x480 && msr <= 0x48c) || (msr >= 0x48d && msr <= 0x490);
+    if (read) {
+        uint64_t value;
+        panic_if(!readMsr(tc, address, value), "Invalid checked RDMSR");
+        RegVal data = htole(value);
+        assert(pkt->getSize() <= sizeof(RegVal));
+        pkt->setData((uint8_t *)&data);
+    } else {
+        RegVal data = 0;
+        assert(pkt->getSize() <= sizeof(RegVal));
+        pkt->writeData((uint8_t *)&data);
+        panic_if(!writeMsr(tc, address, letoh(data)), "Invalid checked WRMSR");
+    }
+    return Cycles(1);
 }
 
 Cycles
@@ -285,19 +294,15 @@ MMU::translateInt(bool read, RequestPtr req, ThreadContext *tc)
         RegIndex regNum;
         if (!msrAddrToIndex(regNum, vaddr))
             return std::make_shared<GeneralProtection>(0);
-        if (!read && (readOnlyVmxMsr(vaddr) ||
-                (vaddr == 0x3a &&
-                 bits(tc->readMiscRegNoEffect(regNum), 0)))) {
+        if (!read && !msrWritable(tc, vaddr)) {
             return std::make_shared<GeneralProtection>(0);
         }
 
         req->setPaddr(req->getVaddr());
-        req->setLocalAccessor(
-            [read,regNum](ThreadContext *tc, PacketPtr pkt)
-            {
-                return localMiscRegAccess(read, regNum, tc, pkt);
-            }
-        );
+        req->setLocalAccessor([read, address = uint32_t(vaddr)](
+                                  ThreadContext *tc, PacketPtr pkt) {
+            return localMsrAccess(read, address, tc, pkt);
+        });
 
         return NoFault;
     } else if (prefix == IntAddrPrefixIO) {

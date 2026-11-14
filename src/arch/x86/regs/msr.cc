@@ -28,6 +28,11 @@
 
 #include "arch/x86/regs/msr.hh"
 
+#include "arch/generic/mmu.hh"
+#include "arch/x86/isa.hh"
+#include "arch/x86/paging.hh"
+#include "cpu/thread_context.hh"
+
 namespace gem5
 {
 
@@ -175,6 +180,142 @@ msrAddrToIndex(RegIndex &reg_num, Addr addr)
         reg_num = it->second;
         return true;
     }
+}
+
+bool
+msrWritable(ThreadContext *tc, uint32_t address)
+{
+    RegIndex reg;
+    if (!msrAddrToIndex(reg, address)) {
+        return false;
+    }
+    // Capability registers are read-only, including the VMX capabilities.
+    if (address == 0xfe || address == 0x179 ||
+        (address >= 0x480 && address <= 0x490)) {
+        return false;
+    }
+    return address != 0x3a ||
+           !(tc->readMiscRegNoEffect(misc_reg::FeatureControl) & 1);
+}
+
+bool
+msrWriteValid(ThreadContext *tc, uint32_t address, uint64_t value)
+{
+    if (!msrWritable(tc, address)) {
+        return false;
+    }
+    const auto mtrr_type = [](uint8_t type) {
+        return type == 0 || type == 1 || (type >= 4 && type <= 6);
+    };
+    if (address >= 0x200 && address <= 0x20f) {
+        CpuidResult sizes;
+        auto *isa = static_cast<ISA *>(tc->getIsaPtr());
+        isa->cpuid->doCpuid(tc, LongModeAddressSize, 0, sizes);
+        const unsigned width = bits(sizes.rax, 7, 0);
+        if (width < 32 || width > 52) {
+            return false;
+        }
+        const uint64_t addresses = mask(width) & ~mask(12);
+        if (address & 1) {
+            if (value & ~(addresses | (1ULL << 11))) {
+                return false;
+            }
+        } else if ((value & ~(addresses | mask(8))) ||
+                   !mtrr_type(uint8_t(value))) {
+            return false;
+        }
+    }
+    if (address == 0x250 || address == 0x258 || address == 0x259 ||
+        (address >= 0x268 && address <= 0x26f)) {
+        for (unsigned i = 0; i < 8; ++i) {
+            if (!mtrr_type(uint8_t(value >> (8 * i)))) {
+                return false;
+            }
+        }
+    }
+    switch (address) {
+        case 0x2ff: // IA32_MTRR_DEF_TYPE
+            if ((value & ~0xc07ULL) || !mtrr_type(uint8_t(value))) {
+                return false;
+            }
+            break;
+        case 0x1d9: // IA32_DEBUGCTL reserved positions, SDM vol. 4 Table 2-2.
+            if (value & (~mask(16) | mask(5, 3))) {
+                return false;
+            }
+            break;
+        case 0x277: // IA32_PAT
+            for (unsigned i = 0; i < 8; ++i) {
+                if (!paging::validPatType(uint8_t(value >> (8 * i)))) {
+                    return false;
+                }
+            }
+            break;
+        case 0xc0000080: { // IA32_EFER; LMA is read-only, not reserved.
+            const uint64_t old = tc->readMiscRegNoEffect(misc_reg::Efer);
+            if (value & ~0xd01ULL) {
+                return false;
+            }
+            if (bits(tc->readMiscRegNoEffect(misc_reg::Cr0), 31) &&
+                ((old ^ value) & (1ULL << 8))) {
+                return false;
+            }
+            break;
+        }
+        case 0x175:      // IA32_SYSENTER_ESP
+        case 0x176:      // IA32_SYSENTER_EIP
+        case 0xc0000082: // IA32_LSTAR
+        case 0xc0000100: // IA32_FS_BASE
+        case 0xc0000101: // IA32_GS_BASE
+        case 0xc0000102: // IA32_KERNEL_GS_BASE
+            if ((value >> 47) != 0 && (value >> 47) != mask(17)) {
+                return false;
+            }
+            break;
+        case 0xc0000103: // IA32_TSC_AUX
+            if (value >> 32) {
+                return false;
+            }
+            break;
+        default:
+            break;
+    }
+    return true;
+}
+
+bool
+readMsr(ThreadContext *tc, uint32_t address, uint64_t &value)
+{
+    RegIndex reg;
+    if (!msrAddrToIndex(reg, address)) {
+        return false;
+    }
+    value = tc->readMiscReg(reg);
+    return true;
+}
+
+bool
+writeMsr(ThreadContext *tc, uint32_t address, uint64_t value)
+{
+    if (!msrWriteValid(tc, address, value)) {
+        return false;
+    }
+    RegIndex reg;
+    msrAddrToIndex(reg, address);
+    if (reg == misc_reg::Efer) {
+        // WRMSR cannot modify LMA, including when used by a VMX MSR list.
+        value = insertBits(value, 10,
+                           bits(tc->readMiscRegNoEffect(misc_reg::Efer), 10));
+    }
+    tc->setMiscReg(reg, value);
+    // SDM WRMSR and 29.4/30.6: MTRR writes invalidate all TLB entries,
+    // including globals, whether explicit or performed by a VMX list.
+    if ((address >= 0x200 && address <= 0x20f) || address == 0x250 ||
+        address == 0x258 || address == 0x259 ||
+        (address >= 0x268 && address <= 0x26f) || address == 0x2ff) {
+        tc->getMMUPtr()->flushAll();
+    }
+    return true;
 }
 
 } // namespace X86ISA

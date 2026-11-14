@@ -36,6 +36,7 @@
 
 namespace gem5
 {
+class ThreadContext;
 
 namespace X86ISA
 {
@@ -63,6 +64,13 @@ extern const MsrMap msrMap;
  * @return True if the MSR was found, false otherwise.
  */
 bool msrAddrToIndex(RegIndex &regNum, Addr addr);
+
+// CPL0 MSR semantics, without instruction privilege or VMX interception.
+// VMX transition lists use these same operations as RDMSR/WRMSR.
+bool msrWritable(ThreadContext *tc, uint32_t address);
+bool msrWriteValid(ThreadContext *tc, uint32_t address, uint64_t value);
+bool readMsr(ThreadContext *tc, uint32_t address, uint64_t &value);
+bool writeMsr(ThreadContext *tc, uint32_t address, uint64_t value);
 
 } // namespace X86ISA
 } // namespace gem5
