@@ -196,6 +196,28 @@ validPhysicalAddress(uint64_t value, unsigned physicalAddressBits)
         (value & ~mask(physicalAddressBits)) == 0;
 }
 
+// SDM rev. 093, 29.2.1.2-3: zero counts ignore the pointer. Otherwise both
+// ends of the 16-byte-entry area must fit; do not wrap the last-byte sum.
+inline bool
+validMsrArea(uint64_t address, uint32_t count, unsigned physicalBits)
+{
+    if (!count) {
+        return true;
+    }
+    return !(address & 15) && validPhysicalAddress(address, physicalBits) &&
+           uint64_t(count) * 16 - 1 <= mask(physicalBits) - address;
+}
+
+// SDM 29.4/30.4/30.6: index/reserved header checks precede the MSR access.
+// FS/GS bases are forbidden only for loads, not for exit stores.
+inline bool
+validMsrItemHeader(uint64_t header, bool store)
+{
+    const uint32_t index = header;
+    return !bits(header, 63, 32) && (index >> 8) != 8 &&
+           (store || (index != 0xc0000100 && index != 0xc0000101));
+}
+
 inline bool
 validCr3(uint64_t value, uint64_t cr4, bool ia32e,
         unsigned physicalAddressBits)

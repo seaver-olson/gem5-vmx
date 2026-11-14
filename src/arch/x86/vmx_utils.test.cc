@@ -280,6 +280,40 @@ TEST(VmxEventDelivery, NestedExceptionMatrix)
     EXPECT_EQ(vmx::nestedException(std::nullopt, 13), Action::Deliver);
 }
 
+TEST(VmxMsrArea, CompletePhysicalRange)
+{
+    for (unsigned width : {32u, 40u, 48u, 52u}) {
+        const uint64_t last = mask(width);
+        EXPECT_TRUE(vmx::validMsrArea(~0ULL, 0, width));
+        EXPECT_TRUE(vmx::validMsrArea(0, 1, width));
+        EXPECT_TRUE(vmx::validMsrArea(last - 15, 1, width));
+        EXPECT_FALSE(vmx::validMsrArea(last - 15, 2, width));
+        EXPECT_FALSE(vmx::validMsrArea(last + 1, 1, width));
+        EXPECT_FALSE(vmx::validMsrArea(~0ULL - 15, 2, width));
+        EXPECT_FALSE(vmx::validMsrArea(last - 15, 0xffffffff, width));
+        EXPECT_TRUE(vmx::validMsrArea(4096, 512, width));
+        EXPECT_TRUE(vmx::validMsrArea(4096, 513, width));
+        for (unsigned low = 1; low < 16; ++low) {
+            EXPECT_FALSE(vmx::validMsrArea(4096 + low, 1, width));
+        }
+    }
+}
+
+TEST(VmxMsrArea, ItemHeader)
+{
+    for (bool store : {false, true}) {
+        EXPECT_TRUE(vmx::validMsrItemHeader(0x174, store));
+        EXPECT_FALSE(vmx::validMsrItemHeader((1ULL << 32) | 0x174, store));
+        EXPECT_FALSE(vmx::validMsrItemHeader((1ULL << 63) | 0x174, store));
+        EXPECT_FALSE(vmx::validMsrItemHeader(0x800, store));
+        EXPECT_FALSE(vmx::validMsrItemHeader(0x8ff, store));
+        EXPECT_TRUE(vmx::validMsrItemHeader(0x7ff, store));
+        EXPECT_TRUE(vmx::validMsrItemHeader(0x900, store));
+        EXPECT_EQ(vmx::validMsrItemHeader(0xc0000100, store), store);
+        EXPECT_EQ(vmx::validMsrItemHeader(0xc0000101, store), store);
+    }
+}
+
 } // namespace
 } // namespace X86ISA
 } // namespace gem5
