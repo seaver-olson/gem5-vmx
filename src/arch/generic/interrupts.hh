@@ -68,6 +68,14 @@ class BaseInterrupts : public SimObject
      */
     virtual void updateIntrInfo() = 0;
 
+    // CPU RESET is distinct from discarding pending interrupts. Retain
+    // the historical behavior for controllers without a separate reset.
+    virtual void
+    reset()
+    {
+        clearAll();
+    }
+
     /*
      * Old functions needed for compatability but which will be phased out
      * eventually.

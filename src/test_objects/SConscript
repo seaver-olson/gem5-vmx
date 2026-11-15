@@ -27,6 +27,10 @@
 Import ("*")
 
 if env['CONF']['USE_TEST_OBJECTS']:
+    if env['CONF']['USE_X86_ISA']:
+        SimObject('X86InterruptTester.py', sim_objects=['X86InterruptTester'])
+        Source('x86_interrupt_tester.cc')
+
     SimObject('StatTester.py', sim_objects=[
         'StatTester',
         'ScalarStatTester',

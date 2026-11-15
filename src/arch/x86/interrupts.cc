@@ -727,6 +727,23 @@ X86ISA::Interrupts::getInterrupt()
 }
 
 void
+X86ISA::Interrupts::clearAll()
+{
+    // Discard latched requests, not interrupts already in service. TMR
+    // still describes the trigger mode of those in-service interrupts.
+    for (unsigned i = 0; i < 8; ++i) {
+        regs[APIC_INTERRUPT_REQUEST(i)] = 0;
+        regs[APIC_TRIGGER_MODE(i)] &= regs[APIC_IN_SERVICE(i)];
+    }
+    IRRV = 0;
+    pendingSmi = pendingNmi = pendingExtInt = false;
+    pendingInit = pendingStartup = pendingUnmaskableInt = false;
+    smiVector = nmiVector = extIntVector = initVector = startupVector = 0;
+    // Configuration, startup status, timers and outgoing IPIs survive.
+    // Requests arriving after this call may become pending again.
+}
+
+void
 X86ISA::Interrupts::updateIntrInfo()
 {
     assert(checkInterrupts());

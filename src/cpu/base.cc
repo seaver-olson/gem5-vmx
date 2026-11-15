@@ -717,8 +717,8 @@ BaseCPU::setReset(bool state)
             tc->getDecoderPtr()->reset();
             // reset MMU,
             tc->getMMUPtr()->reset();
-            // Clear any interrupts,
-            interrupts[tc->threadId()]->clearAll();
+            // Reset the interrupt controller,
+            interrupts[tc->threadId()]->reset();
             // and finally reenable execution.
             tc->activate();
         }

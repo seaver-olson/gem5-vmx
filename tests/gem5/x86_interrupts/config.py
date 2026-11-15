@@ -1,0 +1,77 @@
+# Copyright (c) 2026 Seaver Olson
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met: redistributions of source code must retain the above copyright
+# notice, this list of conditions and the following disclaimer;
+# redistributions in binary form must reproduce the above copyright
+# notice, this list of conditions and the following disclaimer in the
+# documentation and/or other materials provided with the distribution;
+# neither the name of the copyright holders nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+"""Exercise interrupt clearing and INIT without booting a guest."""
+
+import argparse
+
+import m5
+from m5.objects import (
+    AddrRange,
+    AtomicSimpleCPU,
+    Root,
+    SimpleMemory,
+    SrcClockDomain,
+    System,
+    SystemXBar,
+    VoltageDomain,
+    X86BareMetalWorkload,
+    X86InterruptTester,
+)
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("scenario", choices=("clear", "init", "reset"))
+args = parser.parse_args()
+root = Root(full_system=True)
+root.system = system = System(mem_mode="atomic")
+system.clk_domain = SrcClockDomain(
+    clock="1GHz", voltage_domain=VoltageDomain()
+)
+system.mem_ranges = [AddrRange("1MiB")]
+system.membus = SystemXBar()
+system.memory = SimpleMemory(range=system.mem_ranges[0])
+system.memory.port = system.membus.mem_side_ports
+system.system_port = system.membus.cpu_side_ports
+system.cpu = AtomicSimpleCPU()
+system.cpu.interrupts = [X86InterruptTester()]
+apic = system.cpu.interrupts[0]
+system.cpu.createThreads()
+system.cpu.icache_port = system.membus.cpu_side_ports
+system.cpu.dcache_port = system.membus.cpu_side_ports
+system.cpu.mmu.connectWalkerPorts(
+    system.membus.cpu_side_ports, system.membus.cpu_side_ports
+)
+apic.pio = system.membus.mem_side_ports
+apic.int_requestor = system.membus.cpu_side_ports
+apic.int_responder = system.membus.mem_side_ports
+system.workload = X86BareMetalWorkload()
+m5.instantiate()
+apic.run(args.scenario)
+if args.scenario == "clear":
+    event = m5.simulate(1_000_000)
+    assert event.getCause() == "interrupt timer observation"
+    apic.checkTimer()
+print("x86 interrupt semantics passed")

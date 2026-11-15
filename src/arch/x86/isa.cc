@@ -136,6 +136,10 @@ ISA::clear()
     regVal[misc_reg::Dr6] = (mask(8) << 4) | (mask(16) << 16);
     regVal[misc_reg::Dr7] = 1 << 10;
 
+    // Initialize fresh FP state here; INIT must preserve existing state.
+    regVal[misc_reg::Mxcsr] = 0x1f80;
+    regVal[misc_reg::Ftw] = 0xffff;
+
     LocalApicBase lApicBase = 0;
     lApicBase.base = 0xFEE00000 >> 12;
     lApicBase.enable = 1;

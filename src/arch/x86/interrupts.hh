@@ -288,6 +288,15 @@ class Interrupts : public BaseInterrupts
     Fault getInterrupt() override;
     void updateIntrInfo() override;
 
+    // Clearing pending requests does not reset APIC configuration or ISR.
+    void clearAll() override;
+
+    void
+    reset() override
+    {
+        panic("Local APIC RESET is not implemented.\n");
+    }
+
     /*
      * Serialization.
      */
@@ -308,12 +317,6 @@ class Interrupts : public BaseInterrupts
     clear(int int_num, int index) override
     {
         panic("Interrupts::clear unimplemented!\n");
-    }
-
-    void
-    clearAll() override
-    {
-        panic("Interrupts::clearAll unimplemented!\n");
     }
 };
 

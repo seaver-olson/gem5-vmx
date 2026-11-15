@@ -284,10 +284,8 @@ InitInterrupt::invoke(ThreadContext *tc, const StaticInstPtr &inst)
     tc->setMiscReg(misc_reg::Dr6, 0x00000000ffff0ff0ULL);
     tc->setMiscReg(misc_reg::Dr7, 0x0000000000000400ULL);
 
-    tc->setMiscReg(misc_reg::Mxcsr, 0x1f80);
-
-    // Flag all elements on the x87 stack as empty.
-    tc->setMiscReg(misc_reg::Ftw, 0xFFFF);
+    // INIT preserves x87 and SIMD state, including FTW and MXCSR. It is
+    // neither RESET nor FINIT (Intel SDM Vol. 3A, Oct. 2024, Table 11-1).
 
     // Update the handy M5 Reg.
     tc->setMiscReg(misc_reg::M5Reg, 0);
