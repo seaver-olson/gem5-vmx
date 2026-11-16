@@ -30,11 +30,15 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
+#include <utility>
 
+#include "arch/x86/decoder.hh"
 #include "arch/x86/generated/decoder.hh"
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/utility.hh"
+#include "cpu/base.hh"
 #include "sim/sim_exit.hh"
 
 namespace gem5::X86ISA
@@ -43,6 +47,31 @@ namespace gem5::X86ISA
 void
 InterruptTester::run(const std::string &scenario)
 {
+    if (scenario == "suspend") {
+        tc->suspend();
+        return;
+    }
+    if (scenario == "seed-thread-reset") {
+        seedThreadReset();
+        return;
+    }
+    if (scenario == "thread-reset") {
+        checkThreadReset();
+        return;
+    }
+    if (scenario == "check-thread-seed") {
+        panic_if(tc->getReg(int_reg::Rax) != 0x12340000 ||
+                     tc->readMiscRegNoEffect(misc_reg::Cr0) != 0x80000011 ||
+                     tc->getReg(flatFloatRegClass[0]) != 0x56780000,
+                 "Resetting another context modified this thread");
+        return;
+    }
+    if (scenario == "check-reset-tsc") {
+        const auto elapsed = tc->getCpuPtr()->curCycle() - resetCycle;
+        panic_if(!elapsed || tc->readMiscReg(misc_reg::Tsc) != elapsed,
+                 "TSC did not advance from the reset instant");
+        return;
+    }
     // Keep timer/message delivery from waking a CPU into unmapped code.
     tc->halt();
     if (scenario == "reset") {
@@ -89,26 +118,7 @@ InterruptTester::run(const std::string &scenario)
     }
     panic_if(scenario != "clear", "Unknown interrupt test: %s", scenario);
 
-    // Include both a pending-only level interrupt and one in service.
-    regs[APIC_IN_SERVICE(2)] = 1;
-    ISRV = 64;
-    regs[APIC_INTERRUPT_REQUEST(2)] = 1;
-    regs[APIC_TRIGGER_MODE(2)] = 1;
-    regs[APIC_INTERRUPT_REQUEST(3)] = 2;
-    regs[APIC_TRIGGER_MODE(3)] = 2;
-    IRRV = 97;
-    pendingSmi = pendingNmi = pendingExtInt = true;
-    pendingInit = pendingStartup = pendingUnmaskableInt = true;
-    smiVector = nmiVector = extIntVector = initVector = startupVector = 7;
-    startedUp = true;
-    // Model an outstanding outgoing IPI. Clearing incoming requests must
-    // not erase the accounting used by its later response callback.
-    pendingIPIs = 1;
-    regs[APIC_INTERRUPT_COMMAND_LOW] = 1 << 12;
-    regs[APIC_LOGICAL_DESTINATION] = 0x12000000;
-    regs[APIC_TASK_PRIORITY] = 0x20;
-    setReg(APIC_LVT_TIMER, 0xd0);
-    setReg(APIC_INITIAL_COUNT, 4);
+    seedInterrupts();
     const Tick expiration = apicTimerEvent.when();
     std::array<uint32_t, NUM_APIC_REGS> expected;
     std::copy(std::begin(regs), std::end(regs), expected.begin());
@@ -140,6 +150,225 @@ InterruptTester::run(const std::string &scenario)
     regs[APIC_INTERRUPT_COMMAND_LOW] = 0;
     exitSimulationLoopClassic("interrupt timer observation", 0,
                               expiration + 1);
+}
+
+void
+InterruptTester::seedInterrupts()
+{
+    // Include both a pending-only level interrupt and one in service.
+    regs[APIC_IN_SERVICE(2)] = 1;
+    ISRV = 64;
+    regs[APIC_INTERRUPT_REQUEST(2)] = 1;
+    regs[APIC_TRIGGER_MODE(2)] = 1;
+    regs[APIC_INTERRUPT_REQUEST(3)] = 2;
+    regs[APIC_TRIGGER_MODE(3)] = 2;
+    IRRV = 97;
+    pendingSmi = pendingNmi = pendingExtInt = true;
+    pendingInit = pendingStartup = pendingUnmaskableInt = true;
+    smiVector = nmiVector = extIntVector = initVector = startupVector = 7;
+    startedUp = true;
+    // Model an outstanding outgoing IPI. Clearing incoming requests must
+    // not erase the accounting used by its later response callback.
+    pendingIPIs = 1;
+    regs[APIC_INTERRUPT_COMMAND_LOW] = 1 << 12;
+    regs[APIC_LOGICAL_DESTINATION] = 0x12000000;
+    regs[APIC_TASK_PRIORITY] = 0x20;
+    setReg(APIC_LVT_TIMER, 0xd0);
+    setReg(APIC_INITIAL_COUNT, 4);
+}
+
+void
+InterruptTester::seedThreadReset()
+{
+    panic_if(tc->status() != ThreadContext::Suspended,
+             "Thread reset fixture requires a suspended context");
+    for (RegIndex i = 0; i < misc_reg::NumRegs; ++i) {
+        if (misc_reg::isValid(i)) {
+            tc->setMiscRegNoEffect(i, 0x5a5a5a5a);
+        }
+    }
+    for (RegIndex i = 0; i < int_reg::NumRegs; ++i) {
+        tc->setReg(flatIntRegClass[i], RegVal(0x12340000 + i));
+    }
+    for (RegIndex i = 0; i < float_reg::NumRegs; ++i) {
+        tc->setReg(flatFloatRegClass[i], RegVal(0x56780000 + i));
+    }
+    setRFlags(tc, 0xed7);
+    tc->setReg(cc_reg::Ecf, RegVal(1));
+    tc->setReg(cc_reg::Ezf, RegVal(1));
+
+    // Install a coherent long-mode decode state without walking page tables.
+    tc->setMiscRegNoEffect(misc_reg::Cr0, 0x80000011);
+    tc->setMiscRegNoEffect(misc_reg::Cr4, 0x20);
+    tc->setMiscRegNoEffect(misc_reg::Efer, 0x500);
+    SegAttr code_attr = 0;
+    code_attr.longMode = 1;
+    code_attr.present = 1;
+    code_attr.system = 1;
+    code_attr.type = 11;
+    code_attr.readable = 1;
+    tc->setMiscRegNoEffect(misc_reg::CsAttr, code_attr);
+    tc->setMiscRegNoEffect(misc_reg::SsAttr, 0);
+    tc->setMiscReg(misc_reg::M5Reg, 0);
+    PCState pc(0x12345000);
+    pc.size(7);
+    pc.upc(romMicroPC(X86ISAInst::rom_labels::extern_label_initIntHalt));
+    pc.nupc(pc.upc() + 1);
+    tc->pcState(pc);
+    checkDecode(5);
+}
+
+void
+InterruptTester::checkDecode(unsigned size)
+{
+    // MOV AX, imm16 in real mode, MOV EAX, imm32 in long mode.
+    const std::array<uint8_t, 8> bytes = {0xb8, 0x34, 0x12, 0x90,
+                                          0x90, 0x90, 0x90, 0x90};
+    auto *decoder = tc->getDecoderPtr();
+    // Buffer reset remains the caller's responsibility, as in setReset().
+    decoder->reset();
+    panic_if(decoder->moreBytesSize() != bytes.size(),
+             "Unexpected x86 decoder fetch width");
+    std::memcpy(decoder->moreBytesPtr(), bytes.data(), bytes.size());
+    PCState pc(tc->pcState().instAddr());
+    decoder->moreBytes(pc, pc.instAddr());
+    panic_if(!decoder->instReady() || !decoder->decode(pc) ||
+                 pc.size() != size,
+             "Decoder did not observe the expected operand size");
+    decoder->reset();
+}
+
+void
+InterruptTester::checkThreadReset()
+{
+    panic_if(!tc->getCpuPtr()->curCycle(),
+             "Thread reset must be tested at a nonzero cycle");
+    seedInterrupts();
+    std::array<uint32_t, NUM_APIC_REGS> expected_apic;
+    std::copy(std::begin(regs), std::end(regs), expected_apic.begin());
+    const Tick expiration = apicTimerEvent.when();
+    const auto status = tc->status();
+
+    // Repeat without reseeding to check that reset is idempotent.
+    for (unsigned attempt = 0; attempt < 2; ++attempt) {
+        tc->getIsaPtr()->resetThread();
+        resetCycle = tc->getCpuPtr()->curCycle();
+        for (RegIndex i = 0; i < int_reg::NumRegs; ++i) {
+            const RegVal expected =
+                i == int_reg::_RdxIdx ? 0x306a9 + tc->contextId() : 0;
+            panic_if(tc->getReg(flatIntRegClass[i]) != expected,
+                     "RESET integer register %u mismatch", i);
+        }
+        for (RegIndex i = 0; i < float_reg::NumRegs; ++i) {
+            panic_if(tc->getReg(flatFloatRegClass[i]),
+                     "RESET left floating-point register %u dirty", i);
+        }
+        for (RegIndex i = 0; i < cc_reg::NumRegs; ++i) {
+            panic_if(tc->getReg(ccRegClass[i]),
+                     "RESET left condition-code register %u dirty", i);
+        }
+        const std::pair<RegIndex, RegVal> expected_misc[] = {
+            {misc_reg::Cr0, 0x60000010},
+            {misc_reg::Cr2, 0},
+            {misc_reg::Cr3, 0},
+            {misc_reg::Cr4, 0},
+            {misc_reg::Cr8, 0},
+            {misc_reg::Efer, 0},
+            {misc_reg::Xcr0, 1},
+            {misc_reg::Dr0, 0},
+            {misc_reg::Dr1, 0},
+            {misc_reg::Dr2, 0},
+            {misc_reg::Dr3, 0},
+            {misc_reg::Dr6, 0xffff0ff0},
+            {misc_reg::Dr7, 0x400},
+            {misc_reg::Fcw, 0x40},
+            {misc_reg::Ftw, 0x5555},
+            {misc_reg::Mxcsr, 0x1f80},
+            {misc_reg::Fsw, 0},
+            {misc_reg::X87Top, 0},
+            {misc_reg::Ftag, 0},
+            {misc_reg::Fiseg, 0},
+            {misc_reg::Fioff, 0},
+            {misc_reg::Foseg, 0},
+            {misc_reg::Fooff, 0},
+            {misc_reg::Fop, 0},
+            {misc_reg::DefType, 0},
+            {misc_reg::Pat, 0x0007040600070406ULL},
+            {misc_reg::Mtrrcap, 0x508},
+            {misc_reg::McgCap, 0x104},
+            {misc_reg::SysenterCs, 0},
+            {misc_reg::SysenterEsp, 0},
+            {misc_reg::SysenterEip, 0},
+            {misc_reg::Star, 0},
+            {misc_reg::Lstar, 0},
+            {misc_reg::TscAux, 0}};
+        for (const auto &[index, value] : expected_misc) {
+            panic_if(tc->readMiscRegNoEffect(index) != value,
+                     "RESET miscellaneous register %u mismatch", index);
+        }
+        for (RegIndex i = misc_reg::MtrrPhysBaseBase; i < misc_reg::Pat; ++i) {
+            panic_if(tc->readMiscRegNoEffect(i),
+                     "RESET left MTRR register %u dirty", i);
+        }
+        for (int seg = 0; seg < segment_idx::NumIdxs; ++seg) {
+            const RegVal base = seg == segment_idx::Cs ? 0xffff0000 : 0;
+            const RegVal selector = seg == segment_idx::Cs ? 0xf000 : 0;
+            panic_if(tc->readMiscRegNoEffect(misc_reg::segBase(seg)) != base ||
+                         tc->readMiscRegNoEffect(misc_reg::segEffBase(seg)) !=
+                             base ||
+                         tc->readMiscRegNoEffect(misc_reg::segSel(seg)) !=
+                             selector ||
+                         tc->readMiscRegNoEffect(misc_reg::segLimit(seg)) !=
+                             0xffff,
+                     "RESET segment %d mismatch", seg);
+            if (seg <= segment_idx::Gs) {
+                const SegAttr attr =
+                    tc->readMiscRegNoEffect(misc_reg::segAttr(seg));
+                const bool code = seg == segment_idx::Cs;
+                panic_if(attr.dpl || attr.unusable || attr.defaultSize ||
+                             attr.longMode || attr.avl || attr.granularity ||
+                             !attr.present || attr.type != (code ? 11 : 3) ||
+                             attr.writable != !code || !attr.readable ||
+                             attr.expandDown || !attr.system,
+                         "RESET segment %d attributes mismatch", seg);
+            }
+        }
+        const SegAttr ldt = tc->readMiscRegNoEffect(misc_reg::TslAttr);
+        const SegAttr tr = tc->readMiscRegNoEffect(misc_reg::TrAttr);
+        panic_if(!ldt.unusable || !ldt.present || ldt.type != 2 ||
+                     ldt.system || tr.unusable || !tr.present ||
+                     tr.type != 3 || tr.system,
+                 "RESET system-segment attributes mismatch");
+        const HandyM5Reg mode = tc->readMiscRegNoEffect(misc_reg::M5Reg);
+        const auto &pc = tc->pcState().as<PCState>();
+        const LocalApicBase apic_base = tc->readMiscReg(misc_reg::ApicBase);
+        panic_if(getRFlags(tc) != 2 || tc->readMiscReg(misc_reg::Tsc) ||
+                     mode.mode != LegacyMode || mode.submode != RealMode ||
+                     mode.cpl || mode.paging || mode.prot || mode.defOp != 1 ||
+                     mode.defAddr != 1 || mode.stack != 1 ||
+                     pc.instAddr() != 0xfffffff0 || pc.upc() ||
+                     pc.nupc() != 1 || pc.size() || pc.npc() != 0xfffffff8 ||
+                     tc->status() != status || apic_base.base != 0xfee00 ||
+                     !apic_base.enable ||
+                     apic_base.bsp != (tc->contextId() == 0),
+                 "RESET flags, execution state, TSC, or APIC base mismatch");
+        checkDecode(3);
+        panic_if(!std::equal(expected_apic.begin(), expected_apic.end(),
+                             std::begin(regs)) ||
+                     ISRV != 64 || IRRV != 97 || !startedUp ||
+                     pendingIPIs != 1 || !pendingSmi || !pendingNmi ||
+                     !pendingExtInt || !pendingInit || !pendingStartup ||
+                     !pendingUnmaskableInt || smiVector != 7 ||
+                     nmiVector != 7 || extIntVector != 7 || initVector != 7 ||
+                     startupVector != 7 || !apicTimerEvent.scheduled() ||
+                     apicTimerEvent.when() != expiration,
+                 "Thread reset modified the interrupt controller");
+    }
+    // Remove synthetic requests before advancing time to check TSC.
+    deschedule(apicTimerEvent);
+    pendingIPIs = 0;
+    regs[APIC_INTERRUPT_COMMAND_LOW] = 0;
+    clearAll();
 }
 
 void

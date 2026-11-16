@@ -41,6 +41,13 @@ namespace gem5::X86ISA
 // adding test accessors to the production interrupt controller.
 class InterruptTester : public Interrupts
 {
+  private:
+    Cycles resetCycle = Cycles(0);
+    void seedInterrupts();
+    void seedThreadReset();
+    void checkThreadReset();
+    void checkDecode(unsigned size);
+
   public:
     explicit InterruptTester(const X86InterruptTesterParams &p) : Interrupts(p)
     {}

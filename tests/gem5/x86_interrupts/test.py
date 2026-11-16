@@ -35,3 +35,25 @@ for scenario in ("clear", "init"):
         valid_isas=(constants.x86_tag, constants.all_compiled_tag),
         length=constants.quick_tag,
     )
+
+for cpu, num_cpus in (
+    ("atomic", 1),
+    ("atomic", 2),
+    ("timing", 1),
+    ("minor", 1),
+    ("o3", 1),
+):
+    gem5_verify_config(
+        name=f"x86-thread-reset-{cpu}-{num_cpus}",
+        config=joinpath(getcwd(), "config.py"),
+        config_args=[
+            "thread-reset",
+            "--cpu",
+            cpu,
+            "--num-cpus",
+            str(num_cpus),
+        ],
+        verifiers=[verifier.MatchRegex("x86 interrupt semantics passed")],
+        valid_isas=(constants.x86_tag, constants.all_compiled_tag),
+        length=constants.quick_tag,
+    )

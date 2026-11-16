@@ -63,6 +63,10 @@ class ISA : public BaseISA
   public:
     void clear() override;
 
+    // Restore a deterministic power-on register baseline. The caller owns
+    // execution status, decoder/MMU reset, and interrupt-controller reset.
+    void resetThread() override;
+
     PCStateBase *
     newPCState(Addr new_inst_addr=0) const override
     {

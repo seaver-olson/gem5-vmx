@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2009 The Regents of The University of Michigan
+ * Copyright (c) 2026 Seaver Olson
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -34,6 +35,7 @@
 #include "arch/x86/regs/float.hh"
 #include "arch/x86/regs/int.hh"
 #include "arch/x86/regs/misc.hh"
+#include "arch/x86/utility.hh"
 #include "base/compiler.hh"
 #include "cpu/base.hh"
 #include "cpu/thread_context.hh"
@@ -146,6 +148,81 @@ ISA::clear()
     // The "bsp" bit will be set when this register is read, since then we'll
     // have a ThreadContext to check the contextId from.
     regVal[misc_reg::ApicBase] = lApicBase;
+}
+
+void
+ISA::resetThread()
+{
+    assert(tc);
+
+    // Keep the simulator's implementation-specific defaults, then override
+    // its boot-time conveniences with RESET values. This is a power-on
+    // baseline, not a model-specific warm reset (Intel SDM Vol. 3A,
+    // Oct. 2024, Table 11-1). INIT and FINIT have different semantics.
+    clear();
+
+    // clearArchRegs() does not clear the same register classes on every
+    // CPU model. Use flat IDs to also clear scratch registers without x87
+    // stack-relative indexing or partial integer-register aliases.
+    for (RegIndex i = 0; i < int_reg::NumRegs; ++i) {
+        tc->setReg(flatIntRegClass[i], RegVal(0));
+    }
+    for (RegIndex i = 0; i < float_reg::NumRegs; ++i) {
+        tc->setReg(flatFloatRegClass[i], RegVal(0));
+    }
+    setRFlags(tc, 2);
+
+    CpuidResult signature;
+    panic_if(!cpuid->doCpuid(tc, FamilyModelStepping, 0, signature),
+             "RESET requires CPUID leaf 1");
+    tc->setReg(int_reg::Rdx, signature.rax);
+
+    regVal[misc_reg::Fcw] = 0x0040;
+    regVal[misc_reg::Ftw] = 0x5555;
+    regVal[misc_reg::Xcr0] = 1;
+    regVal[misc_reg::DefType] = 0;
+
+    // clear() initializes CR0, debug registers, PAT and MXCSR, and zeros
+    // the remaining control, FP metadata and modeled MSR storage. TSC is
+    // stored as a cycle offset, so a raw zero would not reset its value.
+    setMiscReg(misc_reg::Tsc, 0);
+
+    SegAttr data_attr = 0;
+    data_attr.present = 1;
+    data_attr.type = 3; // Read/write, accessed.
+    data_attr.writable = 1;
+    data_attr.readable = 1;
+    data_attr.system = 1;
+    for (int seg = 0; seg < segment_idx::NumIdxs; ++seg) {
+        regVal[misc_reg::segLimit(seg)] = 0xffff;
+        regVal[misc_reg::segAttr(seg)] = data_attr;
+    }
+
+    SegAttr code_attr = data_attr;
+    code_attr.type = 11; // Execute/read, accessed.
+    code_attr.writable = 0;
+    regVal[misc_reg::CsAttr] = code_attr;
+    regVal[misc_reg::Cs] = 0xf000;
+    regVal[misc_reg::CsBase] = 0xffff0000;
+    regVal[misc_reg::CsEffBase] = 0xffff0000;
+
+    // Use gem5's system-segment representation for an empty LDT and TSS.
+    SegAttr ldt_attr = 0;
+    ldt_attr.unusable = 1;
+    ldt_attr.present = 1;
+    ldt_attr.type = 2;
+    regVal[misc_reg::TslAttr] = ldt_attr;
+    SegAttr tr_attr = 0;
+    tr_attr.present = 1;
+    tr_attr.type = 3; // Busy 16-bit TSS.
+    regVal[misc_reg::TrAttr] = tr_attr;
+
+    // Recompute execution mode and update the decoder only after all of
+    // the input registers are installed. Do not retain an INIT halt or
+    // any other microcode continuation. AP startup sequencing belongs to
+    // the complete CPU/platform reset path, not this register-state hook.
+    setMiscReg(misc_reg::M5Reg, 0);
+    tc->pcState(PCState(0xfffffff0));
 }
 
 namespace
