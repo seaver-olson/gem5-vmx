@@ -231,6 +231,7 @@ jobs:
                   build_dir=$(dirname "$BUILD_TARGET")
                   build_config=$(basename "$build_dir")
                   scons defconfig "$build_dir" "build_opts/$build_config"
+                  scons setconfig "$build_dir" USE_TEST_OBJECTS=y
                   scons "$BUILD_TARGET" -j "$(nproc)"
 
             - name: Sanitize build-target for artifact name
