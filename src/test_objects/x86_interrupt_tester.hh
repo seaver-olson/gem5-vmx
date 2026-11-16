@@ -29,6 +29,7 @@
 #ifndef __TEST_OBJECTS_X86_INTERRUPT_TESTER_HH__
 #define __TEST_OBJECTS_X86_INTERRUPT_TESTER_HH__
 
+#include <array>
 #include <string>
 
 #include "arch/x86/interrupts.hh"
@@ -43,9 +44,28 @@ class InterruptTester : public Interrupts
 {
   private:
     Cycles resetCycle = Cycles(0);
+    std::string activeScenario;
+    unsigned resetAttempt = 0;
+
+    void checkValue(const std::string &field, RegVal actual,
+                    RegVal expected) const;
+    void checkMiscReg(RegIndex index, RegVal expected) const;
+    void
+    checkApicRegs(const std::array<uint32_t, NUM_APIC_REGS> &expected) const;
+    void checkInterruptState(Tick expiration, bool pending) const;
+
     void seedInterrupts();
+    void checkClear();
+    void checkEoi();
+    void checkInit();
+    void checkUnsupportedReset();
     void seedThreadReset();
+    void checkThreadSeed();
     void checkThreadReset();
+    void checkResetRegisters();
+    void checkResetSegments();
+    void checkResetExecutionState();
+    void checkResetTsc();
     void checkDecode(unsigned size);
 
   public:

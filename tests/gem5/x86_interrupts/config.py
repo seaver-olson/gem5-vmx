@@ -27,6 +27,7 @@
 """Exercise x86 interrupt and register-reset semantics without a guest."""
 
 import argparse
+import resource
 
 import m5
 from m5.objects import (
@@ -54,11 +55,14 @@ cpu_types = {
 }
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
-    "scenario", choices=("clear", "init", "reset", "thread-reset")
+    "scenario", choices=("clear", "eoi", "init", "reset", "thread-reset")
 )
 parser.add_argument("--cpu", choices=cpu_types, default="atomic")
 parser.add_argument("--num-cpus", type=int, choices=(1, 2), default=1)
 args = parser.parse_args()
+if args.scenario == "reset":
+    # This scenario deliberately aborts; do not leave a simulator core dump.
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 if args.scenario != "thread-reset" and (
     args.cpu != "atomic" or args.num_cpus != 1
 ):

@@ -24,15 +24,22 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-from testlib import *
+import signal
+import subprocess
 
-for scenario in ("clear", "init"):
+from testlib import *
+from testlib.helper import log_call
+
+config_path = joinpath(getcwd(), "config.py")
+isas = (constants.x86_tag, constants.all_compiled_tag)
+
+for scenario in ("clear", "eoi", "init"):
     gem5_verify_config(
         name=f"x86-interrupt-{scenario}",
-        config=joinpath(getcwd(), "config.py"),
+        config=config_path,
         config_args=[scenario],
         verifiers=[verifier.MatchRegex("x86 interrupt semantics passed")],
-        valid_isas=(constants.x86_tag, constants.all_compiled_tag),
+        valid_isas=isas,
         length=constants.quick_tag,
     )
 
@@ -45,7 +52,7 @@ for cpu, num_cpus in (
 ):
     gem5_verify_config(
         name=f"x86-thread-reset-{cpu}-{num_cpus}",
-        config=joinpath(getcwd(), "config.py"),
+        config=config_path,
         config_args=[
             "thread-reset",
             "--cpu",
@@ -54,6 +61,53 @@ for cpu, num_cpus in (
             str(num_cpus),
         ],
         verifiers=[verifier.MatchRegex("x86 interrupt semantics passed")],
-        valid_isas=(constants.x86_tag, constants.all_compiled_tag),
+        valid_isas=isas,
         length=constants.quick_tag,
     )
+
+
+def run_unsupported_reset(params):
+    """Require the abort; a separate verifier checks its exact diagnostic."""
+    fixtures = params.fixtures
+    gem5 = fixtures[constants.gem5_binary_fixture_name].path
+    outdir = fixtures[constants.tempdir_fixture_name].path
+    command = [
+        gem5,
+        "-d",
+        outdir,
+        "-re",
+        "--silent-redirect",
+        config_path,
+        "reset",
+    ]
+    try:
+        log_call(params.log, command, time=params.time)
+    except subprocess.CalledProcessError as error:
+        if error.returncode != -signal.SIGABRT:
+            raise AssertionError(
+                f"APIC RESET: expected SIGABRT ({-signal.SIGABRT}), "
+                f"got return code {error.returncode}; see {outdir}"
+            ) from error
+    else:
+        raise AssertionError("Unsupported APIC RESET unexpectedly succeeded")
+
+
+# gem5_verify_config requires exit status zero, so this negative case uses
+# the same binary/output fixtures with an explicit expected-signal runner.
+for host in constants.supported_hosts:
+    for variant in constants.supported_variants:
+        for isa in isas:
+            name = f"x86-interrupt-reset-{isa}-{host}-{variant}"
+            diagnostic = verifier.MatchRegex(
+                r".*panic: Local APIC RESET is not implemented\.$",
+                match_stdout=False,
+            )
+            TestSuite(
+                name=name,
+                fixtures=[Gem5Fixture(isa, variant), TempdirFixture()],
+                tests=[
+                    TestFunction(run_unsupported_reset, name=name),
+                    diagnostic.instantiate_test(name),
+                ],
+                tags=(isa, host, variant, constants.quick_tag),
+            )
