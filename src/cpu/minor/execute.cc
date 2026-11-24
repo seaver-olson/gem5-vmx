@@ -37,6 +37,7 @@
 
 #include "cpu/minor/execute.hh"
 
+#include <algorithm>
 #include <functional>
 
 #include "cpu/minor/cpu.hh"
@@ -307,8 +308,10 @@ Execute::updateBranchData(
 {
     if (reason != BranchData::NoBranch) {
         /* Bump up the stream sequence number on a real branch*/
-        if (BranchData::isStreamChange(reason))
+        if (BranchData::isStreamChange(reason)) {
             executeInfo[tid].streamSeqNum++;
+            executeInfo[tid].lastSerializeAfter = 0;
+        }
 
         /* Branches (even mis-predictions) don't change the predictionSeqNum,
          *  just the streamSeqNum */
@@ -729,9 +732,11 @@ Execute::issue(ThreadID thread_id)
                             // checks/branches (e.g., a VMX region gate).
                             if (allowEarlyMemIssue &&
                                 !inst->staticInst->isNonSpeculative()) {
-                                inst->instToWaitFor =
-                                    scoreboard[thread_id].execSeqNumToWaitFor(inst,
-                                        cpu.getContext(thread_id));
+                                const auto producer =
+                                    scoreboard[thread_id].execSeqNumToWaitFor(
+                                        inst, cpu.getContext(thread_id));
+                                inst->instToWaitFor = std::max(
+                                    producer, thread.lastSerializeAfter);
 
                                 if (lsq.getLastMemBarrier(thread_id) >
                                     inst->instToWaitFor)
@@ -809,6 +814,14 @@ Execute::issue(ThreadID thread_id)
             {
                 DPRINTF(MinorMem, "Issuing memory barrier inst: %s\n", *inst);
                 lsq.issuedMemBarrierInst(inst);
+            }
+
+            // A younger access can start translation as soon as it leaves
+            // its FU. Wait for the older op to commit its architectural state
+            // and redirect the stream before initiating that access.
+            if (!discarded && inst->isInst() && inst->isLastOpInInst() &&
+                inst->staticInst->isSerializeAfter()) {
+                thread.lastSerializeAfter = inst->id.execSeqNum;
             }
 
             if (inst->traceData && setTraceTimeOnIssue) {

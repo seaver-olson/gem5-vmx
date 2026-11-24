@@ -80,6 +80,13 @@ def main():
                 + (["--caches"] if caches else []),
             )
         )
+    cases.append(
+        (
+            "pae-minor-classic-1",
+            "config.py",
+            ["--cpu", "minor", "--guest", "pae", "--caches"],
+        )
+    )
     for hierarchy in ("l1", "private-l2", "shared-l2"):
         for cpu in ("atomic", "timing", "o3"):
             cases.append(

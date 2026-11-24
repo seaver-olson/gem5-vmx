@@ -9,12 +9,14 @@ Run the CPU/memory/checkpoint/takeover matrix with
 and simulator statistics under `m5out-paging-matrix`. CI runs this job without
 `continue-on-error`; it is independent of the Linux boot job.
 
-The matrix has 58 cases: the original 56 plus cached and uncached MinorCPU
-IA-32e paging runs. Those Minor cases include cold/warm NX at each level,
-nonpresent and reserved-entry fetch faults, CR2/error-code checks, and return
-from the real exception handler. They do not add Minor Ruby or legacy-mode
-coverage. Regenerate measurement baselines for this test set; the ordered
-load before the host-side functional export also changes guest counters.
+The 59-case matrix includes cached and uncached MinorCPU IA-32e paging runs.
+They check cold and warm NX at each level, nonpresent and reserved-entry
+fetch faults, CR2 and error codes, and return from the exception handler.
+A cached MinorCPU run also exercises legacy PAE with early memory issue
+enabled. Its first load after enabling paging reads linear `0x40000000`
+from physical `0x00400000` and checks for `0x12345678`.
+Regenerate measurement baselines for this test set. The ordered load before
+the host-side functional export also changes guest counters.
 
 For a reproducible no-EPT baseline, build the simulator and guests, capture
 provenance into a fresh output directory, run the matrix, and record its

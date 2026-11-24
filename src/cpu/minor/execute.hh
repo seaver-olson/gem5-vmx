@@ -161,13 +161,14 @@ class Execute : public Named
             drainState(NotDraining)
         { }
 
-        ExecuteThreadInfo(const ExecuteThreadInfo& other) :
-            inputIndex(other.inputIndex),
-            lastCommitWasEndOfMacroop(other.lastCommitWasEndOfMacroop),
-            instsBeingCommitted(other.instsBeingCommitted),
-            streamSeqNum(other.streamSeqNum),
-            lastPredictionSeqNum(other.lastPredictionSeqNum),
-            drainState(other.drainState)
+        ExecuteThreadInfo(const ExecuteThreadInfo &other)
+            : inputIndex(other.inputIndex),
+              lastCommitWasEndOfMacroop(other.lastCommitWasEndOfMacroop),
+              instsBeingCommitted(other.instsBeingCommitted),
+              streamSeqNum(other.streamSeqNum),
+              lastSerializeAfter(other.lastSerializeAfter),
+              lastPredictionSeqNum(other.lastPredictionSeqNum),
+              drainState(other.drainState)
         { }
 
         /** In-order instructions either in FUs or the LSQ */
@@ -193,6 +194,9 @@ class Execute : public Named
          *  For any more complicated behaviour (e.g. speculation) there'll need
          *  to be another plan. */
         InstSeqNum streamSeqNum;
+
+        /** Last issued serializing instruction in this thread's stream. */
+        InstSeqNum lastSerializeAfter = 0;
 
         /** A prediction number for use where one isn't available from an
          *  instruction.  This is harvested from committed instructions.
