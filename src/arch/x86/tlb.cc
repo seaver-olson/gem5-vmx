@@ -56,7 +56,8 @@ TLB::TLB(const Params &p)
       size(p.size),
       tlb(size),
       lruSeq(0),
-      stats(this)
+      stats(this),
+      combinedStats(this)
 {
     if (!size)
         fatal("TLBs must have a non-zero size.\n");
@@ -71,6 +72,46 @@ TLB::TLB(const Params &p)
 
     walker = p.walker;
     walker->setTLB(this);
+}
+
+TLB::CombinedStats::CombinedStats(statistics::Group *parent)
+    : statistics::Group(parent, "combined"),
+      ADD_STAT(readHits, statistics::units::Count::get(), "Usable read hits"),
+      ADD_STAT(writeHits, statistics::units::Count::get(),
+               "Usable write hits"),
+      ADD_STAT(executeHits, statistics::units::Count::get(),
+               "Usable fetch hits"),
+      ADD_STAT(misses, statistics::units::Count::get(), "No covering entry"),
+      ADD_STAT(
+          permissionFallbacks, statistics::units::Count::get(),
+          "Matching entries requiring permission checks on the slow path"),
+      ADD_STAT(dirtyFallbacks, statistics::units::Count::get(),
+               "Permitted accesses requiring a dirty update"),
+      ADD_STAT(evictions, statistics::units::Count::get(),
+               "Capacity evictions"),
+      ADD_STAT(timingCompletions, statistics::units::Count::get(),
+               "Successful timing translations involving a walk"),
+      ADD_STAT(
+          timingTicks, statistics::units::Tick::get(),
+          "Total latency of successful timing translations involving a walk")
+{}
+
+void
+TLB::CombinedStats::hit(BaseMMU::Mode mode)
+{
+    switch (mode) {
+        case BaseMMU::Read:
+            ++readHits;
+            break;
+        case BaseMMU::Write:
+            ++writeHits;
+            break;
+        case BaseMMU::Execute:
+            ++executeHits;
+            break;
+        default:
+            panic("Unknown combined translation access");
+    }
 }
 
 void

@@ -33,6 +33,7 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     System *system;
     const bool transportCases;
     const bool eptOnly;
+    const bool combinedCases;
     Tick observedAtomicLatency = 0;
     class Upstream : public ResponsePort
     {
@@ -69,6 +70,7 @@ class PagingTester : public SimObject, public BaseMMU::Translation
     std::function<void()> squash;
     std::function<void(PacketPtr)> inspectAttributes;
     std::function<void(PacketPtr)> inspectResponse;
+    std::function<bool(PacketPtr)> holdResponse;
     EventFunctionWrapper retryEvent;
     ThreadContext *tc = nullptr;
     MMU *mmu = nullptr;
@@ -100,7 +102,16 @@ class PagingTester : public SimObject, public BaseMMU::Translation
                          TableRead, TableUpdate, DirtyUpdate, DataMisconfig,
                          TableMisconfig, GuestFault, Replace, Remap,
                          InheritedWrite, Rmw };
-    void setupEpt(bool presetAD, bool eptAD = false);
+    void setupEpt(bool presetAD, bool eptAD = false, bool largeGuest = false);
+    void buildCombinedCases();
+    void setupCombined(bool large = false, bool ept_ad = true);
+    void combinedByte(const char *label, Addr va, Addr hpa, uint8_t data,
+                      unsigned guest_reads, unsigned ept_reads,
+                      BaseMMU::Mode mode = BaseMMU::Read, bool rmw = false,
+                      bool uncached = false);
+    void combinedDenied(bool execute);
+    void combinedDirty(bool guest_dirty, bool ept_ad, bool rmw);
+    void combinedRace();
     void finishEpt();
     void eptMmuCases();
     void eptMemoryTypeCase(unsigned scenario, BaseMMU::Mode mode,

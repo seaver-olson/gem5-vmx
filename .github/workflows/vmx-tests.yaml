@@ -133,6 +133,8 @@ jobs:
               run: python3 tests/gem5/x86_paging/run.py
             - name: Run shared paging transport and lifecycle regressions
               run: python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
+            - name: Validate the combined translation cache and study workloads
+              run: python3 tests/gem5/x86_paging/run.py --combined-only --outdir m5out-combined
             - name: Run memory-backed EPT walker regressions
               run: python3 tests/gem5/x86_paging/run.py --ept-only --outdir m5out-ept-walker
             - name: Run native VMX operand regressions
@@ -162,6 +164,7 @@ jobs:
                       m5out-paging-matrix/source.tar.gz
                       m5out-paging-transport/
                       m5out-ept-walker/
+                      m5out-combined/
                       m5out-vmx-operands/
                       m5out-vmx-msrs/
                       m5out-vmresume/

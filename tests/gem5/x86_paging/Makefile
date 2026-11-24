@@ -2,7 +2,7 @@ CC ?= gcc
 CFLAGS = -O2 -g -ffreestanding -fno-pie -fno-stack-protector -mno-red-zone -mgeneral-regs-only -Wall -Wextra -Werror
 
 .PHONY: all
-all: vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
+all: translation_study.elf vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
     vmx_address.elf vmx_migrate.elf vmx_msrs.elf \
     paging.elf legacy.elf pae.elf gdb.elf se-context-1 se-context-2
 
@@ -26,7 +26,7 @@ host_faults: host_faults.c
 
 .PHONY: clean
 clean:
-	$(RM) vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
+	$(RM) translation_study.elf vmx_operands.elf vmresume.elf ept_entry.elf vmx_transition.elf vmx_nmi.elf \
 	    vmx_address.elf vmx_migrate.elf vmx_msrs.elf \
 	    paging.elf legacy.elf pae.elf gdb.elf host_faults \
 	    se-context-1 se-context-2
@@ -39,6 +39,9 @@ vmresume.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
 
 ept_entry.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
 	$(CC) $(CFLAGS) -DEPT_ENTRY_TEST -nostdlib -static -no-pie -Wl,-T,link.ld -o $@ vmresume.S vmresume.c
+
+translation_study.elf: translation_study.S translation_study.c vmresume.S vmresume.c vmx_operands.S entry.S link.ld
+	$(CC) $(CFLAGS) -nostdlib -static -no-pie -Wl,-T,link.ld -o $@ translation_study.S translation_study.c
 
 vmx_transition.elf: vmresume.S vmresume.c vmx_operands.S entry.S link.ld
 	$(CC) $(CFLAGS) -DVMX_TRANSITION_TEST -nostdlib -static -no-pie \

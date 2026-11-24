@@ -5,15 +5,24 @@
 #include <functional>
 #include <vector>
 
+#include "base/statistics.hh"
 #include "mem/qport.hh"
 
 namespace gem5
 {
+class SimObject;
 namespace X86ISA
 {
 
 // Raw attributes of the structure referring to a guest descriptor. These
 // survive transport without conflating PWT with the current cache model.
+enum class PagingStage
+{
+    Other,
+    Guest,
+    Ept
+};
+
 struct PagingAttributes
 {
     bool pwt = false;
@@ -33,11 +42,16 @@ class PagingPort : public QueuedRequestPort
     struct SenderState : Packet::SenderState
     {
         PagingAttributes attributes;
+        PagingStage stage;
         Valid valid;
         Completion completion;
-        SenderState(PagingAttributes attrs, Valid check, Completion done)
-            : attributes(attrs), valid(std::move(check)),
-              completion(std::move(done)) {}
+        SenderState(PagingAttributes attrs, PagingStage stage, Valid check,
+                    Completion done)
+            : attributes(attrs),
+              stage(stage),
+              valid(std::move(check)),
+              completion(std::move(done))
+        {}
     };
 
     class RequestQueue : public ReqPacketQueue
@@ -64,11 +78,21 @@ class PagingPort : public QueuedRequestPort
     bool recvTimingResp(PacketPtr packet) override;
 
   public:
-    PagingPort(const std::string &name, EventManager &em,
+    struct Traffic : public statistics::Group
+    {
+        explicit Traffic(statistics::Group *parent);
+        statistics::Scalar guestReads, eptReads, guestUpdates, eptUpdates;
+        statistics::Scalar retries;
+        void accepted(PagingStage stage, bool update);
+    } traffic;
+
+    PagingPort(const std::string &name, SimObject &owner,
                std::function<void()> idle);
     void submit(PacketPtr packet, Valid valid, Completion completion,
-                PagingAttributes attributes = {});
-    Tick sendAtomic(PacketPtr packet, PagingAttributes attributes = {});
+                PagingAttributes attributes = {},
+                PagingStage stage = PagingStage::Other);
+    Tick sendAtomic(PacketPtr packet, PagingAttributes attributes = {},
+                    PagingStage stage = PagingStage::Other);
     void sendFunctional(PacketPtr packet, PagingAttributes attributes = {});
     static PagingAttributes attributes(PacketPtr packet)
     {

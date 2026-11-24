@@ -539,3 +539,47 @@ virtual layouts match. Each must observe its own code/data and produce its
 own expected output. The pre-repair cache reduced both IDs to the same PCID;
 the regression reproduced incorrect data in both processes. This is SE SMT
 coverage; full-system O3 currently rejects multiple hardware threads.
+
+## Combined guest and EPT translation measurements
+
+```sh
+scons build/X86/gem5.opt build/X86/arch/x86/combined_tlb.test.opt -j5
+build/X86/arch/x86/combined_tlb.test.opt
+python3 tests/gem5/x86_paging/run.py --combined-only --outdir m5out-combined
+```
+
+`--combined-entries N` sets the number of fully associative LRU entries
+per x86 TLB object. The default is zero. `config.py` shares one object
+between instruction fetches and data accesses. On a usable hit the MMU
+translates inline, with zero additional lookup cycles. Architectural
+invalidations conservatively discard combined translations. The benchmark
+keeps EPT mappings static while the guest runs. Its research reset drains
+the machine and invokes `flushTLBs()` on the participating CPU. Apply this
+flush to every participating CPU if extending the experiment to more cores.
+
+The atomic and timing fixtures compare accepted descriptor packets with
+independent port observations and check the byte returned by the final
+load. With A/D preset and four-level, 4 KiB EPT mappings throughout, a
+cold 4 KiB guest load reads 4 guest and 20 EPT descriptors. Repeating it
+with only the guest TLB warm requires 0 and 4. A usable combined entry
+requires 0 and 0. A cold 2 MiB guest mapping requires 3 and 16. Separate
+VM-entry runs execute a split two-byte load, revoke access to the second
+subpage, and compare the bytes, faulting GPA and exit qualification at zero
+and 64 entries.
+
+Each benchmark arm runs the same 4,096 dependent loads on TimingSimple
+with Classic caches and a 64-entry guest TLB. A seeded shuffle places
+one node on each of 32 or 128 distinct 4 KiB pages. The guest verifies
+the links before measurement and checks a rolling checksum afterward.
+The harness drains at the start marker and flushes translations once.
+Memory caches retain their warm-up state, and all later laps retain
+translation state. Register-only instructions at the markers allow the
+CPU to drain without consuming a loop load or a result store.
+
+`measurements.json` records simulated ticks, cache capacities, loop
+fingerprints and counters from the measured interval. `combined.readHits`
+counts data reads and `combined.executeHits` counts fetches. Guest TLB hits
+count accesses that reach the guest TLB. Descriptor reads, capacity
+evictions and timing-walk totals include instruction and data translations.
+A/D update requests and rejected sends have separate counters. Per-case
+simulator commands, logs and full statistics are in the same output tree.

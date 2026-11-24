@@ -131,6 +131,14 @@ namespace X86ISA
         } stats;
 
       public:
+        struct CombinedStats : public statistics::Group
+        {
+            explicit CombinedStats(statistics::Group *parent);
+            statistics::Scalar readHits, writeHits, executeHits, misses;
+            statistics::Scalar permissionFallbacks, dirtyFallbacks, evictions;
+            statistics::Scalar timingCompletions, timingTicks;
+            void hit(BaseMMU::Mode mode);
+        } combinedStats;
 
         void recordAccess(BaseMMU::Mode mode);
         void recordMiss(BaseMMU::Mode mode);

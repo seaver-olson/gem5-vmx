@@ -25,6 +25,7 @@ def main():
     )
     parser.add_argument("--vmx-operands-only", action="store_true")
     parser.add_argument("--vmx-msrs-only", action="store_true")
+    parser.add_argument("--combined-only", action="store_true")
     parser.add_argument(
         "--ept-only",
         action="store_true",
@@ -38,6 +39,7 @@ def main():
                 args.vmx_operands_only,
                 args.ept_only,
                 args.vmx_msrs_only,
+                args.combined_only,
             )
         )
         > 1
@@ -500,6 +502,67 @@ def main():
                         + (["--no-snoop-filter"] if broadcast else []),
                     )
                 )
+    if args.combined_only:
+        cases = []
+        for cpu in ("atomic", "timing"):
+            base = ["--cpu", cpu, "--caches"]
+            for size in (0, 2):
+                cases.append(
+                    (
+                        f"fixture-{cpu}-{size}",
+                        "config.py",
+                        base
+                        + [
+                            "--combined-fixture",
+                            "--combined-entries",
+                            str(size),
+                        ],
+                    )
+                )
+            for size in (0, 64):
+                cases.append(
+                    (
+                        f"split-{cpu}-{size}",
+                        "config.py",
+                        base
+                        + [
+                            "--guest",
+                            "translation_study",
+                            "--guest-entries",
+                            "4",
+                            "--combined-entries",
+                            str(size),
+                        ],
+                    )
+                )
+            cases.append(
+                (
+                    f"entry-{cpu}",
+                    "config.py",
+                    base
+                    + ["--guest", "ept_entry", "--combined-entries", "64"],
+                )
+            )
+        for pages in (32, 128):
+            for arm in ("native", "ept-0", "ept-64"):
+                cases.append(
+                    (
+                        f"bench-{pages}-{arm}",
+                        "config.py",
+                        [
+                            "--cpu",
+                            "timing",
+                            "--caches",
+                            "--guest",
+                            "translation_study",
+                            "--benchmark-pages",
+                            str(pages),
+                            "--combined-entries",
+                            "64" if arm == "ept-64" else "0",
+                        ]
+                        + (["--benchmark-native"] if arm == "native" else []),
+                    )
+                )
     for name, script, options in cases:
         output = args.outdir / name
         output.mkdir(parents=True, exist_ok=True)
@@ -560,7 +623,12 @@ def main():
             f'{name}: {"PASS" if status == 0 else f"FAIL ({status})"}',
             flush=True,
         )
-    return int(any(result["status"] != 0 for result in results))
+    failed = any(result["status"] != 0 for result in results)
+    if args.combined_only and not failed:
+        from study_results import report
+
+        report(args.outdir)
+    return int(failed)
 
 
 if __name__ == "__main__":

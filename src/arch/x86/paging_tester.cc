@@ -44,9 +44,13 @@ class TestContinuation : public BaseMMU::Translation
 } // anonymous namespace
 
 PagingTester::PagingTester(const X86PagingTesterParams &p)
-    : SimObject(p), system(p.system), transportCases(p.transport_cases),
+    : SimObject(p),
+      system(p.system),
+      transportCases(p.transport_cases),
       eptOnly(p.ept_only),
-      upstream(*this), downstream(*this),
+      combinedCases(p.combined_cases),
+      upstream(*this),
+      downstream(*this),
       retryEvent([this] { upstream.sendRetryReq(); }, name() + ".retry"),
       nextEvent([this] { next(); }, name() + ".next")
 {
@@ -118,6 +122,9 @@ bool
 PagingTester::Downstream::recvTimingResp(PacketPtr pkt)
 {
     panic_if(!owner.pendingPackets, "Unowned fixture response");
+    if (owner.holdResponse && owner.holdResponse(pkt)) {
+        return true;
+    }
     --owner.pendingPackets;
     if (owner.inspectResponse)
         owner.inspectResponse(pkt);
@@ -232,7 +239,9 @@ PagingTester::startup()
         thread->suspend();
     mmu = static_cast<MMU *>(tc->getMMUPtr());
     tlb = static_cast<TLB *>(mmu->dtb);
-    if (eptOnly) {
+    if (combinedCases) {
+        buildCombinedCases();
+    } else if (eptOnly) {
         cases.emplace_back([this] {
             eptCases();
             schedule(nextEvent, curTick() + 1);

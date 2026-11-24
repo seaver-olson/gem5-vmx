@@ -1,6 +1,7 @@
 """Disk-free x86 paging regression using real CPU and walker ports."""
 
 import argparse
+import struct
 from pathlib import Path
 
 import m5
@@ -25,6 +26,11 @@ parser.add_argument(
     "--cpu", choices=["atomic", "timing", "o3", "minor"], default="atomic"
 )
 parser.add_argument("--caches", action="store_true")
+parser.add_argument("--combined-entries", type=int, default=0)
+parser.add_argument("--guest-entries", type=int, default=64)
+parser.add_argument("--combined-fixture", action="store_true")
+parser.add_argument("--benchmark-pages", type=int, choices=(32, 128))
+parser.add_argument("--benchmark-native", action="store_true")
 parser.add_argument(
     "--direct-walker",
     action="store_true",
@@ -54,6 +60,7 @@ parser.add_argument(
         "vmx_operands",
         "vmresume",
         "ept_entry",
+        "translation_study",
         "vmx_transition",
         "vmx_nmi",
         "vmx_address",
@@ -113,6 +120,14 @@ parser.add_argument(
     help="Run standalone EPT walker tests in all memory modes",
 )
 args = parser.parse_args()
+if args.combined_entries < 0 or args.guest_entries < 1:
+    parser.error("invalid TLB capacity")
+if args.benchmark_native and not args.benchmark_pages:
+    parser.error("--benchmark-native requires --benchmark-pages")
+if args.benchmark_pages and args.guest != "translation_study":
+    parser.error("--benchmark-pages requires the translation_study guest")
+if args.combined_fixture and args.combined_entries not in (0, 2):
+    parser.error("the replacement fixture needs zero or two combined entries")
 if args.vmx_high_memory and (
     (args.physical_bits != 52 and not args.restore)
     or args.guest != "vmx_address"
@@ -153,7 +168,7 @@ for instruction in ("vmresume", "vmlaunch"):
             f"--{instruction}-latency requires O3, no CPU switch, "
             "and >= 1 cycle"
         )
-args.fixture |= args.transport or args.ept_only
+args.fixture |= args.transport or args.ept_only or args.combined_fixture
 root = Root(full_system=True)
 root.system = system = System()
 system.clk_domain = SrcClockDomain(
@@ -208,6 +223,8 @@ else:
     system.cpu.icache_port = system.membus.cpu_side_ports
     system.cpu.dcache_port = system.membus.cpu_side_ports
 # Deliberately share the TLB: a data fill must also enforce fetch permissions.
+system.cpu.mmu.dtb.size = args.guest_entries
+system.cpu.mmu.dtb.combined_entries = args.combined_entries
 system.cpu.mmu.itb = system.cpu.mmu.dtb
 if args.caches and not args.direct_walker:
     system.walkcache = Cache(
@@ -238,6 +255,8 @@ if args.switch_to:
         "timing": TimingSimpleCPU,
         "o3": DerivO3CPU,
     }[args.switch_to](cpu_id=0, switched_out=True)
+    system.switch_cpu.mmu.dtb.size = args.guest_entries
+    system.switch_cpu.mmu.dtb.combined_entries = args.combined_entries
     system.switch_cpu.mmu.itb = system.switch_cpu.mmu.dtb
     system.switch_cpu.createThreads()
     system.switch_cpu.isa[0].LongModeAddressSize = address_sizes
@@ -255,7 +274,11 @@ if args.gdb_socket:
     system.workload.remote_gdb_port = args.gdb_socket
     system.workload.wait_for_remote_gdb = True
 input_file = Path(m5.options.outdir) / "functional-input.bin"
-input_file.write_bytes(bytes.fromhex("0011223344556677"))
+if args.guest == "translation_study":
+    arm = (1 if args.benchmark_native else 2) if args.benchmark_pages else 0
+    input_file.write_bytes(struct.pack("<QQ", arm, args.benchmark_pages or 0))
+else:
+    input_file.write_bytes(bytes.fromhex("0011223344556677"))
 system.readfile = str(input_file)
 if args.fixture:
     if args.cpu not in ("atomic", "timing"):
@@ -263,7 +286,10 @@ if args.fixture:
     from m5.objects import X86PagingTester
 
     system.paging_tester = X86PagingTester(
-        system=system, transport_cases=args.transport, ept_only=args.ept_only
+        system=system,
+        transport_cases=args.transport,
+        ept_only=args.ept_only,
+        combined_cases=args.combined_fixture,
     )
     system.cpu.mmu.dtb.walker.port.splice(
         system.paging_tester.cpu_side, system.paging_tester.mem_side
@@ -283,6 +309,20 @@ if args.switch_to and args.guest not in ("pae", "vmx_transition"):
     m5.switchCpus(system, [(system.cpu, system.switch_cpu)])
 # Each exit reports a test ID in its code. Zero is a complete pass.
 event = m5.simulate(10_000_000_000)
+if args.benchmark_pages:
+    if event.getCause() != "m5_exit instruction encountered":
+        raise RuntimeError(f"Missing start marker: {event.getCause()}")
+    m5.drain()
+    system.cpu.flushTLBs()  # This harness has one participating CPU.
+    m5.stats.reset()
+    start = m5.curTick()
+    event = m5.simulate(10_000_000_000)
+    if event.getCause() != "m5_exit instruction encountered":
+        raise RuntimeError(f"Missing end marker: {event.getCause()}")
+    m5.drain()
+    print(f"TRANSLATION ROI ticks={m5.curTick() - start}")
+    m5.stats.dump()
+    event = m5.simulate(10_000_000_000)
 if (
     args.guest == "vmx_transition"
     or (args.guest == "vmx_address" and args.vmx_high_memory)

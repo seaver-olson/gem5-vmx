@@ -184,6 +184,7 @@ class MMU::WalkContinuation :
     ThreadContext *tc;
     Translation *translation;
     const TranslationContextPtr snapshot;
+    const Tick start = curTick();
     bool completed = false;
 
   public:
@@ -245,6 +246,10 @@ class MMU::WalkContinuation :
     {
         assert(!completed);
         completed = true;
+        if (!fault) {
+            ++cache.combinedStats.timingCompletions;
+            cache.combinedStats.timingTicks += curTick() - start;
+        }
         translation->finish(fault, req, tc, snapshot->originalMode);
     }
 
@@ -605,7 +610,12 @@ MMU::translate(const RequestPtr &req,
                     const bool needs_dirty =
                         (mode == BaseMMU::Write && !hit->guestDirty) ||
                         (access == EptAccess::Write && !hit->eptDirtyReady);
-                    if (!denied && !needs_dirty) {
+                    if (denied) {
+                        ++cache.combinedStats.permissionFallbacks;
+                    } else if (needs_dirty) {
+                        ++cache.combinedStats.dirtyFallbacks;
+                    } else {
+                        cache.combinedStats.hit(mode);
                         req->setPaddr(hit->hostBase |
                                       (vaddr & mask(hit->shift)));
                         applyFinalType(req, cr0,
@@ -614,6 +624,8 @@ MMU::translate(const RequestPtr &req,
                                        hit->ignorePat, access);
                         return finalizePhysical(req, tc, mode);
                     }
+                } else {
+                    ++cache.combinedStats.misses;
                 }
             }
 
@@ -839,7 +851,9 @@ MMU::finishEpt(const RequestPtr &req, const TranslationContext &context,
         entry.eptDirtyReady = !input.config.accessedDirty ||
                               bits(result.entry, 9) ||
                               input.access == EptAccess::Write;
-        cache.combined.insert(entry);
+        if (cache.combined.insert(entry)) {
+            ++cache.combinedStats.evictions;
+        }
     }
     return fault;
 }

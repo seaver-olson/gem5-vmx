@@ -1183,9 +1183,17 @@ test_vmx_nmi(uint64_t host_cr3)
 }
 #endif
 
+#ifdef TRANSLATION_STUDY
+static void study_prepare(void);
+static void study_guest(void);
+#endif
+
 void
 paging_test(void)
 {
+#ifdef TRANSLATION_STUDY
+    study_prepare();
+#endif
     // Catch #UD before VMXON; unexpected faults must fail, not time out. (i
     // need to not forget to time this outcome as well)
     for (unsigned v = 0; v < 256; ++v) {
@@ -1269,7 +1277,9 @@ paging_test(void)
     field(0x6c0c, gdtr.base);
     field(0x6c0e, idtr.base);
 
-#ifdef EPT_ENTRY_TEST
+#if defined(TRANSLATION_STUDY)
+    study_guest();
+#elif defined(EPT_ENTRY_TEST)
     test_ept_entry(cr3);
 #elif defined(VMX_TRANSITION_TEST)
     test_vmx_transition(cr0, cr3, cr4, pointer);

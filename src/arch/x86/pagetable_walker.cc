@@ -151,13 +151,17 @@ Walker::recvPacket(WalkerState *state, PacketPtr pkt, bool cancelled)
 void
 Walker::sendTiming(WalkerState *state, PacketPtr pkt)
 {
-    state->snapshot->port->submit(pkt,
-        [state] { return !state->obsolete() &&
-                        !state->completion->squashed(); },
+    state->snapshot->port->submit(
+        pkt,
+        [state] {
+            return !state->obsolete() && !state->completion->squashed();
+        },
         [this, state](PacketPtr response, bool cancelled) {
             recvPacket(state, response, cancelled);
-        }, pkt->req->isAtomicReturn() ? state->updateAttributes :
-                                       state->readAttributes);
+        },
+        pkt->req->isAtomicReturn() ? state->updateAttributes
+                                   : state->readAttributes,
+        PagingStage::Guest);
 }
 
 void
@@ -323,7 +327,8 @@ Walker::WalkerState::startWalk()
                 endWalk();
                 break;
             }
-            snapshot->port->sendAtomic(read, readAttributes);
+            snapshot->port->sendAtomic(read, readAttributes,
+                                       PagingStage::Guest);
             PacketPtr write = NULL;
             fault = stepWalk(write);
             assert(fault == NoFault || read == NULL);
@@ -332,7 +337,8 @@ Walker::WalkerState::startWalk()
             if (write) {
                 fault = translatePacket(write, EptAccess::Write);
                 if (fault == NoFault) {
-                    snapshot->port->sendAtomic(write, updateAttributes);
+                    snapshot->port->sendAtomic(write, updateAttributes,
+                                               PagingStage::Guest);
                     finishUpdate(write);
                 }
                 delete write;

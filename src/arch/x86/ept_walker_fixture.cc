@@ -77,9 +77,9 @@ checkResult(const ept::WalkResult &actual, const ept::WalkResult &expected,
 } // anonymous namespace
 
 void
-PagingTester::setupEpt(bool presetAD, bool eptAD)
+PagingTester::setupEpt(bool presetAD, bool eptAD, bool largeGuest)
 {
-    setup(Long);
+    setup(Long, largeGuest);
     std::array<uint8_t, 4 * 4096> zero{};
     system->physProxy.writeBlob(EptRoot, zero.data(), zero.size());
     system->physProxy.writeBlob(HostTables, zero.data(), zero.size());
@@ -92,8 +92,9 @@ PagingTester::setupEpt(bool presetAD, bool eptAD)
     system->physProxy.write<uint64_t>(EptDataLeaf,
         HostData | 7 | (6ULL << 3) | 128, ByteOrder::little);
     for (unsigned level = 0; level < descriptors.size(); ++level) {
-        const auto value = descriptor(level) | (presetAD ? 32 : 0) |
-            (presetAD && level == 3 ? 64 : 0);
+        const auto value =
+            descriptor(level) | (presetAD ? 32 : 0) |
+            (presetAD && level + 1 == descriptors.size() ? 64 : 0);
         const Addr host = HostTables + level * 4096 +
             (descriptors[level] & 4095);
         descriptor(level, 0); // Direct GPA reads must not accidentally work.
@@ -115,6 +116,379 @@ PagingTester::setupEpt(bool presetAD, bool eptAD)
     tc->setMiscRegNoEffect(misc_reg::VmxEptVpidCap, caps);
     isa->vmxState().activeEptConfig =
         *ept::decodeEptp(EptRoot | (3 << 3) | 6 | (eptAD ? 64 : 0), caps, 48);
+}
+
+// Unlike the standalone large-leaf fixture, every translation of a GPA
+// here requires four EPT descriptors, including the final data lookup.
+constexpr Addr DataPtes = EptRoot + 4 * 4096;
+
+void
+PagingTester::setupCombined(bool large, bool ept_ad)
+{
+    setupEpt(true, ept_ad, large);
+    auto &mem = system->physProxy;
+    const auto set = [&](Addr addr, uint64_t flags) {
+        mem.write<uint64_t>(
+            addr, mem.read<uint64_t>(addr, ByteOrder::little) | flags,
+            ByteOrder::little);
+    };
+    set(EptRoot, 0x100);
+    set(EptRoot + 4096, 0x100);
+    set(EptRoot + 8192 + 8 * (Tables >> 21), 0x100);
+    mem.write<uint64_t>(EptDataLeaf, DataPtes | 0x107, ByteOrder::little);
+    for (unsigned i = 0; i < 4; ++i) {
+        set(EptTableLeaves + 8 * i, 0x300);
+        mem.write<uint64_t>(DataPtes + 8 * i, (HostData + i * 4096) | 0x337,
+                            ByteOrder::little);
+        mem.write<uint8_t>(HostData + i * 4096 + (Virtual & 4095), 0x90 + i);
+        if (!large) {
+            mem.write<uint64_t>(descriptors.back() + 8 * i,
+                                (Physical + i * 4096) | 0x67,
+                                ByteOrder::little);
+        }
+    }
+}
+
+void
+PagingTester::combinedByte(const char *label, Addr va, Addr hpa, uint8_t data,
+                           unsigned guest_reads, unsigned ept_reads,
+                           BaseMMU::Mode mode, bool rmw, bool uncached)
+{
+    auto &port = tlb->getWalker()->pagingPort();
+    const auto before_guest = port.traffic.guestReads.value();
+    const auto before_ept = port.traffic.eptReads.value();
+    const Tick start = curTick();
+    // Observe disjoint physical ranges independently of the producer's
+    // stage tags. Timing responses correspond to accepted requests.
+    auto observed = std::make_shared<std::array<unsigned, 3>>();
+    auto observe = [=](PacketPtr pkt) {
+        if (pkt->req->isAtomicReturn()) {
+            return;
+        }
+        const Addr addr = pkt->getAddr();
+        if (addr >= HostTables && addr < HostTables + 4 * 4096) {
+            ++(*observed)[0];
+        } else if (addr >= EptRoot && addr < DataPtes + 4096) {
+            ++(*observed)[1];
+        } else if (addr == hpa) {
+            ++(*observed)[2];
+        }
+    };
+    if (system->isTimingMode()) {
+        inspectResponse = observe;
+    } else {
+        inspectAttributes = observe;
+    }
+    auto flags = accessFlags;
+    if (rmw) {
+        flags.set(Request::READ_MODIFY_WRITE);
+    }
+    auto req = std::make_shared<Request>(
+        va, 1, flags, system->getRequestorId(this), va, tc->contextId());
+    auto translated = [=, &port, this](const Fault &fault,
+                                       const RequestPtr &out, ThreadContext *,
+                                       BaseMMU::Mode) {
+        panic_if(fault || out->getPaddr() != hpa,
+                 "%s: wrong final mapping at %#x", label, va);
+        const auto type = uncached ? paging::MemoryType::Uncacheable
+                                   : paging::MemoryType::WriteBack;
+        panic_if(out->memoryType() != type ||
+                     out->isUncacheable() != uncached ||
+                     bool(out->getFlags() & Request::STRICT_ORDER) != uncached,
+                 "%s: incorrect final memory attributes", label);
+        const bool write = mode == BaseMMU::Write;
+        auto *pkt = write ? Packet::createWrite(out) : Packet::createRead(out);
+        pkt->allocate();
+        if (write) {
+            pkt->setLE<uint8_t>(data);
+        }
+        auto done = [=, &port, this](PacketPtr response, bool cancelled) {
+            panic_if(cancelled || response->isError(), "%s: data fault",
+                     label);
+            const auto byte = write ? system->physProxy.read<uint8_t>(hpa)
+                                    : response->getLE<uint8_t>();
+            const unsigned g = port.traffic.guestReads.value() - before_guest;
+            const unsigned e = port.traffic.eptReads.value() - before_ept;
+            panic_if(g != guest_reads || e != ept_reads ||
+                         (*observed)[0] != g || (*observed)[1] != e ||
+                         (*observed)[2] != 1 || byte != data,
+                     "%s: reads %u/%u (port %u/%u), data packets %u, byte %#x;"
+                     " expected %u/%u, one packet, %#x",
+                     label, g, e, (*observed)[0], (*observed)[1],
+                     (*observed)[2], byte, guest_reads, ept_reads, data);
+            inform("Combined %s guest=%u ept=%u byte=%#x ticks=%llu", label, g,
+                   e, byte, curTick() - start);
+            delete response;
+            inspectAttributes = {};
+            inspectResponse = {};
+            awaiting = false;
+            schedule(nextEvent, curTick() + 1);
+        };
+        if (system->isTimingMode()) {
+            port.submit(pkt, [] { return true; }, done);
+        } else {
+            port.sendAtomic(pkt);
+            done(pkt, false);
+        }
+    };
+    awaiting = true;
+    if (system->isTimingMode()) {
+        auto cb = std::make_unique<EptTranslation>(translated);
+        auto *raw = cb.get();
+        continuations.push_back(std::move(cb));
+        mmu->translateTiming(req, tc, raw, mode);
+    } else {
+        translated(mmu->translateAtomic(req, tc, mode), req, tc, mode);
+    }
+}
+
+void
+PagingTester::combinedDirty(bool guest_dirty, bool ept_ad, bool rmw)
+{
+    const Addr hpa = HostData + (Virtual & 4095);
+    auto &traffic = tlb->getWalker()->pagingPort().traffic;
+    auto before = std::make_shared<std::array<statistics::Counter, 2>>();
+    cases.emplace_back([=, this] {
+        setupCombined(false, ept_ad);
+        if (!guest_dirty) {
+            descriptor(3, descriptor(3) & ~64ULL);
+        }
+        if (guest_dirty) {
+            system->physProxy.write<uint64_t>(DataPtes, HostData | 0x137,
+                                              ByteOrder::little);
+        }
+        combinedByte("prime dirty case", Virtual, hpa, 0x90, 4, 20);
+    });
+    cases.emplace_back([=, &traffic, this] {
+        *before = {traffic.guestUpdates.value(), traffic.eptUpdates.value()};
+        const unsigned ept_reads = !guest_dirty ? 24 : ept_ad ? 4 : 0;
+        combinedByte("first write access", Virtual, hpa, rmw ? 0x90 : 0xa5,
+                     guest_dirty ? 0 : 4, ept_reads,
+                     rmw ? BaseMMU::Read : BaseMMU::Write, rmw);
+    });
+    cases.emplace_back([=, &traffic, this] {
+        const auto raw =
+            system->physProxy.read<uint64_t>(DataPtes, ByteOrder::little);
+        panic_if(!(descriptor(3) & 64) || bool(raw & 0x200) != ept_ad,
+                 "Wrong guest/EPT dirty readiness after first write");
+        panic_if(traffic.guestUpdates.value() - (*before)[0] != !guest_dirty ||
+                     traffic.eptUpdates.value() - (*before)[1] !=
+                         (guest_dirty && ept_ad),
+                 "First write charged the wrong guest/EPT A/D updates");
+        combinedByte("ready write", Virtual, hpa, 0x5a, 0, 0, BaseMMU::Write);
+    });
+    cases.emplace_back([this] { finishEpt(); });
+}
+
+void
+PagingTester::combinedDenied(bool execute)
+{
+    auto flags = accessFlags;
+    flags.set(execute ? Request::INST_FETCH : Request::READ_MODIFY_WRITE);
+    const auto mode = execute ? BaseMMU::Execute : BaseMMU::Read;
+    auto req = std::make_shared<Request>(Virtual, 1, flags,
+                                         system->getRequestorId(this), Virtual,
+                                         tc->contextId());
+    const auto fallbacks = tlb->combinedStats.permissionFallbacks.value();
+    auto done = [=, this](const Fault &fault, const RequestPtr &,
+                          ThreadContext *, BaseMMU::Mode) {
+        auto *exit = dynamic_cast<VmxExitFault *>(fault.get());
+        const uint64_t qual = 0x188 | (execute ? 4 : 2);
+        panic_if(!exit || exit->info().reason != VmxExitReason::EptViolation ||
+                     exit->info().qualification != qual ||
+                     exit->info().guestPhysicalAddress !=
+                         Physical + (Virtual & 4095) ||
+                     tlb->combinedStats.permissionFallbacks.value() !=
+                         fallbacks + 1,
+                 "Combined permission fallback lost the final EPT violation");
+        awaiting = false;
+        schedule(nextEvent, curTick() + 1);
+    };
+    awaiting = true;
+    if (system->isTimingMode()) {
+        auto cb = std::make_unique<EptTranslation>(done);
+        auto *raw = cb.get();
+        continuations.push_back(std::move(cb));
+        mmu->translateTiming(req, tc, raw, mode);
+    } else {
+        done(mmu->translateAtomic(req, tc, mode), req, tc, mode);
+    }
+}
+
+void
+PagingTester::combinedRace()
+{
+    setupCombined();
+    auto calls = std::make_shared<unsigned>(0);
+    auto held = std::make_shared<bool>(false);
+    const Addr old_hpa = HostData + (Virtual & 4095);
+    inspectAttributes = [=](PacketPtr pkt) {
+        panic_if(pkt->getAddr() == old_hpa,
+                 "Obsolete data access reached RAM");
+    };
+    holdResponse = [=, this](PacketPtr pkt) {
+        if (*held || pkt->getAddr() != DataPtes) {
+            return false;
+        }
+        *held = true;
+        // The last descriptor response already contains the old mapping.
+        system->physProxy.write<uint64_t>(DataPtes, OtherHostData | 0x337,
+                                          ByteOrder::little);
+        mmu->invalidateLinear(Virtual, tc);
+        schedule(new EventFunctionWrapper(
+                     [this, pkt] {
+                         --pendingPackets;
+                         panic_if(!upstream.sendTimingResp(pkt),
+                                  "Held response rejected");
+                     },
+                     name() + ".release_ept", true),
+                 curTick() + 1);
+        return true;
+    };
+    auto req = std::make_shared<Request>(Virtual, 1, accessFlags,
+                                         system->getRequestorId(this), Virtual,
+                                         tc->contextId());
+    auto cb = std::make_unique<EptTranslation>([=, this](const Fault &fault,
+                                                         const RequestPtr &,
+                                                         ThreadContext *,
+                                                         BaseMMU::Mode) {
+        const auto eptp =
+            static_cast<ISA *>(tc->getIsaPtr())->vmxState().eptConfig()->eptp;
+        const CombinedTag tag{tc->contextId(), Tables, 0, eptp};
+        panic_if(++*calls != 1 || !*held ||
+                     !dynamic_cast<ReExec *>(fault.get()) ||
+                     tlb->combined.lookup(tag, Virtual, 1),
+                 "Invalidated final EPT response escaped cancellation");
+        holdResponse = {};
+        inspectAttributes = {};
+        awaiting = false;
+        schedule(nextEvent, curTick() + 1);
+    });
+    auto *raw = cb.get();
+    continuations.push_back(std::move(cb));
+    awaiting = true;
+    mmu->translateTiming(req, tc, raw, BaseMMU::Read);
+}
+
+void
+PagingTester::buildCombinedCases()
+{
+    const Addr hpa = HostData + (Virtual & 4095);
+    const bool enabled = tlb->combined.enabled();
+    cases.emplace_back([=, this] {
+        setupCombined();
+        auto debug = std::make_shared<Request>(Virtual, 1, accessFlags,
+                                               system->getRequestorId(this),
+                                               Virtual, tc->contextId());
+        panic_if(mmu->translateFunctional(debug, tc, BaseMMU::Read),
+                 "Functional priming failed");
+        combinedByte("cold 4KiB", Virtual, hpa, 0x90, 4, 20);
+    });
+    cases.emplace_back([=, this] {
+        combinedByte("repeat 4KiB", Virtual, hpa, 0x90, 0, enabled ? 0 : 4);
+    });
+    cases.emplace_back([this] { finishEpt(); });
+    cases.emplace_back([=, this] {
+        setupCombined(true);
+        combinedByte("cold 2MiB", Virtual, hpa + 3 * 4096, 0x93, 3, 16);
+    });
+    cases.emplace_back([this] { finishEpt(); });
+    if (!enabled) {
+        return;
+    }
+
+    // The harness configures two combined entries. The guest TLB is larger.
+    const std::array<unsigned, 5> pages{0, 1, 0, 2, 1};
+    for (unsigned i = 0; i < pages.size(); ++i) {
+        cases.emplace_back([=, this] {
+            if (i == 0) {
+                setupCombined();
+            }
+            const auto page = pages[i];
+            combinedByte("LRU A B A C B", Virtual + page * 4096,
+                         hpa + page * 4096, 0x90 + page,
+                         (i == 2 || i == 4) ? 0 : 4,
+                         i == 2   ? 0
+                         : i == 4 ? 4
+                                  : 20);
+        });
+    }
+    cases.emplace_back([this] { finishEpt(); });
+    cases.emplace_back([=, this] {
+        setupCombined();
+        combinedByte("prime guest eviction", Virtual, hpa, 0x90, 4, 20);
+    });
+    cases.emplace_back([=, this] {
+        auto *guest = tlb->lookup(Virtual, false, {tc->contextId(), 0});
+        panic_if(!guest, "Missing guest entry before replacement");
+        tlb->evict(*guest);
+        combinedByte("after guest eviction", Virtual, hpa, 0x90, 0, 0);
+    });
+    cases.emplace_back([=, this] {
+        panic_if(tlb->lookup(Virtual, false, {tc->contextId(), 0}),
+                 "Combined hit unexpectedly refilled the guest TLB");
+        descriptor(3, (Physical + 4096) | 0x67);
+        mmu->invalidateLinear(Virtual, tc);
+        combinedByte("after linear invalidation", Virtual, hpa + 4096, 0x91, 4,
+                     20);
+    });
+    cases.emplace_back([this] { finishEpt(); });
+    cases.emplace_back([=, this] {
+        setupCombined();
+        system->physProxy.write<uint64_t>(DataPtes, HostData | 0x331,
+                                          ByteOrder::little);
+        combinedByte("prime read-only mapping", Virtual, hpa, 0x90, 4, 20);
+    });
+    cases.emplace_back([this] { combinedDenied(true); });
+    cases.emplace_back([this] { combinedDenied(false); });
+    cases.emplace_back([this] { finishEpt(); });
+    for (bool ignore_pat : {false, true}) {
+        cases.emplace_back([=, this] {
+            setupCombined();
+            if (ignore_pat) {
+                system->physProxy.write<uint64_t>(DataPtes, HostData | 0x377,
+                                                  ByteOrder::little);
+            }
+            combinedByte("prime PAT", Virtual, hpa, 0x90, 4, 20);
+        });
+        const auto pat = tc->readMiscRegNoEffect(misc_reg::Pat);
+        cases.emplace_back([=, this] {
+            tc->setMiscReg(misc_reg::Pat, pat & ~0xffULL);
+            combinedByte("warm PAT", Virtual, hpa, 0x90, 0, 0, BaseMMU::Read,
+                         false, !ignore_pat);
+        });
+        cases.emplace_back([=, this] {
+            tc->setMiscReg(misc_reg::Pat, pat);
+            finishEpt();
+        });
+    }
+    combinedDirty(false, true, false);
+    combinedDirty(true, true, false);
+    combinedDirty(true, true, true);
+    combinedDirty(true, false, false);
+    if (system->isTimingMode()) {
+        auto retries = std::make_shared<statistics::Counter>(0);
+        cases.emplace_back([=, this] {
+            setupCombined();
+            *retries = tlb->getWalker()->pagingPort().traffic.retries.value();
+            injection = RetryRead;
+            combinedByte("one transport retry", Virtual, hpa, 0x90, 4, 20);
+        });
+        cases.emplace_back([=, this] {
+            panic_if(
+                injected != 1 ||
+                    tlb->getWalker()->pagingPort().traffic.retries.value() !=
+                        *retries + 1,
+                "Expected one rejected descriptor send");
+            finishEpt();
+        });
+        cases.emplace_back([this] { combinedRace(); });
+        cases.emplace_back([this] {
+            combinedByte("retry after invalidation", Virtual,
+                         OtherHostData + (Virtual & 4095), 0xeb, 4, 20);
+        });
+        cases.emplace_back([this] { finishEpt(); });
+    }
 }
 
 void

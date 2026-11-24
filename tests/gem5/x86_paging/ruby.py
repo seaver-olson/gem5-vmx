@@ -35,6 +35,7 @@ parser.add_argument(
     ],
     default="paging",
 )
+parser.add_argument("--combined-entries", type=int, default=0)
 parser.add_argument("--fixture", action="store_true")
 parser.add_argument(
     "--fixture-peers",
@@ -122,6 +123,10 @@ board = X86Board(
 # This intentionally supplies a bare ELF instead of the board's Linux/disk
 # workload helper. All cache and walker connections use the standard board.
 board._set_fullsystem(True)
+for core in board.get_processor().get_cores():
+    cpu = core.get_simobject()
+    cpu.mmu.itb.combined_entries = args.combined_entries
+    cpu.mmu.dtb.combined_entries = args.combined_entries
 board.workload = X86FsWorkload(
     object_file=str(Path(__file__).with_name(args.guest + ".elf")),
     exit_on_kernel_panic=False,

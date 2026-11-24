@@ -206,10 +206,12 @@ struct TimingWalk : std::enable_shared_from_this<TimingWalk>
             done(*state.result);
             return;
         }
-        port.submit(state.nextPacket(requestor).release(), valid,
+        port.submit(
+            state.nextPacket(requestor).release(), valid,
             [self = shared_from_this()](PacketPtr packet, bool cancelled) {
                 self->receive(packet, cancelled);
-            });
+            },
+            {}, PagingStage::Ept);
     }
 
     void
@@ -268,7 +270,7 @@ walkAtomic(PagingPort &port, RequestorID requestor, const LookupInput &input,
     Tick latency = 0;
     while (!state.done()) {
         auto packet = state.nextPacket(requestor);
-        latency += port.sendAtomic(packet.get());
+        latency += port.sendAtomic(packet.get(), {}, PagingStage::Ept);
         state.consume(*packet);
     }
     return {*state.result, latency};

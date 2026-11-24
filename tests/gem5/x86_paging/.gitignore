@@ -2,6 +2,7 @@
 /vmx_operands.elf
 /vmresume.elf
 /ept_entry.elf
+/translation_study.elf
 /vmx_transition.elf
 /vmx_nmi.elf
 /vmx_address.elf

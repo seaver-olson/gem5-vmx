@@ -1,16 +1,45 @@
 /* SPDX-License-Identifier: BSD-3-Clause */
 #include "arch/x86/paging_port.hh"
 
+#include "sim/sim_object.hh"
+
 namespace gem5
 {
 namespace X86ISA
 {
 
-PagingPort::PagingPort(const std::string &name, EventManager &em,
+PagingPort::PagingPort(const std::string &name, SimObject &owner,
                        std::function<void()> idle)
-    : QueuedRequestPort(name, requests, snoops), requests(em, *this),
-      snoops(em, *this), onIdle(std::move(idle))
+    : QueuedRequestPort(name, requests, snoops),
+      requests(owner, *this),
+      snoops(owner, *this),
+      onIdle(std::move(idle)),
+      traffic(&owner)
 {}
+
+PagingPort::Traffic::Traffic(statistics::Group *parent)
+    : statistics::Group(parent, "traffic"),
+      ADD_STAT(guestReads, statistics::units::Count::get(),
+               "Guest descriptor reads"),
+      ADD_STAT(eptReads, statistics::units::Count::get(),
+               "EPT descriptor reads"),
+      ADD_STAT(guestUpdates, statistics::units::Count::get(),
+               "Guest A/D update requests"),
+      ADD_STAT(eptUpdates, statistics::units::Count::get(),
+               "EPT A/D update requests"),
+      ADD_STAT(retries, statistics::units::Count::get(),
+               "Rejected descriptor sends")
+{}
+
+void
+PagingPort::Traffic::accepted(PagingStage stage, bool update)
+{
+    if (stage == PagingStage::Guest) {
+        ++(update ? guestUpdates : guestReads);
+    } else if (stage == PagingStage::Ept) {
+        ++(update ? eptUpdates : eptReads);
+    }
+}
 
 PagingPort::SenderState &
 PagingPort::sender(PacketPtr packet)
@@ -22,19 +51,21 @@ PagingPort::sender(PacketPtr packet)
 
 void
 PagingPort::submit(PacketPtr packet, Valid valid, Completion completion,
-                   PagingAttributes attributes)
+                   PagingAttributes attributes, PagingStage stage)
 {
     assert(packet->isRequest() && packet->needsResponse());
-    packet->pushSenderState(new SenderState(attributes, std::move(valid),
-                                            std::move(completion)));
+    packet->pushSenderState(new SenderState(
+        attributes, stage, std::move(valid), std::move(completion)));
     ++owned;
     requests.submit(packet);
 }
 
 Tick
-PagingPort::sendAtomic(PacketPtr packet, PagingAttributes attributes)
+PagingPort::sendAtomic(PacketPtr packet, PagingAttributes attributes,
+                       PagingStage stage)
 {
-    packet->pushSenderState(new SenderState(attributes, {}, {}));
+    packet->pushSenderState(new SenderState(attributes, stage, {}, {}));
+    traffic.accepted(stage, packet->req->isAtomicReturn());
     const Tick latency = RequestPort::sendAtomic(packet);
     delete packet->popSenderState();
     return latency;
@@ -43,7 +74,8 @@ PagingPort::sendAtomic(PacketPtr packet, PagingAttributes attributes)
 void
 PagingPort::sendFunctional(PacketPtr packet, PagingAttributes attributes)
 {
-    packet->pushSenderState(new SenderState(attributes, {}, {}));
+    packet->pushSenderState(
+        new SenderState(attributes, PagingStage::Other, {}, {}));
     RequestPort::sendFunctional(packet);
     delete packet->popSenderState();
 }
@@ -74,7 +106,16 @@ PagingPort::RequestQueue::sendTiming(PacketPtr packet)
         port.complete(packet, true);
         return true;
     }
-    return port.sendTimingReq(packet);
+    const auto stage = sender(packet).stage;
+    const bool update = packet->req->isAtomicReturn();
+    if (!port.sendTimingReq(packet)) {
+        if (stage != PagingStage::Other) {
+            ++port.traffic.retries;
+        }
+        return false;
+    }
+    port.traffic.accepted(stage, update);
+    return true;
 }
 
 void
