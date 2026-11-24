@@ -53,6 +53,11 @@ namespace gem5
 
 namespace X86ISA {
 
+namespace ept
+{
+struct WalkResult;
+}
+
 class MMU : public BaseMMU
 {
   private:
@@ -70,9 +75,13 @@ class MMU : public BaseMMU
         ThreadContext *tc, TLB &cache, Mode access, Mode original,
         Addr linear, Addr faultAddress, bool supervisor = false) const;
     Fault finishWalk(const RequestPtr &req, const TranslationContext &context,
-                     const TlbEntry &entry, bool functional);
+                     const TlbEntry &entry, TLB &cache, bool functional);
     Fault resolveEpt(const RequestPtr &req, const TranslationContext &context,
-                     bool functional, uint8_t patIndex = 0);
+                     TLB &cache, bool functional, const TlbEntry *guest);
+    Fault finishEpt(const RequestPtr &req, const TranslationContext &context,
+                    TLB &cache, const ept::LookupInput &input,
+                    const ept::WalkResult &result, uint8_t pat_index,
+                    std::optional<CombinedEntry> candidate);
     Fault finalizePhysical(const RequestPtr &req, Mode mode,
                            LocalApicBase apicBase, ContextID thread) const;
 

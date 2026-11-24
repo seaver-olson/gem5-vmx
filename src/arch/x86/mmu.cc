@@ -113,6 +113,66 @@ MMU::captureContext(const RequestPtr &req, ThreadContext *tc, TLB &cache,
     return context;
 }
 
+namespace
+{
+
+EptAccess
+finalAccess(BaseMMU::Mode mode, Request::Flags flags)
+{
+    if (mode == BaseMMU::Execute) {
+        return EptAccess::Execute;
+    }
+    if (mode == BaseMMU::Write || (flags & Request::READ_MODIFY_WRITE)) {
+        return EptAccess::Write;
+    }
+    return EptAccess::Read;
+}
+
+CombinedTag
+combinedTag(TlbContext tag, CR3 cr3, CR4 cr4, HandyM5Reg handy,
+            const EptConfig &config)
+{
+    const Addr root = handy.mode != LongMode && cr4.pae
+                          ? Addr(cr3.paePdtb) << 5
+                          : Addr(cr3.longPdtb) << 12;
+    return {tag.thread, root, tag.addressSpace, config.eptp};
+}
+
+// Copy stage one before any asynchronous final lookup. A guest TLB slot
+// can be replaced while that lookup is in flight.
+std::optional<CombinedEntry>
+candidateFor(const TranslationContext &context, const TlbEntry *guest,
+             const TLB &cache)
+{
+    if (!guest || !cache.combined.enabled()) {
+        return std::nullopt;
+    }
+
+    CombinedEntry entry{};
+    entry.tag = combinedTag(context.tag, context.cr3, context.cr4,
+                            context.m5reg, *context.ept);
+    entry.shift = guest->logBytes;
+    entry.writable = guest->writable;
+    entry.user = guest->user;
+    entry.noExec = guest->noExec;
+    entry.guestDirty = guest->dirty;
+    entry.patIndex = guest->patIndex();
+    return entry;
+}
+
+void
+applyFinalType(const RequestPtr &req, CR0 cr0, RegVal pat, uint8_t index,
+               uint8_t ept_type, bool ignore_pat, EptAccess access)
+{
+    const auto guest_type = cr0.pg ? paging::patType(pat, index) : 6;
+    paging::applyMemoryType(
+        *req,
+        paging::effectiveEptType(cr0.cd, ept_type, ignore_pat, guest_type),
+        access == EptAccess::Write);
+}
+
+} // anonymous namespace
+
 class MMU::WalkContinuation :
     public Walker::Completion,
     public std::enable_shared_from_this<WalkContinuation>
@@ -152,7 +212,7 @@ class MMU::WalkContinuation :
     bool done() const { return completed; }
 
     void
-    startFinal(Addr guestPhysical, uint8_t pat_index = 0)
+    startFinal(Addr guestPhysical, const TlbEntry *guest)
     {
         req->setPaddr(guestPhysical);
         if (!snapshot->ept) {
@@ -160,11 +220,9 @@ class MMU::WalkContinuation :
                 snapshot->apicBase, snapshot->tag.thread));
             return;
         }
-        const EptAccess access = snapshot->accessMode == BaseMMU::Execute ?
-            EptAccess::Execute :
-            (snapshot->accessMode == BaseMMU::Write ||
-             (snapshot->flags & Request::READ_MODIFY_WRITE)) ?
-            EptAccess::Write : EptAccess::Read;
+        const auto access = finalAccess(snapshot->accessMode, snapshot->flags);
+        const uint8_t pat_index = guest ? guest->patIndex() : 0;
+        auto candidate = candidateFor(*snapshot, guest, cache);
         const ept::LookupInput input(guestPhysical, access, *snapshot->ept,
                                      false, snapshot->cr0.cd);
         ept::walkTiming(
@@ -175,26 +233,11 @@ class MMU::WalkContinuation :
                     self->snapshot->generation == self->cache.generation(
                         self->snapshot->tag.thread);
             },
-            [self = shared_from_this(), input,
-             pat_index](const ept::WalkResult &result) {
-                if (result.status != ept::WalkStatus::Mapping) {
-                    self->complete(ept::lookupFault(result, input,
-                        self->snapshot->linearAddress, true));
-                    return;
-                }
-                self->req->setPaddr(result.hostPhysical);
-                const auto &context = *self->snapshot;
-                const auto pat = context.cr0.pg
-                                     ? paging::patType(context.pat, pat_index)
-                                     : 6;
-                paging::applyMemoryType(
-                    *self->req,
-                    paging::effectiveEptType(context.cr0.cd, result.memoryType,
-                                             result.ignorePat, pat),
-                    input.access == EptAccess::Write);
-                self->complete(self->mmu.finalizePhysical(self->req,
-                    self->snapshot->accessMode, self->snapshot->apicBase,
-                    self->snapshot->tag.thread));
+            [self = shared_from_this(), input, pat_index,
+             candidate](const ept::WalkResult &result) {
+                self->complete(self->mmu.finishEpt(self->req, *self->snapshot,
+                                                   self->cache, input, result,
+                                                   pat_index, candidate));
             });
     }
 
@@ -210,8 +253,8 @@ class MMU::WalkContinuation :
         assert(!completed);
         if (fault == NoFault) {
             assert(result);
-            if (result->generation !=
-                    cache.generation(snapshot->tag.thread)) {
+            if (squashed() ||
+                result->generation != cache.generation(snapshot->tag.thread)) {
                 complete(std::make_shared<ReExec>());
             } else {
                 cache.insert(result->entry.vaddr, result->entry, result->context);
@@ -222,7 +265,7 @@ class MMU::WalkContinuation :
                 startFinal(result->entry.paddr |
                                (snapshot->linearAddress &
                                 mask(result->entry.logBytes)),
-                           result->entry.patIndex());
+                           &result->entry);
             }
         } else {
             complete(fault);
@@ -441,7 +484,7 @@ MMU::translate(const RequestPtr &req,
                                               ->vmxState()
                                               .eptConfig()
                                               .has_value();
-    uint8_t pat_index = 0;
+    const TlbEntry *final_guest = nullptr;
 
     // Port proxies (debugger, pseudo-instructions, workload loaders) name
     // linear addresses on the simulator's behalf. Like the original
@@ -542,6 +585,38 @@ MMU::translate(const RequestPtr &req,
                 (cr4.pcide ? uint64_t(cr3.pcid) : 0) :
                 tc->getProcessPtr()->pTable->pid()};
 
+            if (ept_active && !functional && cache.combined.enabled()) {
+                const auto &ept = static_cast<ISA *>(tc->getIsaPtr())
+                                      ->vmxState()
+                                      .eptConfig();
+                const auto tag = combinedTag(context, cr3, cr4, m5Reg, *ept);
+                const auto *hit =
+                    cache.combined.lookup(tag, vaddr, req->getSize());
+                if (hit) {
+                    const CR0 cr0 = tc->readMiscRegNoEffect(misc_reg::Cr0);
+                    const bool user = m5Reg.cpl == 3 && !(flags & CPL0FlagBit);
+                    const auto access = finalAccess(mode, flags);
+                    const bool denied =
+                        (user && !hit->user) ||
+                        (access == EptAccess::Write && !hit->writable &&
+                         (user || cr0.wp)) ||
+                        (mode == BaseMMU::Execute && hit->noExec) ||
+                        !(hit->eptPermissions & (1U << unsigned(access)));
+                    const bool needs_dirty =
+                        (mode == BaseMMU::Write && !hit->guestDirty) ||
+                        (access == EptAccess::Write && !hit->eptDirtyReady);
+                    if (!denied && !needs_dirty) {
+                        req->setPaddr(hit->hostBase |
+                                      (vaddr & mask(hit->shift)));
+                        applyFinalType(req, cr0,
+                                       tc->readMiscRegNoEffect(misc_reg::Pat),
+                                       hit->patIndex, hit->eptType,
+                                       hit->ignorePat, access);
+                        return finalizePhysical(req, tc, mode);
+                    }
+                }
+            }
+
             TlbEntry functionalEntry;
             TlbEntry *entry = functional ? nullptr :
                 cache.lookup(pageAlignedVaddr, true, context);
@@ -581,7 +656,8 @@ MMU::translate(const RequestPtr &req,
                         functionalEntry);
                     if (fault != NoFault)
                         return fault;
-                    return finishWalk(req, *snapshot, functionalEntry, true);
+                    return finishWalk(req, *snapshot, functionalEntry, cache,
+                                      true);
                 } else if (FullSystem) {
                     Walker::Result result;
                     std::shared_ptr<Walker::Completion> continuation;
@@ -604,7 +680,8 @@ MMU::translate(const RequestPtr &req,
                     // Complete from the walk result, as the timing path does;
                     // the cache may hold another page size for this range.
                     cache.insert(result.entry.vaddr, result.entry, result.context);
-                    return finishWalk(req, *snapshot, result.entry, false);
+                    return finishWalk(req, *snapshot, result.entry, cache,
+                                      false);
                 } else {
                     Process *p = tc->getProcessPtr();
                     const EmulationPageTable::Entry *pte =
@@ -657,7 +734,7 @@ MMU::translate(const RequestPtr &req,
             Addr paddr = entry->paddr | (vaddr & mask(entry->logBytes));
             DPRINTF(TLB, "Translated %#x -> %#x.\n", vaddr, paddr);
             req->setPaddr(paddr);
-            pat_index = entry->patIndex();
+            final_guest = entry;
             if (entry->uncacheable && !ept_active) {
                 req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
             }
@@ -680,19 +757,19 @@ MMU::translate(const RequestPtr &req,
         if (timing) {
             auto continuation = std::make_shared<WalkContinuation>(
                 *this, cache, req, tc, translation, snapshot);
-            continuation->startFinal(req->getPaddr(), pat_index);
+            continuation->startFinal(req->getPaddr(), final_guest);
             completedInline = continuation->done();
             delayedResponse = !completedInline;
             return NoFault;
         }
-        return resolveEpt(req, *snapshot, functional, pat_index);
+        return resolveEpt(req, *snapshot, cache, functional, final_guest);
     }
     return finalizePhysical(req, tc, mode);
 }
 
 Fault
 MMU::finishWalk(const RequestPtr &req, const TranslationContext &context,
-                const TlbEntry &entry, bool functional)
+                const TlbEntry &entry, TLB &cache, bool functional)
 {
     // The walker returns an explicit stage-one result with permissions
     // checked against its captured context. Completion never re-enters
@@ -701,39 +778,70 @@ MMU::finishWalk(const RequestPtr &req, const TranslationContext &context,
     if (entry.uncacheable && !context.ept) {
         req->setFlags(Request::UNCACHEABLE | Request::STRICT_ORDER);
     }
-    return resolveEpt(req, context, functional, entry.patIndex());
+    return resolveEpt(req, context, cache, functional, &entry);
 }
 
 Fault
 MMU::resolveEpt(const RequestPtr &req, const TranslationContext &context,
-                bool functional, uint8_t pat_index)
+                TLB &cache, bool functional, const TlbEntry *guest)
 {
-    if (context.ept) {
-        const EptAccess access = context.accessMode == BaseMMU::Execute ?
-            EptAccess::Execute :
-            (context.accessMode == BaseMMU::Write ||
-             (context.flags & Request::READ_MODIFY_WRITE)) ?
-            EptAccess::Write : EptAccess::Read;
-        const ept::LookupInput input(req->getPaddr(), access, *context.ept,
-                                     false, context.cr0.cd);
-        const auto result = functional ?
-            ept::walkFunctional(*context.port, req->requestorId(), input,
-                context.physicalBits, context.eptCapabilities) :
-            ept::walkAtomic(*context.port, req->requestorId(), input,
-                context.physicalBits, context.eptCapabilities).result;
-        if (result.status != ept::WalkStatus::Mapping)
-            return ept::lookupFault(result, input, context.linearAddress, true);
-        req->setPaddr(result.hostPhysical);
-        const auto pat =
-            context.cr0.pg ? paging::patType(context.pat, pat_index) : 6;
-        paging::applyMemoryType(
-            *req,
-            paging::effectiveEptType(context.cr0.cd, result.memoryType,
-                                     result.ignorePat, pat),
-            access == EptAccess::Write);
+    if (!context.ept) {
+        return finalizePhysical(req, context.accessMode, context.apicBase,
+                                context.tag.thread);
     }
-    return finalizePhysical(req, context.accessMode, context.apicBase,
-                            context.tag.thread);
+    const auto access = finalAccess(context.accessMode, context.flags);
+    const ept::LookupInput input(req->getPaddr(), access, *context.ept, false,
+                                 context.cr0.cd);
+    const uint8_t pat_index = guest ? guest->patIndex() : 0;
+    auto candidate =
+        functional ? std::nullopt : candidateFor(context, guest, cache);
+    const auto result =
+        functional
+            ? ept::walkFunctional(*context.port, req->requestorId(), input,
+                                  context.physicalBits,
+                                  context.eptCapabilities)
+            : ept::walkAtomic(*context.port, req->requestorId(), input,
+                              context.physicalBits, context.eptCapabilities)
+                  .result;
+    return finishEpt(req, context, cache, input, result, pat_index, candidate);
+}
+
+Fault
+MMU::finishEpt(const RequestPtr &req, const TranslationContext &context,
+               TLB &cache, const ept::LookupInput &input,
+               const ept::WalkResult &result, uint8_t pat_index,
+               std::optional<CombinedEntry> candidate)
+{
+    if (candidate &&
+        context.generation != cache.generation(context.tag.thread)) {
+        return std::make_shared<ReExec>();
+    }
+    if (result.status != ept::WalkStatus::Mapping) {
+        return ept::lookupFault(result, input, context.linearAddress, true);
+    }
+
+    req->setPaddr(result.hostPhysical);
+    applyFinalType(req, context.cr0, context.pat, pat_index, result.memoryType,
+                   result.ignorePat, input.access);
+    Fault fault = finalizePhysical(req, context.accessMode, context.apicBase,
+                                   context.tag.thread);
+    if (!fault && candidate) {
+        auto &entry = *candidate;
+        entry.shift = std::min<unsigned>(entry.shift, result.pageShift);
+        const Addr base_mask = ~mask(entry.shift);
+        entry.linearBase = context.linearAddress & base_mask;
+        entry.guestBase = input.guestPhysical & base_mask;
+        entry.hostBase = result.hostPhysical & base_mask;
+        entry.eptPermissions = result.permissions;
+        entry.eptType = result.memoryType;
+        entry.ignorePat = result.ignorePat;
+        // result.entry is the word observed before the walker's own update.
+        entry.eptDirtyReady = !input.config.accessedDirty ||
+                              bits(result.entry, 9) ||
+                              input.access == EptAccess::Write;
+        cache.combined.insert(entry);
+    }
+    return fault;
 }
 
 Fault
