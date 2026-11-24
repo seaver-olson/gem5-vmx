@@ -50,8 +50,13 @@ namespace gem5
 namespace X86ISA {
 
 TLB::TLB(const Params &p)
-    : BaseTLB(p), configAddress(0), size(p.size),
-      tlb(size), lruSeq(0), stats(this)
+    : BaseTLB(p),
+      configAddress(0),
+      combined(p.combined_entries),
+      size(p.size),
+      tlb(size),
+      lruSeq(0),
+      stats(this)
 {
     if (!size)
         fatal("TLBs must have a non-zero size.\n");
@@ -179,6 +184,7 @@ void
 TLB::flushAll()
 {
     ++invalidationGeneration;
+    combined.clear();
     DPRINTF(TLB, "Invalidating all entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle) {
@@ -199,6 +205,7 @@ void
 TLB::flushNonGlobal()
 {
     ++invalidationGeneration;
+    combined.clear();
     DPRINTF(TLB, "Invalidating all non global entries.\n");
     for (unsigned i = 0; i < size; i++) {
         if (tlb[i].trieHandle && !tlb[i].global) {
@@ -213,6 +220,7 @@ void
 TLB::demapPage(Addr va, uint64_t asn)
 {
     ++invalidationGeneration;
+    combined.clear();
     // INVLPG also invalidates any global translation for the address.
     for (auto &entry : tlb) {
         if (entry.trieHandle && (entry.context.addressSpace == asn || entry.global) &&
@@ -230,6 +238,7 @@ TLB::invalidatePage(Addr va, TlbContext context)
     // INVLPG and #PF invalidation affect only this logical processor, so
     // they do not make other threads' outstanding walks obsolete.
     ++threadGenerations[context.thread];
+    combined.invalidateThread(context.thread);
     for (auto &entry : tlb) {
         if (entry.trieHandle && entry.context.thread == context.thread &&
             (entry.context.addressSpace == context.addressSpace || entry.global) &&

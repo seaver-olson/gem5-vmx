@@ -43,6 +43,7 @@
 #include <vector>
 
 #include "arch/generic/tlb.hh"
+#include "arch/x86/combined_tlb.hh"
 #include "arch/x86/pagetable.hh"
 #include "base/trie.hh"
 #include "mem/request.hh"
@@ -71,6 +72,7 @@ namespace X86ISA
 
         typedef X86TLBParams Params;
         TLB(const Params &p);
+        CombinedTLB combined;
 
         void takeOverFrom(BaseTLB *otlb) override { flushAll(); }
 

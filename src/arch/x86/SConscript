@@ -75,6 +75,7 @@ Source('tlb.cc', tags=['x86 isa'])
 Source('types.cc', tags=['x86 isa'])
 Source('utility.cc', tags=['x86 isa'])
 
+GTest('combined_tlb.test', 'combined_tlb.test.cc')
 GTest('paging.test', 'paging.test.cc', '../../sim/cur_tick.cc')
 GTest('ept.test', 'ept.test.cc')
 GTest('vmcs.test', 'vmcs.test.cc')
