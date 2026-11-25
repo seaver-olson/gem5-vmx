@@ -78,7 +78,7 @@ jobs:
 
             - name: Build VMX unit tests
               run: scons build/X86/arch/x86/vmx_utils.test.opt build/X86/arch/x86/vmcs.test.opt build/X86/arch/x86/paging.test.opt build/X86/arch/x86/ept.test.opt
-                  build/X86/mem/request.test.opt build/X86/mem/packet.test.opt -j "$(nproc)"
+                  build/X86/arch/x86/combined_tlb.test.opt build/X86/mem/request.test.opt build/X86/mem/packet.test.opt -j "$(nproc)"
 
             - name: Run vmx_utils.test
               run: build/X86/arch/x86/vmx_utils.test.opt --gtest_output=xml:vmx_utils.test.xml
@@ -91,6 +91,9 @@ jobs:
 
             - name: Run ept.test
               run: build/X86/arch/x86/ept.test.opt --gtest_output=xml:ept.test.xml
+
+            - name: Run combined_tlb.test
+              run: build/X86/arch/x86/combined_tlb.test.opt --gtest_output=xml:combined_tlb.test.xml
 
             - name: Run request.test
               run: build/X86/mem/request.test.opt --gtest_output=xml:request.test.xml
@@ -108,6 +111,7 @@ jobs:
                       vmcs.test.xml
                       paging.test.xml
                       ept.test.xml
+                      combined_tlb.test.xml
                       request.test.xml
                       packet.test.xml
 

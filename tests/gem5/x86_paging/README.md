@@ -552,8 +552,11 @@ python3 tests/gem5/x86_paging/run.py --combined-only --outdir m5out-combined
 
 `--combined-entries N` sets the number of fully associative LRU entries
 per x86 TLB object. The default is zero. `config.py` shares one object
-between instruction fetches and data accesses. On a usable hit the MMU
-translates inline, with zero additional lookup cycles. Architectural
+between instruction fetches and data accesses. A usable hit completes inline
+by default. `--combined-hit-cycles N` delays a timing hit by N CPU cycles.
+Misses and
+permission or dirty fallbacks start their usual paths immediately. Atomic
+and functional translation keep their synchronous behavior. Architectural
 invalidations conservatively discard combined translations. The benchmark
 keeps EPT mappings static while the guest runs. Its research reset drains
 the machine and invokes `flushTLBs()` on the participating CPU. Apply this
@@ -569,17 +572,30 @@ VM-entry runs execute a split two-byte load, revoke access to the second
 subpage, and compare the bytes, faulting GPA and exit qualification at zero
 and 64 entries.
 
-Each benchmark arm runs the same 4,096 dependent loads on TimingSimple
-with Classic caches and a 64-entry guest TLB. A seeded shuffle places
-one node on each of 32 or 128 distinct 4 KiB pages. The guest verifies
-the links before measurement and checks a rolling checksum afterward.
+The TimingSimple benchmark runs the same 4,096 dependent loads for each
+configuration. The seeded shuffle visits 16, 32, 63, 64, 65 or 128 data
+pages. The loop also needs an instruction translation in the shared TLB.
+The 63- and 64-page cases straddle the 64-entry combined cache's effective
+data capacity. Split-load guests check the returned bytes and exit metadata
+on AtomicSimple, TimingSimple, Minor and O3.
+
+For the original comparison, keep the guest TLB at 64 entries and add zero
+or 64 combined entries. For a fixed budget of 128 translation entries,
+compare `native-128` and `ept-0-128` (128 guest entries) with `ept-64`
+(64 guest and 64 combined). These budgets count entries. The two entry
+formats store different fields and may occupy different silicon areas.
+`ept-64-delay2` repeats the latter configuration with two extra CPU cycles
+per usable timing hit as a sensitivity check.
+
+The guest verifies the links before measurement and checks a rolling
+checksum afterward.
 The harness drains at the start marker and flushes translations once.
 Memory caches retain their warm-up state, and all later laps retain
 translation state. Register-only instructions at the markers allow the
 CPU to drain without consuming a loop load or a result store.
 
-`measurements.json` records simulated ticks, cache capacities, loop
-fingerprints and counters from the measured interval. `combined.readHits`
+`measurements.json` records simulated ticks, both capacities, their sum, hit
+cycles, loop fingerprints and counters from the measured interval. `combined.readHits`
 counts data reads and `combined.executeHits` counts fetches. Guest TLB hits
 count accesses that reach the guest TLB. Descriptor reads, capacity
 evictions and timing-walk totals include instruction and data translations.

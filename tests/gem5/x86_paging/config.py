@@ -30,7 +30,7 @@ parser.add_argument("--combined-entries", type=int, default=0)
 parser.add_argument("--combined-hit-cycles", type=int, default=0)
 parser.add_argument("--guest-entries", type=int, default=64)
 parser.add_argument("--combined-fixture", action="store_true")
-parser.add_argument("--benchmark-pages", type=int, choices=(32, 128))
+parser.add_argument("--benchmark-pages", type=int, metavar="1..128")
 parser.add_argument("--benchmark-native", action="store_true")
 parser.add_argument(
     "--direct-walker",
@@ -125,6 +125,8 @@ if args.combined_hit_cycles < 0:
     parser.error("--combined-hit-cycles must be nonnegative")
 if args.combined_entries < 0 or args.guest_entries < 1:
     parser.error("invalid TLB capacity")
+if args.benchmark_pages is not None and not 1 <= args.benchmark_pages <= 128:
+    parser.error("--benchmark-pages must be between 1 and 128")
 if args.benchmark_native and not args.benchmark_pages:
     parser.error("--benchmark-native requires --benchmark-pages")
 if args.benchmark_pages and args.guest != "translation_study":

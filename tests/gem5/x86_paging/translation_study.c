@@ -6,6 +6,7 @@
 #include "vmresume.c"
 
 #define PAGE 4096
+#define MAX_PAGES 128
 #define ALIGNED __attribute__((aligned(PAGE)))
 typedef uint64_t Table[512];
 static Table guest_root ALIGNED, guest_pdpt ALIGNED, guest_pd ALIGNED;
@@ -13,7 +14,7 @@ static Table guest_pt[2] ALIGNED, other_guest_pd ALIGNED;
 Table study_alias_pt ALIGNED;
 static Table ept_root[2] ALIGNED, ept_pdpt[2] ALIGNED, ept_pd[2] ALIGNED;
 static Table ept_low[2][2] ALIGNED, ept_data_pt[2] ALIGNED;
-static uint8_t data[4][PAGE] ALIGNED, nodes[128][PAGE] ALIGNED;
+static uint8_t data[4][PAGE] ALIGNED, nodes[MAX_PAGES][PAGE] ALIGNED;
 uint8_t study_pressure[8][PAGE] ALIGNED;
 uint64_t study_first;
 volatile uint64_t study_value, study_before;
@@ -88,7 +89,7 @@ node(unsigned page)
 static void
 build_cycle(unsigned pages)
 {
-    unsigned order[128];
+    unsigned order[MAX_PAGES];
     uint32_t seed = 1;
     for (unsigned i = 0; i < pages; ++i) {
         order[i] = i;
@@ -139,7 +140,7 @@ study_prepare(void)
     __asm__ volatile("mov %0, %%cr0" ::"r"(cr0) : "memory");
     build_tables();
     if (options[0]) {
-        check(options[1] == 32 || options[1] == 128, 905);
+        check(options[1] >= 1 && options[1] <= MAX_PAGES, 905);
         build_cycle(options[1]);
     }
     if (options[0] == 1) {

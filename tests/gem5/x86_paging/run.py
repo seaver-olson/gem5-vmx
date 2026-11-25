@@ -510,6 +510,12 @@ def main():
                     )
                 )
     if args.combined_only:
+        from study_results import (
+            ARM_CONFIGS,
+            PAGE_COUNTS,
+            report,
+        )
+
         cases = []
         for cpu in ("atomic", "timing"):
             base = ["--cpu", cpu, "--caches"]
@@ -526,10 +532,13 @@ def main():
                         ],
                     )
                 )
-            for size in (0, 64):
+        for cpu in ("atomic", "timing", "minor", "o3"):
+            base = ["--cpu", cpu, "--caches"]
+            for size, delay in ((0, 0), (64, 0), (64, 2)):
+                suffix = f"{size}-delay{delay}" if delay else str(size)
                 cases.append(
                     (
-                        f"split-{cpu}-{size}",
+                        f"split-{cpu}-{suffix}",
                         "config.py",
                         base
                         + [
@@ -539,6 +548,8 @@ def main():
                             "4",
                             "--combined-entries",
                             str(size),
+                            "--combined-hit-cycles",
+                            str(delay),
                         ],
                     )
                 )
@@ -566,8 +577,8 @@ def main():
                 ],
             )
         )
-        for pages in (32, 128):
-            for arm in ("native", "ept-0", "ept-64"):
+        for pages in PAGE_COUNTS:
+            for arm, (guest, combined, hit_cycles) in ARM_CONFIGS.items():
                 cases.append(
                     (
                         f"bench-{pages}-{arm}",
@@ -580,10 +591,18 @@ def main():
                             "translation_study",
                             "--benchmark-pages",
                             str(pages),
+                            "--guest-entries",
+                            str(guest),
                             "--combined-entries",
-                            "64" if arm == "ept-64" else "0",
+                            str(combined),
+                            "--combined-hit-cycles",
+                            str(hit_cycles),
                         ]
-                        + (["--benchmark-native"] if arm == "native" else []),
+                        + (
+                            ["--benchmark-native"]
+                            if arm.startswith("native")
+                            else []
+                        ),
                     )
                 )
     for name, script, options in cases:
@@ -648,8 +667,6 @@ def main():
         )
     failed = any(result["status"] != 0 for result in results)
     if args.combined_only and not failed:
-        from study_results import report
-
         report(args.outdir)
     return int(failed)
 
