@@ -1,62 +1,28 @@
-# gem5 Intel VMX support
+# Studying nested page walks in gem5
 
-This fork of gem5 adds a research-oriented Intel VMX model for x86 full-system
-simulation. It focuses on a testable VMX lifecycle and the paging machinery
-needed for Extended Page Tables (EPT) guest execution.
+I use this fork to measure what Intel Extended Page Tables (EPT) add to
+address translation. A small 64-bit guest runs under VMX in gem5. EPT
+translates both the guest's page-table accesses and its final instruction
+fetches, loads and stores. The guest tests exercise VM entry, EPT violations
+and resuming the faulting instruction on AtomicSimple, TimingSimple, Minor
+and O3.
 
-## Current status
+The supported guest setup uses four-level EPT tables in write-back memory,
+4 KiB EPT pages and optional accessed/dirty updates. The disk-free benchmark
+runs the same shuffled chain of dependent loads with native paging, EPT, and
+EPT with a combined translation cache. It checks the returned data and
+reports simulated ticks and guest and EPT descriptor reads separately.
 
-- VMXON/VMXOFF, VMCS management, VMREAD/VMWRITE, VMLAUNCH/VMRESUME, and VMCALL.
-- 64-bit guest entry and exit, selected intercepts and event injection, VMCS
-  validation, and checkpoint/restore of VMX state.
-- Reworked x86 paging and MMU paths, with a memory-backed EPT walker connected
-  to guest page-table reads, guest A/D writes, and final instruction/data
-  translations. Atomic and timing walks use conditional physical EPT A/D
-  updates; functional inspection remains read-only. These paths are tested
-  with suspended-CPU fixtures. **EPT is not yet enabled for guest execution.**
+The combined cache defaults to zero entries. Enabling it adds entries
+alongside the guest TLB. A usable hit skips both walks and adds zero lookup
+cycles by default. The timing model still needs calibration against hardware.
 
-## Remaining work
-
-- [ ] Enable EPT at VM entry and validate EPT exit delivery during guest execution.
-- [ ] Complete EPT memory attributes, invalidation, and end-to-end tests
-      before advertising EPT support.
-- [ ] Expand VMX coverage beyond the current 64-bit, single-vCPU subset
-      (including optional controls and multi-vCPU behavior).
-- [ ] Calibrate VMX instruction timing against hardware.
-
-See the [VMX audit](docs/vmx-architectural-audit.md) and
-[EPT status](docs/x86-paging-ept-status.md) for the detailed scope and gaps.
-
-## Build and test
-
-From the repository root, build gem5, the disk-free test guests, and the x86
-unit tests:
+To build and run the study from the repository root:
 
 ```sh
-scons build/X86/gem5.opt \
-  build/X86/arch/x86/vmx_utils.test.opt \
-  build/X86/arch/x86/vmcs.test.opt \
-  build/X86/arch/x86/paging.test.opt \
-  build/X86/arch/x86/ept.test.opt -j"$(nproc)"
-make -C tests/gem5/x86_paging
+scons build/X86/gem5.opt -j4
+python3 tests/gem5/x86_paging/run.py --combined-only --outdir m5out-combined
 ```
 
-Run the unit tests and simulator regressions:
-
-```sh
-for test in vmx_utils vmcs paging ept; do
-  build/X86/arch/x86/$test.test.opt
-done
-python3 tests/gem5/x86_paging/run.py
-python3 tests/gem5/x86_paging/run.py --transport-only --outdir m5out-paging-transport
-python3 tests/gem5/x86_paging/run.py --ept-only --outdir m5out-ept-walker
-python3 tests/gem5/x86_paging/run.py --vmx-operands-only --outdir m5out-vmx-operands
-python3 tests/gem5/x86_paging/vmresume.py
-```
-
-The Linux full-system VMX smoke and transition tests require separate kernel
-resources. Follow [their setup guide](tests/gem5/vmx/README.md), then run
-`tests/gem5/vmx/run.sh` or `tests/gem5/vmx/run.sh transition`.
-
-The [paging test guide](tests/gem5/x86_paging/README.md) documents individual
-cases, options, and expected results.
+See the [paging test guide](tests/gem5/x86_paging/README.md) for the
+workloads, counters and regression commands.
