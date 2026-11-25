@@ -601,3 +601,24 @@ count accesses that reach the guest TLB. Descriptor reads, capacity
 evictions and timing-walk totals include instruction and data translations.
 A/D update requests and rejected sends have separate counters. Per-case
 simulator commands, logs and full statistics are in the same output tree.
+
+### What happens at the 64-entry boundary
+
+These TimingSimple runs at `fd1bf322a4` used a shared instruction/data TLB,
+a 2 GHz CPU and 4,096 dependent loads. Each size produced the same checksum
+across all six configurations. All three tick columns below use EPT and a
+budget of 128 translation entries.
+
+| Data pages | Combined data hits¹ | Guest data hits¹ | Ticks, 128 guest | Ticks, 64+64¹ | Ticks, 64+64 with 2-cycle hits |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 63 | 4,033 | 0 | 94,345,000 | 36,710,500 | 65,322,500 |
+| 64 | 0 | 4,032 | 94,510,000 | 44,935,000 | 69,514,000 |
+| 65 | 0 | 0 | 96,552,000 | 514,692,000 | 539,271,000 |
+
+¹ The 64+64 configuration has 64 guest and 64 combined entries. These hit
+counts come from its zero-delay run. At 63 data pages the loop's code page
+and all data pages fit in the combined cache. At 64, combined data hits
+disappear, but the guest TLB still serves 4,032 data reads. At 65, both
+levels miss on every data read, and the 128-guest-entry control is faster.
+The delay applies to instruction hits too. At 64 pages the 24,579 combined
+instruction hits account for all 24,579,000 extra simulated ticks.
