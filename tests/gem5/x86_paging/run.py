@@ -550,6 +550,22 @@ def main():
                     + ["--guest", "ept_entry", "--combined-entries", "64"],
                 )
             )
+        cases.append(
+            (
+                "fixture-timing-delayed",
+                "config.py",
+                [
+                    "--cpu",
+                    "timing",
+                    "--caches",
+                    "--combined-fixture",
+                    "--combined-entries",
+                    "2",
+                    "--combined-hit-cycles",
+                    "2",
+                ],
+            )
+        )
         for pages in (32, 128):
             for arm in ("native", "ept-0", "ept-64"):
                 cases.append(

@@ -53,6 +53,7 @@ TLB::TLB(const Params &p)
     : BaseTLB(p),
       configAddress(0),
       combined(p.combined_entries),
+      combinedHitLatency(p.combined_hit_latency),
       size(p.size),
       tlb(size),
       lruSeq(0),

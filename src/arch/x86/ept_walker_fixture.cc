@@ -12,6 +12,7 @@
 #include "arch/x86/paging_tester.hh"
 #include "arch/x86/tlb.hh"
 #include "base/logging.hh"
+#include "cpu/base.hh"
 #include "mem/packet_access.hh"
 #include "mem/port_proxy.hh"
 #include "sim/system.hh"
@@ -190,6 +191,13 @@ PagingTester::combinedByte(const char *label, Addr va, Addr hpa, uint8_t data,
                                        BaseMMU::Mode) {
         panic_if(fault || out->getPaddr() != hpa,
                  "%s: wrong final mapping at %#x", label, va);
+        if (system->isTimingMode() && !guest_reads && !ept_reads) {
+            const Tick delay =
+                tc->getCpuPtr()->cyclesToTicks(tlb->combinedHitLatency);
+            panic_if(curTick() - start != delay,
+                     "%s: hit completed after %llu ticks, expected %llu",
+                     label, curTick() - start, delay);
+        }
         const auto type = uncached ? paging::MemoryType::Uncacheable
                                    : paging::MemoryType::WriteBack;
         panic_if(out->memoryType() != type ||
@@ -387,6 +395,29 @@ PagingTester::buildCombinedCases()
     cases.emplace_back([=, this] {
         combinedByte("repeat 4KiB", Virtual, hpa, 0x90, 0, enabled ? 0 : 4);
     });
+    if (system->isTimingMode() && enabled && tlb->combinedHitLatency) {
+        cases.emplace_back([this] {
+            auto req = std::make_shared<Request>(Virtual, 1, accessFlags,
+                                                 system->getRequestorId(this),
+                                                 Virtual, tc->contextId());
+            auto cb = std::make_unique<EptTranslation>(
+                [this](const Fault &fault, const RequestPtr &out,
+                       ThreadContext *, BaseMMU::Mode) {
+                    panic_if(!dynamic_cast<ReExec *>(fault.get()) ||
+                                 out->hasPaddr(),
+                             "Invalidated delayed hit published an address");
+                    awaiting = false;
+                    schedule(nextEvent, curTick() + 1);
+                });
+            auto *raw = cb.get();
+            continuations.push_back(std::move(cb));
+            awaiting = true;
+            mmu->translateTiming(req, tc, raw, BaseMMU::Read);
+            panic_if(mmu->drain() != DrainState::Draining,
+                     "Delayed hit missing from MMU drain");
+            mmu->invalidateLinear(Virtual, tc);
+        });
+    }
     cases.emplace_back([this] { finishEpt(); });
     cases.emplace_back([=, this] {
         setupCombined(true);

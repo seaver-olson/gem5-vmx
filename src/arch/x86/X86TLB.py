@@ -58,6 +58,9 @@ class X86TLB(BaseTLB):
 
     size = Param.Unsigned(64, "TLB size")
     combined_entries = Param.Unsigned(0, "Final guest/EPT translations")
+    combined_hit_latency = Param.Cycles(
+        0, "Extra CPU cycles for a usable combined hit in timing mode"
+    )
     system = Param.System(Parent.any, "system object")
     walker = Param.X86PagetableWalker(
         X86PagetableWalker(), "page table walker"

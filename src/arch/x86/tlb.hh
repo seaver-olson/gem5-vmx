@@ -73,6 +73,7 @@ namespace X86ISA
         typedef X86TLBParams Params;
         TLB(const Params &p);
         CombinedTLB combined;
+        const Cycles combinedHitLatency;
 
         void takeOverFrom(BaseTLB *otlb) override { flushAll(); }
 

@@ -42,8 +42,8 @@
 
 #include "arch/x86/ept_walker.hh"
 #include "arch/x86/faults.hh"
-#include "arch/x86/isa.hh"
 #include "arch/x86/insts/microldstop.hh"
+#include "arch/x86/isa.hh"
 #include "arch/x86/pagetable_walker.hh"
 #include "arch/x86/paging.hh"
 #include "arch/x86/pseudo_inst_abi.hh"
@@ -51,6 +51,7 @@
 #include "arch/x86/regs/msr.hh"
 #include "arch/x86/x86_traits.hh"
 #include "base/trace.hh"
+#include "cpu/base.hh"
 #include "cpu/thread_context.hh"
 #include "debug/TLB.hh"
 #include "mem/packet_access.hh"
@@ -616,13 +617,51 @@ MMU::translate(const RequestPtr &req,
                         ++cache.combinedStats.dirtyFallbacks;
                     } else {
                         cache.combinedStats.hit(mode);
-                        req->setPaddr(hit->hostBase |
-                                      (vaddr & mask(hit->shift)));
-                        applyFinalType(req, cr0,
-                                       tc->readMiscRegNoEffect(misc_reg::Pat),
-                                       hit->patIndex, hit->eptType,
-                                       hit->ignorePat, access);
-                        return finalizePhysical(req, tc, mode);
+                        // The slot can be evicted before a delayed hit
+                        // returns.
+                        const Addr hpa =
+                            hit->hostBase | (vaddr & mask(hit->shift));
+                        const auto pat =
+                            tc->readMiscRegNoEffect(misc_reg::Pat);
+                        const auto apic =
+                            tc->readMiscRegNoEffect(misc_reg::ApicBase);
+                        auto finish_hit = [=, this, index = hit->patIndex,
+                                           type = hit->eptType,
+                                           ignore = hit->ignorePat] {
+                            req->setPaddr(hpa);
+                            applyFinalType(req, cr0, pat, index, type, ignore,
+                                           access);
+                            return finalizePhysical(req, mode, apic,
+                                                    context.thread);
+                        };
+                        if (!timing || !cache.combinedHitLatency) {
+                            return finish_hit();
+                        }
+
+                        const auto generation =
+                            cache.generation(context.thread);
+                        auto respond = [=, &cache, this] {
+                            Fault fault;
+                            if (translation->squashed() ||
+                                cache.generation(context.thread) !=
+                                    generation) {
+                                fault = std::make_shared<ReExec>();
+                            } else {
+                                fault = finish_hit();
+                            }
+                            translation->finish(fault, req, tc,
+                                                completionMode);
+                            if (--pendingWalks == 0) {
+                                signalDrainDone();
+                            }
+                        };
+                        ++pendingWalks;
+                        delayedResponse = true;
+                        schedule(new EventFunctionWrapper(
+                                     respond, name() + ".combinedHit", true),
+                                 curTick() + tc->getCpuPtr()->cyclesToTicks(
+                                                 cache.combinedHitLatency));
+                        return NoFault;
                     }
                 } else {
                     ++cache.combinedStats.misses;
